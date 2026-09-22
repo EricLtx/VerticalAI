@@ -1,0 +1,19 @@
+# Literature corpus — never pushed (see docs/superpowers/specs/*-design.md §8)
+01_Architectural_Documentation/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+.vscode/
+.idea/
+
+# Secrets and local state
+.env
+.env.*
+*.pem
+*.key
+
+# Rust build output
+target/

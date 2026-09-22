@@ -1,0 +1,29 @@
+name: ci
+on:
+  push: { branches: [master, main, sp0-contracts] }
+  pull_request:
+jobs:
+  test:
+    strategy:
+      matrix: { os: [windows-latest, ubuntu-latest, macos-latest] }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt, clippy }
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+  sign:
+    # Scaffold only: signs release binaries when a certificate secret exists (SP1 gate).
+    if: ${{ github.event_name == 'push' }}
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check signing secret
+        shell: pwsh
+        run: |
+          if (-not $env:SIGNING_CERT_B64) { Write-Host "no SIGNING_CERT_B64 secret; skipping (expected in SP0)"; exit 0 }
+          Write-Host "signing pipeline would run here"
+        env: { SIGNING_CERT_B64: ${{ secrets.SIGNING_CERT_B64 }} }
