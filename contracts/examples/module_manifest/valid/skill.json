@@ -1,0 +1,3 @@
+{ "name": "quote-drafter", "kind": "skill", "version": "0.1.0", "machine_evolved": false, "files": ["SKILL.md"],
+  "provenance": { "content_hash": "sha256:c", "lineage": [], "signer": "founder", "arch_compat": [], "origin_taints": [] },
+  "pool_epoch": null, "autonomy_profile": null, "tags": [] }

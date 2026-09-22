@@ -1,0 +1,1 @@
+{ "subject_hash": "sha256:abc", "kind": "test", "approver": { "kind": "machine", "node_id": "n1", "lease_id": "l1" }, "challenge": null, "signature_hex": null }

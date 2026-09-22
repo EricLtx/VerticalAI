@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ResumeEvent",
+  "type": "object",
+  "properties": {
+    "cites": {
+      "type": "string"
+    },
+    "hlc_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "id": {
+      "type": "string"
+    },
+    "issuer": {
+      "$ref": "#/$defs/Principal"
+    }
+  },
+  "required": [
+    "id",
+    "cites",
+    "issuer",
+    "hlc_ms"
+  ],
+  "$defs": {
+    "Principal": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "machine"
+            },
+            "lease_id": {
+              "type": "string"
+            },
+            "node_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "node_id",
+            "lease_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "device_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "human"
+            }
+          },
+          "required": [
+            "kind",
+            "device_id"
+          ]
+        }
+      ]
+    }
+  }
+}

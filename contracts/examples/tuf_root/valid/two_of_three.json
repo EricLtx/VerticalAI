@@ -1,0 +1,1 @@
+{ "root": { "keys": { "k0": "00", "k1": "01", "k2": "02" }, "threshold": 2, "expires_at_ms": 1 }, "signatures": { "k0": "aa", "k1": "bb" } }

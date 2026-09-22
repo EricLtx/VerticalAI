@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LivenessLease",
+  "type": "object",
+  "properties": {
+    "business": {
+      "type": "string"
+    },
+    "expires_at_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "renewed_by_device": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "business",
+    "renewed_by_device",
+    "expires_at_ms"
+  ]
+}

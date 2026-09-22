@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Ctx",
+  "description": "Built by the channel layer from an authenticated connection — never by userland.",
+  "type": "object",
+  "properties": {
+    "clearance": {
+      "$ref": "#/$defs/Clearance"
+    },
+    "now_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "partition": {
+      "type": "string"
+    },
+    "principal": {
+      "$ref": "#/$defs/Principal"
+    }
+  },
+  "required": [
+    "principal",
+    "clearance",
+    "partition",
+    "now_ms"
+  ],
+  "$defs": {
+    "Clearance": {
+      "type": "object",
+      "properties": {
+        "max_scope": {
+          "$ref": "#/$defs/Scope"
+        },
+        "third_party_allowed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "max_scope",
+        "third_party_allowed"
+      ]
+    },
+    "Principal": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "machine"
+            },
+            "lease_id": {
+              "type": "string"
+            },
+            "node_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "node_id",
+            "lease_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "device_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "human"
+            }
+          },
+          "required": [
+            "kind",
+            "device_id"
+          ]
+        }
+      ]
+    },
+    "Scope": {
+      "description": "Ordered low → high. `Holdout` is the top: readable only by the rehearsal verifier role.",
+      "type": "string",
+      "enum": [
+        "public",
+        "vertical",
+        "business",
+        "personal",
+        "holdout"
+      ]
+    }
+  }
+}

@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Lease",
+  "type": "object",
+  "properties": {
+    "fence": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "granted_at_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "holder": {
+      "$ref": "#/$defs/Principal"
+    },
+    "id": {
+      "type": "string"
+    },
+    "partition": {
+      "description": "Diagnostic only (spec §3.4): which connected partition granted it.",
+      "type": "string"
+    },
+    "resource": {
+      "type": "string"
+    },
+    "ttl_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "id",
+    "resource",
+    "holder",
+    "granted_at_ms",
+    "ttl_ms",
+    "fence",
+    "partition"
+  ],
+  "$defs": {
+    "Principal": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "machine"
+            },
+            "lease_id": {
+              "type": "string"
+            },
+            "node_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "node_id",
+            "lease_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "device_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "human"
+            }
+          },
+          "required": [
+            "kind",
+            "device_id"
+          ]
+        }
+      ]
+    }
+  }
+}

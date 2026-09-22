@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ModuleManifest",
+  "type": "object",
+  "properties": {
+    "autonomy_profile": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AutonomyProfile"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "kind": {
+      "$ref": "#/$defs/ModuleKind"
+    },
+    "machine_evolved": {
+      "type": "boolean"
+    },
+    "name": {
+      "type": "string"
+    },
+    "pool_epoch": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "provenance": {
+      "$ref": "#/$defs/Provenance"
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "kind",
+    "version",
+    "machine_evolved",
+    "files",
+    "provenance",
+    "tags"
+  ],
+  "$defs": {
+    "AutonomyProfile": {
+      "type": "object",
+      "properties": {
+        "auto_approve_allowed": {
+          "type": "boolean"
+        },
+        "human_required_kinds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "human_required_kinds",
+        "auto_approve_allowed"
+      ]
+    },
+    "ModuleKind": {
+      "type": "string",
+      "enum": [
+        "skill",
+        "process",
+        "automation"
+      ]
+    },
+    "Origin": {
+      "type": "string",
+      "enum": [
+        "owner_authored",
+        "owner_shipped",
+        "third_party_inbound",
+        "web"
+      ]
+    },
+    "Provenance": {
+      "type": "object",
+      "properties": {
+        "arch_compat": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "content_hash": {
+          "type": "string"
+        },
+        "lineage": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "origin_taints": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Origin"
+          },
+          "uniqueItems": true
+        },
+        "signer": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "content_hash",
+        "lineage",
+        "signer",
+        "arch_compat",
+        "origin_taints"
+      ]
+    }
+  }
+}

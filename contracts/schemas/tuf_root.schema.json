@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SignedRoot",
+  "type": "object",
+  "properties": {
+    "root": {
+      "$ref": "#/$defs/RootRole"
+    },
+    "signatures": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "root",
+    "signatures"
+  ],
+  "$defs": {
+    "RootRole": {
+      "type": "object",
+      "properties": {
+        "expires_at_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "keys": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "threshold": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "keys",
+        "threshold",
+        "expires_at_ms"
+      ]
+    }
+  }
+}

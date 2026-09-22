@@ -1,0 +1,2 @@
+{ "id": "r1", "task_id": "t1", "label": { "scope": "personal", "data_class": "own", "origins": [] },
+  "goal": "draft a quote", "constraints": [], "evidence": [], "decisions": [], "open_questions": [], "artefacts": [] }

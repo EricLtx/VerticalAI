@@ -1,0 +1,2 @@
+{ "seq": 0, "prev_hash": "sha256:genesis", "hash": "sha256:0000", "kind": "task.submitted", "retention": "operational90d", "wall_ms": 1,
+  "clock_quality": "synced", "hlc": { "wall_ms": 1, "counter": 0, "node": "n1" }, "causal_heads": [], "payload_hash": "sha256:p1" }

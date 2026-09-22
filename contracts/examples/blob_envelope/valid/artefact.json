@@ -1,0 +1,1 @@
+{ "hash": "sha256:a", "key_id": "subject-1", "alg": "xchacha20poly1305", "ciphertext_len": 3, "label": { "scope": "personal", "data_class": "own", "origins": [] } }

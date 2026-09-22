@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArchManifest",
+  "type": "object",
+  "properties": {
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Capability"
+      },
+      "uniqueItems": true
+    },
+    "clearance": {
+      "$ref": "#/$defs/Clearance"
+    },
+    "context_ceiling": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "cost_per_1k_tokens_eur": {
+      "type": "number",
+      "format": "double"
+    },
+    "determinism": {
+      "$ref": "#/$defs/Determinism"
+    },
+    "governed": {
+      "description": "True only if the kernel launched and contains the inference process (spec §3.3).",
+      "type": "boolean"
+    },
+    "identity": {
+      "$ref": "#/$defs/ArchIdentity"
+    },
+    "jurisdiction": {
+      "description": "ISO 3166 country code, or \"EU\".",
+      "type": "string"
+    },
+    "latency_ms_p50": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "locality": {
+      "$ref": "#/$defs/Locality"
+    },
+    "name": {
+      "type": "string"
+    },
+    "retention_days": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "name",
+    "capabilities",
+    "locality",
+    "jurisdiction",
+    "cost_per_1k_tokens_eur",
+    "latency_ms_p50",
+    "context_ceiling",
+    "determinism",
+    "identity",
+    "clearance",
+    "governed"
+  ],
+  "$defs": {
+    "ArchIdentity": {
+      "description": "Everything that changes model behaviour. Any change = a new arch id.",
+      "type": "object",
+      "properties": {
+        "backend": {
+          "type": "string"
+        },
+        "batch": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "engine": {
+          "type": "string"
+        },
+        "engine_version": {
+          "type": "string"
+        },
+        "kv_cache": {
+          "type": "string"
+        },
+        "quant": {
+          "type": "string"
+        },
+        "sampling": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "seed": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "threads": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "weights_sha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "weights_sha256",
+        "engine",
+        "engine_version",
+        "backend",
+        "quant",
+        "kv_cache",
+        "threads",
+        "batch",
+        "sampling"
+      ]
+    },
+    "Capability": {
+      "type": "string",
+      "enum": [
+        "generate",
+        "embed",
+        "predict",
+        "perceive",
+        "plan",
+        "judge"
+      ]
+    },
+    "Clearance": {
+      "type": "object",
+      "properties": {
+        "max_scope": {
+          "$ref": "#/$defs/Scope"
+        },
+        "third_party_allowed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "max_scope",
+        "third_party_allowed"
+      ]
+    },
+    "Determinism": {
+      "type": "string",
+      "enum": [
+        "seeded_deterministic",
+        "non_deterministic"
+      ]
+    },
+    "Locality": {
+      "type": "string",
+      "enum": [
+        "local",
+        "on_prem",
+        "peer",
+        "cloud"
+      ]
+    },
+    "Scope": {
+      "description": "Ordered low → high. `Holdout` is the top: readable only by the rehearsal verifier role.",
+      "type": "string",
+      "enum": [
+        "public",
+        "vertical",
+        "business",
+        "personal",
+        "holdout"
+      ]
+    }
+  }
+}

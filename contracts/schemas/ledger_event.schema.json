@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LedgerEvent",
+  "type": "object",
+  "properties": {
+    "causal_heads": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "clock_quality": {
+      "$ref": "#/$defs/ClockQuality"
+    },
+    "hash": {
+      "type": "string"
+    },
+    "hlc": {
+      "$ref": "#/$defs/Hlc"
+    },
+    "kind": {
+      "type": "string"
+    },
+    "payload_hash": {
+      "description": "Commits to ciphertext, never to plaintext (spec §3.9).",
+      "type": "string"
+    },
+    "prev_hash": {
+      "type": "string"
+    },
+    "retention": {
+      "$ref": "#/$defs/RetentionClass"
+    },
+    "seq": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "wall_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "seq",
+    "prev_hash",
+    "hash",
+    "kind",
+    "retention",
+    "wall_ms",
+    "clock_quality",
+    "hlc",
+    "causal_heads",
+    "payload_hash"
+  ],
+  "$defs": {
+    "ClockQuality": {
+      "type": "string",
+      "enum": [
+        "synced",
+        "unsynced",
+        "manual_change_detected"
+      ]
+    },
+    "Hlc": {
+      "type": "object",
+      "properties": {
+        "counter": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "node": {
+          "type": "string"
+        },
+        "wall_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "wall_ms",
+        "counter",
+        "node"
+      ]
+    },
+    "RetentionClass": {
+      "type": "string",
+      "enum": [
+        "ephemeral",
+        "operational90d",
+        "compliance6m",
+        "compliance10y"
+      ]
+    }
+  }
+}

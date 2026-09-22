@@ -1,0 +1,1 @@
+{ "id": "lease-1", "resource": "doc:1", "holder": { "kind": "machine", "node_id": "n1", "lease_id": "l1" }, "granted_at_ms": 0, "ttl_ms": 1000, "fence": 1, "partition": "p1" }

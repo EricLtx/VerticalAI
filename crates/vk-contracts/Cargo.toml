@@ -1,0 +1,21 @@
+[package]
+name = "vk-contracts"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "VerticalAI kernel contracts: types that define the kernel boundary"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+hex.workspace = true
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+
+[dev-dependencies]
+jsonschema = { version = "0.30", default-features = false }
+walkdir = "2"

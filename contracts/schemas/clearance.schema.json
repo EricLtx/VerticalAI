@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Clearance",
+  "type": "object",
+  "properties": {
+    "max_scope": {
+      "$ref": "#/$defs/Scope"
+    },
+    "third_party_allowed": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "max_scope",
+    "third_party_allowed"
+  ],
+  "$defs": {
+    "Scope": {
+      "description": "Ordered low → high. `Holdout` is the top: readable only by the rehearsal verifier role.",
+      "type": "string",
+      "enum": [
+        "public",
+        "vertical",
+        "business",
+        "personal",
+        "holdout"
+      ]
+    }
+  }
+}

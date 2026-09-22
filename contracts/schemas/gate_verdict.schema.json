@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GateVerdict",
+  "type": "object",
+  "properties": {
+    "evidence_hash": {
+      "type": "string"
+    },
+    "gate": {
+      "$ref": "#/$defs/GateKind"
+    },
+    "pass": {
+      "type": "boolean"
+    },
+    "signer": {
+      "type": "string"
+    },
+    "subject_hash": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "gate",
+    "subject_hash",
+    "pass",
+    "evidence_hash",
+    "signer"
+  ],
+  "$defs": {
+    "GateKind": {
+      "type": "string",
+      "enum": [
+        "annex_iii",
+        "declassification",
+        "output_marking"
+      ]
+    }
+  }
+}

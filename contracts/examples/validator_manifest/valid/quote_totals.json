@@ -1,0 +1,1 @@
+{ "name": "quote-totals", "artefact_type": "quote", "anchor_suite": [{ "input_hash": "sha256:q1", "expected_pass": true }], "signers": ["founder"], "community": false }

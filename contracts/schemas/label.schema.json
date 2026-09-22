@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Label",
+  "type": "object",
+  "properties": {
+    "data_class": {
+      "$ref": "#/$defs/DataClass"
+    },
+    "origins": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Origin"
+      },
+      "uniqueItems": true
+    },
+    "scope": {
+      "$ref": "#/$defs/Scope"
+    }
+  },
+  "required": [
+    "scope",
+    "data_class",
+    "origins"
+  ],
+  "$defs": {
+    "DataClass": {
+      "description": "Ordered low → high; `Unknown` is treated as third-party and is the most restrictive.",
+      "type": "string",
+      "enum": [
+        "own",
+        "third_party_mandated",
+        "unknown"
+      ]
+    },
+    "Origin": {
+      "type": "string",
+      "enum": [
+        "owner_authored",
+        "owner_shipped",
+        "third_party_inbound",
+        "web"
+      ]
+    },
+    "Scope": {
+      "description": "Ordered low → high. `Holdout` is the top: readable only by the rehearsal verifier role.",
+      "type": "string",
+      "enum": [
+        "public",
+        "vertical",
+        "business",
+        "personal",
+        "holdout"
+      ]
+    }
+  }
+}

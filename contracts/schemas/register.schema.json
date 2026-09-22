@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Register",
+  "type": "object",
+  "properties": {
+    "artefacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ArtefactRef"
+      }
+    },
+    "constraints": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Evidence"
+      }
+    },
+    "goal": {
+      "type": "string"
+    },
+    "id": {
+      "$ref": "#/$defs/RegisterId"
+    },
+    "label": {
+      "$ref": "#/$defs/Label"
+    },
+    "open_questions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "task_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "task_id",
+    "label",
+    "goal",
+    "constraints",
+    "evidence",
+    "decisions",
+    "open_questions",
+    "artefacts"
+  ],
+  "$defs": {
+    "ArtefactRef": {
+      "type": "object",
+      "properties": {
+        "hash": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "hash",
+        "kind"
+      ]
+    },
+    "DataClass": {
+      "description": "Ordered low → high; `Unknown` is treated as third-party and is the most restrictive.",
+      "type": "string",
+      "enum": [
+        "own",
+        "third_party_mandated",
+        "unknown"
+      ]
+    },
+    "Evidence": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "origin": {
+          "$ref": "#/$defs/Origin"
+        },
+        "source_hash": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "origin",
+        "source_hash"
+      ]
+    },
+    "Label": {
+      "type": "object",
+      "properties": {
+        "data_class": {
+          "$ref": "#/$defs/DataClass"
+        },
+        "origins": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Origin"
+          },
+          "uniqueItems": true
+        },
+        "scope": {
+          "$ref": "#/$defs/Scope"
+        }
+      },
+      "required": [
+        "scope",
+        "data_class",
+        "origins"
+      ]
+    },
+    "Origin": {
+      "type": "string",
+      "enum": [
+        "owner_authored",
+        "owner_shipped",
+        "third_party_inbound",
+        "web"
+      ]
+    },
+    "RegisterId": {
+      "type": "string"
+    },
+    "Scope": {
+      "description": "Ordered low → high. `Holdout` is the top: readable only by the rehearsal verifier role.",
+      "type": "string",
+      "enum": [
+        "public",
+        "vertical",
+        "business",
+        "personal",
+        "holdout"
+      ]
+    }
+  }
+}

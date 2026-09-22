@@ -1,0 +1,5 @@
+{ "name": "gemma-4-9b", "capabilities": ["generate", "plan"], "locality": "local", "jurisdiction": "FR", "retention_days": null,
+  "cost_per_1k_tokens_eur": 0.0, "latency_ms_p50": 900, "context_ceiling": 8192, "determinism": "seeded_deterministic",
+  "identity": { "weights_sha256": "sha256:abc", "engine": "llama-server", "engine_version": "b5000", "backend": "cuda", "quant": "Q4_K_M",
+                "kv_cache": "f16", "threads": 8, "batch": 512, "sampling": {}, "seed": 7 },
+  "clearance": { "max_scope": "personal", "third_party_allowed": true }, "governed": true }

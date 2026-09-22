@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BlobEnvelope",
+  "type": "object",
+  "properties": {
+    "alg": {
+      "type": "string"
+    },
+    "ciphertext_len": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "hash": {
+      "type": "string"
+    },
+    "key_id": {
+      "type": "string"
+    },
+    "label": {
+      "$ref": "#/$defs/Label"
+    }
+  },
+  "required": [
+    "hash",
+    "key_id",
+    "alg",
+    "ciphertext_len",
+    "label"
+  ],
+  "$defs": {
+    "DataClass": {
+      "description": "Ordered low → high; `Unknown` is treated as third-party and is the most restrictive.",
+      "type": "string",
+      "enum": [
+        "own",
+        "third_party_mandated",
+        "unknown"
+      ]
+    },
+    "Label": {
+      "type": "object",
+      "properties": {
+        "data_class": {
+          "$ref": "#/$defs/DataClass"
+        },
+        "origins": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Origin"
+          },
+          "uniqueItems": true
+        },
+        "scope": {
+          "$ref": "#/$defs/Scope"
+        }
+      },
+      "required": [
+        "scope",
+        "data_class",
+        "origins"
+      ]
+    },
+    "Origin": {
+      "type": "string",
+      "enum": [
+        "owner_authored",
+        "owner_shipped",
+        "third_party_inbound",
+        "web"
+      ]
+    },
+    "Scope": {
+      "description": "Ordered low → high. `Holdout` is the top: readable only by the rehearsal verifier role.",
+      "type": "string",
+      "enum": [
+        "public",
+        "vertical",
+        "business",
+        "personal",
+        "holdout"
+      ]
+    }
+  }
+}

@@ -1,0 +1,1 @@
+{ "id": "s1", "scope": "business:acme", "issuer": { "kind": "human", "device_id": "phone-1" }, "hlc_ms": 1, "causal_heads": [] }

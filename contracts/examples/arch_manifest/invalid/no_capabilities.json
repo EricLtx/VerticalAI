@@ -1,0 +1,4 @@
+{ "name": "x", "capabilities": "generate", "locality": "local", "jurisdiction": "FR", "retention_days": null,
+  "cost_per_1k_tokens_eur": 0.0, "latency_ms_p50": 1, "context_ceiling": 1, "determinism": "non_deterministic",
+  "identity": { "weights_sha256": "s", "engine": "e", "engine_version": "1", "backend": "b", "quant": "q", "kv_cache": "k", "threads": 1, "batch": 1, "sampling": {}, "seed": null },
+  "clearance": { "max_scope": "public", "third_party_allowed": false }, "governed": false }

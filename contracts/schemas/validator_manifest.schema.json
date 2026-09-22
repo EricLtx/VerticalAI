@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ValidatorManifest",
+  "type": "object",
+  "properties": {
+    "anchor_suite": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AnchorCase"
+      }
+    },
+    "artefact_type": {
+      "type": "string"
+    },
+    "community": {
+      "type": "boolean"
+    },
+    "name": {
+      "type": "string"
+    },
+    "signers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "name",
+    "artefact_type",
+    "anchor_suite",
+    "signers",
+    "community"
+  ],
+  "$defs": {
+    "AnchorCase": {
+      "type": "object",
+      "properties": {
+        "expected_pass": {
+          "type": "boolean"
+        },
+        "input_hash": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "input_hash",
+        "expected_pass"
+      ]
+    }
+  }
+}
