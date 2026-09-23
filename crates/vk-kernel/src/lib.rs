@@ -1,6 +1,7 @@
 //! The real single-node kernel (spec §3): the stub's semantics over vk-store.
 pub mod arch;
 pub mod ns;
+pub mod presence;
 pub mod tasks;
 
 use anyhow::Result;
@@ -257,6 +258,42 @@ impl RealKernel {
         self.devices.register(device_id.into(), vk);
         self.log("device.enrolled", now_ms(), &device_id)?;
         Ok(())
+    }
+
+    /// Enrol the node's own device key as `node:<node_id>`, trust class `full`.
+    ///
+    /// Idempotent: the same key again is a no-op (no row written, no event
+    /// logged). A *different* key is refused: the node device is the key that
+    /// makes local requests human, and swapping it would be swapping who the
+    /// human is — an I1 matter, not an update.
+    pub fn enroll_node_key(&mut self, vk: [u8; 32]) -> Result<(), KernelError> {
+        let id = format!("node:{}", self.node_id);
+        let existing: Option<DeviceRow> = self
+            .store
+            .db
+            .get_json("devices", &id)
+            .map_err(store_failed)?;
+        match existing {
+            Some(row) if row.vk_hex == hex::encode(vk) => Ok(()),
+            Some(_) => Err(KernelError::I1(format!(
+                "device {id} is already enrolled with a different key"
+            ))),
+            None => self.enroll_device_persisted(&id, vk),
+        }
+    }
+
+    /// `enroll_node_key` for the device `vk boot` loaded; a device made for
+    /// another node id is not this node's device.
+    pub fn enroll_node_device(&mut self, dev: &presence::NodeDevice) -> Result<(), KernelError> {
+        use vk_contracts::principal::HumanKey;
+        let expected = format!("node:{}", self.node_id);
+        if dev.device_id() != expected {
+            return Err(KernelError::I1(format!(
+                "device {} is not this node's device ({expected})",
+                dev.device_id()
+            )));
+        }
+        self.enroll_node_key(dev.verifying_key_bytes())
     }
 
     /// Renew a business's liveness lease (I4). As above: the test hook cannot

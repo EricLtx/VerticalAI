@@ -1903,11 +1903,14 @@ dependencies = [
  "rand 0.8.8",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "uuid",
  "vk-contracts",
  "vk-kernel",
+ "vk-store",
 ]
 
 [[package]]
@@ -1915,7 +1918,10 @@ name = "vk-kernel"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
+ "ed25519-dalek",
  "hex",
+ "keyring",
  "rand 0.8.8",
  "serde",
  "serde_json",
