@@ -3,6 +3,7 @@ use vk_contracts::arch::*;
 use vk_contracts::labels::*;
 use vk_contracts::principal::Principal;
 use vk_contracts::syscalls::*;
+use vk_contracts::testing::KernelTestHooks;
 use vk_stub::StubKernel;
 
 fn arch(max_scope: Scope, third_party: bool) -> ArchManifest {
@@ -73,7 +74,7 @@ proptest! {
             let _ = k.infer(&ctx, &id, Capability::Generate, &r);
         }
         let clearance = Clearance { max_scope: max, third_party_allowed: tp };
-        for (arch_id, label) in k.infer_log() {
+        for (arch_id, label) in k.infer_log().iter() {
             prop_assert_eq!(arch_id, &id);
             prop_assert!(label.flows_to(&clearance), "leaked {:?} to clearance {:?}", label, clearance);
         }

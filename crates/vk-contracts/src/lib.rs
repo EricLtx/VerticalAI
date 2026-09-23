@@ -14,6 +14,7 @@ pub mod register;
 pub mod stop;
 pub mod storage;
 pub mod syscalls;
+pub mod testing;
 
 use sha2::{Digest, Sha256};
 

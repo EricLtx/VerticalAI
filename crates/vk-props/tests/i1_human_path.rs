@@ -2,6 +2,7 @@ use proptest::prelude::*;
 use vk_contracts::labels::*;
 use vk_contracts::principal::*;
 use vk_contracts::syscalls::*;
+use vk_contracts::testing::KernelTestHooks;
 use vk_stub::StubKernel;
 
 #[derive(Debug, Clone)]

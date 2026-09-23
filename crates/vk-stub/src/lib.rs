@@ -12,6 +12,7 @@ use vk_contracts::principal::{Approval, ApprovalKind, DeviceRegistry};
 use vk_contracts::register::{Register, RegisterId};
 use vk_contracts::stop::{LivenessLease, ResumeEvent, StopEvent, StopSet};
 use vk_contracts::syscalls::{Ctx, InferOutcome, Kernel, KernelError};
+use vk_contracts::testing::KernelTestHooks;
 
 pub struct StubKernel {
     node_id: String,
@@ -51,45 +52,6 @@ impl StubKernel {
             counter: 0,
         }
     }
-    pub fn register_arch(&mut self, m: ArchManifest) -> String {
-        let id = m.arch_id();
-        self.budgets.insert(id.clone(), m.context_ceiling);
-        self.arches.insert(id.clone(), m);
-        id
-    }
-    pub fn enroll_device(&mut self, device_id: &str, vk: [u8; 32]) {
-        self.devices.register(device_id.into(), vk);
-    }
-    pub fn renew_liveness(&mut self, business: &str, device_id: &str, expires_at_ms: u64) {
-        self.liveness.insert(
-            business.into(),
-            LivenessLease {
-                business: business.into(),
-                renewed_by_device: device_id.into(),
-                expires_at_ms,
-            },
-        );
-    }
-    pub fn set_context_budget(&mut self, arch_id: &str, tokens: u32) {
-        self.budgets.insert(arch_id.into(), tokens);
-    }
-    pub fn approvals_for(&self, subject_hash: &str) -> Vec<Approval> {
-        self.approvals
-            .iter()
-            .filter(|a| a.subject_hash == subject_hash)
-            .cloned()
-            .collect()
-    }
-    pub fn hot_modules(&self) -> Vec<String> {
-        self.hot.clone()
-    }
-    pub fn infer_log(&self) -> &[(String, Label)] {
-        &self.infer_log
-    }
-    pub fn stops(&self) -> &StopSet {
-        &self.stops
-    }
-
     fn log(&mut self, kind: &str, now_ms: u64, payload: &impl serde::Serialize) {
         let hlc = self.clock.now(now_ms);
         let payload_hash = hash_canonical(payload);
@@ -316,6 +278,47 @@ impl Kernel for StubKernel {
 
     fn ledger(&self) -> &Ledger {
         &self.ledger
+    }
+}
+
+impl KernelTestHooks for StubKernel {
+    fn register_arch(&mut self, m: ArchManifest) -> String {
+        let id = m.arch_id();
+        self.budgets.insert(id.clone(), m.context_ceiling);
+        self.arches.insert(id.clone(), m);
+        id
+    }
+    fn enroll_device(&mut self, device_id: &str, vk: [u8; 32]) {
+        self.devices.register(device_id.into(), vk);
+    }
+    fn renew_liveness(&mut self, business: &str, device_id: &str, expires_at_ms: u64) {
+        self.liveness.insert(
+            business.into(),
+            LivenessLease {
+                business: business.into(),
+                renewed_by_device: device_id.into(),
+                expires_at_ms,
+            },
+        );
+    }
+    fn set_context_budget(&mut self, arch_id: &str, tokens: u32) {
+        self.budgets.insert(arch_id.into(), tokens);
+    }
+    fn approvals_for(&self, subject_hash: &str) -> Vec<Approval> {
+        self.approvals
+            .iter()
+            .filter(|a| a.subject_hash == subject_hash)
+            .cloned()
+            .collect()
+    }
+    fn hot_modules(&self) -> Vec<String> {
+        self.hot.clone()
+    }
+    fn infer_log(&self) -> Vec<(String, Label)> {
+        self.infer_log.clone()
+    }
+    fn stops(&self) -> StopSet {
+        self.stops.clone()
     }
 }
 

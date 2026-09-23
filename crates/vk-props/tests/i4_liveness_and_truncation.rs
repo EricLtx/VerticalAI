@@ -3,6 +3,7 @@ use vk_contracts::arch::*;
 use vk_contracts::labels::*;
 use vk_contracts::principal::Principal;
 use vk_contracts::syscalls::*;
+use vk_contracts::testing::KernelTestHooks;
 use vk_stub::StubKernel;
 
 fn local() -> ArchManifest {

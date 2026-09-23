@@ -1,0 +1,18 @@
+[package]
+name = "vk-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "VerticalAI CLI: the vk binary"
+
+[[bin]]
+name = "vk"
+path = "src/main.rs"
+
+[dependencies]
+vk-contracts = { path = "../vk-contracts" }
+vk-ipc = { path = "../vk-ipc" }
+clap.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true

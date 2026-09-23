@@ -1,0 +1,21 @@
+[package]
+name = "vkd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "VerticalAI kernel daemon: the vkd binary"
+
+[[bin]]
+name = "vkd"
+path = "src/main.rs"
+
+[dependencies]
+vk-kernel = { path = "../vk-kernel" }
+vk-store = { path = "../vk-store" }
+vk-ipc = { path = "../vk-ipc" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+clap.workspace = true
