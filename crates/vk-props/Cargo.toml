@@ -9,7 +9,10 @@ description = "Property tests for kernel invariants"
 [dependencies]
 vk-contracts = { path = "../vk-contracts" }
 vk-stub = { path = "../vk-stub" }
+vk-kernel = { path = "../vk-kernel" }
+vk-store = { path = "../vk-store" }
 
 [dev-dependencies]
 proptest = "1"
 hex = "0.4"
+tempfile = "3"
