@@ -13,6 +13,9 @@ pub struct Store {
 }
 
 impl Store {
+    /// Opens all three storage tiers under `state_dir`. Does **not** verify
+    /// the ledger's hash chain; the boot sequence does that — call
+    /// `store.ledger.verify()`.
     pub fn open(state_dir: &std::path::Path, key_source: keys::KeySource) -> anyhow::Result<Store> {
         let master = keys::MasterKey::load_or_create(key_source)?;
         Ok(Store {
