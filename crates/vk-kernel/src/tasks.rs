@@ -452,19 +452,17 @@ impl RealKernel {
         for t in self.tasks() {
             v.tasks.insert(t.id, t.status);
         }
-        if self.stops.stopped("node") {
-            v.stopped_scopes.push("node".into());
-        }
+        // Every scope a live STOP holds, from the STOP set itself rather than
+        // from a list of scopes worth asking about: a scope this screen did
+        // not think to ask about is exactly the one whose STOP an operator
+        // would never find. `vk status` reads the same set.
+        v.stopped_scopes = self.stopped_scopes();
         for (business, l) in self
             .store
             .db
             .list_json::<vk_contracts::stop::LivenessLease>("liveness")
             .unwrap_or_default()
         {
-            let scope = format!("business:{business}");
-            if self.stops.stopped(&scope) {
-                v.stopped_scopes.push(scope);
-            }
             v.liveness.insert(business, l.expires_at_ms);
         }
         v
@@ -895,6 +893,20 @@ mod tests {
             TaskStatus::Stopped
         ));
         assert_eq!(k.top().stopped_scopes, vec!["node".to_string()]);
+    }
+
+    /// `top` and `boot`/`vk status` read one set. A scope this screen had to
+    /// know about in advance to report — a business with no liveness lease, a
+    /// vertical, anything a later release names — would be a STOP an operator
+    /// holds and cannot see.
+    #[test]
+    fn top_names_every_stopped_scope_not_only_the_ones_it_knows_to_ask_about() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let s = k.stop(&human(1), "business:acme").unwrap();
+        assert_eq!(k.top().stopped_scopes, vec!["business:acme".to_string()]);
+        k.resume(&human(2), &s).unwrap();
+        assert!(k.top().stopped_scopes.is_empty());
     }
 
     #[test]

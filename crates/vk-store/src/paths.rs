@@ -12,6 +12,17 @@ const SYNC_MARKERS: &[&str] = &[
 ];
 
 pub fn state_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
+    let dir = resolve_state_dir(override_dir)?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Where the state directory *would* be: resolved and refused for the same
+/// reasons as `state_dir`, but nothing is created. A caller that may still
+/// decline to use it (`vk boot`, which first asks what the daemon already on
+/// this endpoint is serving) must not leave an empty directory behind when it
+/// refuses.
+pub fn resolve_state_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
     let dir = match override_dir {
         Some(d) => resolve_override(&d, &std::env::current_dir()?),
         None => directories::ProjectDirs::from("ai", "VerticalAI", "vk")
@@ -20,7 +31,6 @@ pub fn state_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
             .to_path_buf(),
     };
     refuse_sync_folder(&dir)?;
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     Ok(dir)
 }
 
@@ -79,6 +89,16 @@ mod tests {
         let resolved = resolve_override(d.path(), Path::new("C:/some/other/cwd"));
         assert_eq!(resolved, d.path());
     }
+    #[test]
+    fn resolving_does_not_create_the_directory() {
+        let d = tempfile::tempdir().unwrap();
+        let wanted = d.path().join("not-yet");
+        assert_eq!(resolve_state_dir(Some(wanted.clone())).unwrap(), wanted);
+        assert!(!wanted.exists(), "resolution must not create anything");
+        assert_eq!(state_dir(Some(wanted.clone())).unwrap(), wanted);
+        assert!(wanted.exists(), "but opening it does");
+    }
+
     #[test]
     fn empty_override_resolves_to_cwd() {
         let cwd = Path::new("C:/Users/x/project");

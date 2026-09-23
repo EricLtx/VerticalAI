@@ -80,6 +80,20 @@ impl StopSet {
         self.stops.contains_key(stop_id)
     }
 
+    /// Every scope a live STOP still holds, sorted and without duplicates —
+    /// what the boot report and `vk status` name, so an operator can see what
+    /// is halted without guessing which scopes to ask about.
+    pub fn stopped_scopes(&self) -> Vec<String> {
+        let resumed: BTreeSet<&String> = self.resumes.values().map(|r| &r.cites).collect();
+        self.stops
+            .values()
+            .filter(|s| !resumed.contains(&s.id))
+            .map(|s| s.scope.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     pub fn stopped(&self, scope: &str) -> bool {
         let resumed: BTreeSet<&String> = self.resumes.values().map(|r| &r.cites).collect();
         self.stops

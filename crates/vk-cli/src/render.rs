@@ -78,13 +78,18 @@ fn step_status(v: &Value) -> String {
     }
 }
 
+/// What this node is and what its boot sequence found. The two conditions a
+/// person has to be told about — a chain that does not verify, an event lost
+/// to a crash mid-append — are lines of their own, because a caller who reads
+/// this screen has read everything the node will volunteer.
 pub fn status(v: &Value) -> String {
     let chain = if v["ledger_ok"] == Value::Bool(true) {
         "verified"
     } else {
         "BROKEN"
     };
-    fields(&[
+    let stopped = array(v, "stopped_scopes");
+    let mut rows = vec![
         ("node", text(&v["node_id"])),
         ("state dir", text(&v["state_dir"])),
         ("export root", text(&v["export_root"])),
@@ -93,7 +98,22 @@ pub fn status(v: &Value) -> String {
             "ledger",
             format!("{} events, chain {chain}", text(&v["ledger_len"])),
         ),
-    ])
+        (
+            "stopped",
+            if stopped.is_empty() {
+                "nothing".into()
+            } else {
+                stopped.iter().map(text).collect::<Vec<_>>().join(", ")
+            },
+        ),
+    ];
+    if v["recovered_partial_line"] == Value::Bool(true) {
+        rows.push((
+            "recovered",
+            "an unterminated last ledger line was dropped at boot".into(),
+        ));
+    }
+    fields(&rows)
 }
 
 /// A namespace entry. A directory is its listing; a ledger path is a dmesg
@@ -340,6 +360,57 @@ mod tests {
         for l in &lines {
             assert_eq!(*l, l.trim_end(), "trailing whitespace in {l:?}");
         }
+    }
+
+    /// What `vk status` volunteers about the boot sequence. The two bad
+    /// conditions have to be visible without `--json`, and the good one must
+    /// not read like a warning: a node with nothing wrong says so in words a
+    /// person can stop reading at.
+    #[test]
+    fn status_says_what_boot_found() {
+        let node = |ledger_ok, recovered, stopped: Value| {
+            super::status(&json!({
+                "node_id": "node-1", "state_dir": "S", "export_root": "E",
+                "arches": 1, "ledger_len": 18,
+                "ledger_ok": ledger_ok,
+                "recovered_partial_line": recovered,
+                "stopped_scopes": stopped,
+            }))
+        };
+
+        // `label<pad>  value`, read back by label.
+        let value = |rendered: &str, label: &str| {
+            rendered
+                .lines()
+                .find_map(|l| l.split_once("  ").filter(|(k, _)| k.trim_end() == label))
+                .map(|(_, v)| v.trim_start().to_string())
+        };
+
+        let healthy = node(true, false, json!([]));
+        assert_eq!(
+            value(&healthy, "ledger").as_deref(),
+            Some("18 events, chain verified"),
+            "{healthy}"
+        );
+        assert_eq!(value(&healthy, "stopped").as_deref(), Some("nothing"));
+        assert_eq!(value(&healthy, "recovered"), None, "{healthy}");
+
+        let damaged = node(false, true, json!(["node", "business:acme"]));
+        assert_eq!(
+            value(&damaged, "ledger").as_deref(),
+            Some("18 events, chain BROKEN"),
+            "{damaged}"
+        );
+        assert_eq!(
+            value(&damaged, "stopped").as_deref(),
+            Some("node, business:acme"),
+            "{damaged}"
+        );
+        assert!(
+            value(&damaged, "recovered")
+                .is_some_and(|v| v.starts_with("an unterminated last ledger line")),
+            "{damaged}"
+        );
     }
 
     #[test]

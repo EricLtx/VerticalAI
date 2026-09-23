@@ -30,12 +30,22 @@ struct Args {
     /// it with the passkey enrolment ceremony.
     #[arg(long)]
     auto_enroll_node: bool,
+    /// Serve even though the ledger chain does not verify. For recovering a
+    /// node whose record was damaged — everything it then appends is chained
+    /// onto a record that is already known not to hold.
+    #[arg(long)]
+    force: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Info by default, so the boot report is in `<state_dir>/vkd.log` without
+    // anybody having had to know to ask for it; `$RUST_LOG` overrides.
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
     let a = Args::parse();
     let state_dir = vk_store::paths::state_dir(a.state_dir)?;
@@ -59,9 +69,35 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         ledger_ok = report.ledger_ok,
         ledger_len = report.ledger_len,
+        recovered_partial_line = report.recovered_partial_line,
+        arches = report.arches.len(),
+        devices = report.devices.len(),
+        stopped_scopes = ?report.stopped_scopes,
+        policies_version = %report.policies_version,
         state_dir = %state_dir.display(),
         "vkd booted"
     );
+    if report.recovered_partial_line {
+        tracing::warn!(
+            "the last ledger line was unterminated and has been dropped: one event that a \
+             previous run was appending when it stopped is not in the record"
+        );
+    }
+    // A node whose record does not verify may still be looked at — `boot`
+    // appended its event and `vk dmesg` reads the file — but it does not serve
+    // syscalls, because everything it would append chains onto a record that is
+    // already known not to hold.
+    if !report.ledger_ok && !a.force {
+        anyhow::bail!(
+            "the ledger chain in {} does not verify ({} events): refusing to serve. \
+             Inspect it, restore it from a backup, or pass --force to serve anyway.",
+            state_dir.join("ledger").display(),
+            report.ledger_len
+        );
+    }
+    if !report.ledger_ok {
+        tracing::warn!("--force: serving on a ledger chain that does not verify");
+    }
     let endpoint = a
         .endpoint
         .map(vk_ipc::transport::Endpoint)

@@ -10,6 +10,7 @@
 //! key over a nonce the daemon just issued (spec §3.6, invariant I1). In SP1a
 //! the interactive machine *is* the enrolled device; SP1b replaces the key
 //! file with a passkey.
+mod man;
 mod render;
 
 use anyhow::{anyhow, Context, Result};
@@ -47,9 +48,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Start vkd (Task 9 adds the full boot sequence).
+    /// Start vkd over a state directory and wait until it answers.
     Boot(BootArgs),
-    /// What this node is, and whether its ledger verifies.
+    /// What this node is, and what its boot sequence found.
     Status,
     /// List a namespace path.
     Ls {
@@ -91,6 +92,9 @@ enum Cmd {
         #[command(subcommand)]
         what: LedgerCmd,
     },
+    /// The contracts this kernel speaks: no name lists them, a name renders
+    /// one. Needs no daemon — the schemas are in this binary.
+    Man { name: Option<String> },
 }
 
 /// Where the daemon's state and keys come from. The same flags `vkd` takes,
@@ -111,6 +115,9 @@ struct BootArgs {
     /// Run the daemon in this terminal instead of detaching it.
     #[arg(long)]
     foreground: bool,
+    /// Start the daemon even though the ledger chain does not verify.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Subcommand)]
@@ -176,8 +183,24 @@ fn run(cli: &Cli) -> Result<()> {
         .build()?;
     match &cli.cmd {
         Cmd::Boot(args) => boot(cli, &rt, args),
+        Cmd::Man { name } => man(cli, name.as_deref()),
         _ => rt.block_on(call(cli)),
     }
+}
+
+/// `vk man`, which answers out of the binary: a contract is readable on a
+/// machine whose daemon will not start, which is exactly when somebody needs
+/// to read one.
+fn man(cli: &Cli, name: Option<&str>) -> Result<()> {
+    match name {
+        None if cli.json => println!("{}", serde_json::to_string_pretty(&man::names())?),
+        None => println!("{}", man::list()),
+        // `--json` is the schema itself, byte for byte: what a generator or a
+        // validator wants, where the rendered page is what a person wants.
+        Some(n) if cli.json => print!("{}", man::schema(n).ok_or_else(|| man::unknown(n))?),
+        Some(n) => println!("{}", man::render(n)?),
+    }
+    Ok(())
 }
 
 /// `$VK_ENDPOINT` or `--endpoint`, when either says where the daemon is.
@@ -215,9 +238,9 @@ async fn call(cli: &Cli) -> Result<()> {
         .await
         .with_context(|| format!("no daemon on {} (start one with `vk boot`)", ep.0))?;
     match &cli.cmd {
-        // Dispatched before the client connects: it starts a daemon rather
-        // than calling one.
-        Cmd::Boot(_) => unreachable!("boot does not go through the client"),
+        // Dispatched before the client connects: one starts a daemon rather
+        // than calling one, the other needs none at all.
+        Cmd::Boot(_) | Cmd::Man { .. } => unreachable!("not a syscall"),
         Cmd::Status => show(
             cli,
             c.call("boot.info", json!({}), None).await?,
@@ -532,8 +555,9 @@ fn boot(cli: &Cli, rt: &tokio::runtime::Runtime, a: &BootArgs) -> Result<()> {
     // Resolved here, the way `vkd` itself would resolve it (and refusing a
     // synced folder here rather than in a daemon that is already detached), so
     // that it can be compared with what a daemon already on this endpoint
-    // serves.
-    let state_dir = vk_store::paths::state_dir(a.state_dir.clone())?;
+    // serves. Resolved only: this call may still refuse, and a refusal that
+    // left a state directory behind would be a node the user never asked for.
+    let state_dir = vk_store::paths::resolve_state_dir(a.state_dir.clone())?;
     let ep = endpoint(cli);
     if let Some(info) = rt.block_on(serving(&ep)) {
         let served = field(&info, "state_dir")?;
@@ -558,6 +582,9 @@ fn boot(cli: &Cli, rt: &tokio::runtime::Runtime, a: &BootArgs) -> Result<()> {
             render::booted,
         );
     }
+    // Committed now: the daemon's log lands inside it before the daemon is
+    // even started.
+    let state_dir = vk_store::paths::state_dir(Some(state_dir))?;
     let mut cmd = Command::new(&exe);
     cmd.arg("--auto-enroll-node")
         .arg("--state-dir")
@@ -569,6 +596,9 @@ fn boot(cli: &Cli, rt: &tokio::runtime::Runtime, a: &BootArgs) -> Result<()> {
     }
     if let Some(key) = node_key_file(a) {
         cmd.arg("--node-key-file").arg(key);
+    }
+    if a.force {
+        cmd.arg("--force");
     }
     if a.foreground {
         let status = cmd

@@ -53,6 +53,9 @@ fn validate_artefact_kind(kind: &str) -> Result<(), KernelError> {
     Ok(())
 }
 
+/// The `kv` key holding the version of the policy set this node runs under.
+const POLICIES_VERSION: &str = "policies_version";
+
 /// An enrolled human device, as the `devices` table stores it.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DeviceRow {
@@ -60,13 +63,28 @@ struct DeviceRow {
     trust_class: String,
 }
 
-/// What `boot` found. Task 9 grows this into the full report (recovered
-/// partial line, arches, devices, stopped scopes) and makes a failed chain
-/// refuse to serve; SP1a reports and serves.
+/// What this node came up with: the verdict on its own record, what it had to
+/// repair to read it, and the durable state it will serve. `vkd` logs it,
+/// refuses to serve on `ledger_ok: false` unless forced, and the `boot` ledger
+/// event commits to its canonical hash — so the report a person reads and the
+/// one the record keeps are the same value.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BootReport {
+    /// Did the hash chain verify? The chain as found, before the `boot` event.
     pub ledger_ok: bool,
+    /// How many events that chain had — again, before this boot's own event.
     pub ledger_len: usize,
+    /// A crash mid-`append` left an unterminated last line, which the store
+    /// dropped and truncated away. One event is missing from the record.
+    pub recovered_partial_line: bool,
+    pub arches: Vec<String>,
+    pub devices: Vec<String>,
+    pub stopped_scopes: Vec<String>,
+    /// Placeholder (spec §4.3): there is no policy engine in SP1a, so boot
+    /// writes `"0"` the first time it finds no version and reports it
+    /// unchanged afterwards. It exists so that the first policy set has a
+    /// predecessor to migrate from.
+    pub policies_version: String,
 }
 
 /// Cumulative per-arch call counters, persisted under the `kv` key `stats:<arch_id>`.
@@ -193,20 +211,62 @@ impl RealKernel {
         Ok(())
     }
 
-    /// Verify the ledger chain and record that this kernel started.
+    /// The boot sequence: verify the ledger chain, load the policies version,
+    /// enumerate what this node has, and record that it started.
     ///
     /// The `boot` event is appended whatever the verdict: a node that came up
     /// on a chain that does not verify is exactly the thing an auditor must
-    /// find in the record afterwards. Refusing to serve on a failed chain is
-    /// Task 9's, once `--force` exists to override it; here the verdict is
-    /// reported and `vk status` shows it.
+    /// find in the record afterwards. Whether to *serve* on that verdict is
+    /// not the kernel's call — `vkd` refuses unless `--force` says otherwise —
+    /// because the one thing a broken chain must not do is stop the operator
+    /// from looking at it.
+    ///
+    /// The event's payload is the hash of this very report, so the record says
+    /// what the node found and not merely that it started.
     pub fn boot(&mut self) -> Result<BootReport, KernelError> {
-        let ledger_ok = self.store.ledger.verify();
-        self.log("boot", now_ms(), &ledger_ok)?;
-        Ok(BootReport {
-            ledger_ok,
+        let report = BootReport {
+            ledger_ok: self.store.ledger.verify(),
             ledger_len: self.store.ledger.len(),
-        })
+            recovered_partial_line: self.recovered_partial_line(),
+            arches: self.arches().into_iter().map(|(id, _)| id).collect(),
+            devices: self.devices.ids(),
+            stopped_scopes: self.stops.stopped_scopes(),
+            policies_version: self.policies_version()?,
+        };
+        self.log("boot", now_ms(), &report)?;
+        Ok(report)
+    }
+
+    /// The policy set this node runs under. SP1a has no policy engine, so the
+    /// key is written once with `"0"` and read back unchanged; the version is
+    /// in the boot report from the start so that the first real policy set has
+    /// a predecessor in the record to migrate from.
+    fn policies_version(&mut self) -> Result<String, KernelError> {
+        if let Some(v) = self
+            .store
+            .db
+            .kv_get(POLICIES_VERSION)
+            .map_err(store_failed)?
+        {
+            return Ok(v);
+        }
+        self.store
+            .db
+            .kv_set(POLICIES_VERSION, "0")
+            .map_err(store_failed)?;
+        Ok("0".into())
+    }
+
+    /// Did opening the ledger have to drop an unterminated last line (a crash
+    /// mid-`append`)? True for the life of this kernel, which is the life of
+    /// the `LedgerFs` that repaired it.
+    pub fn recovered_partial_line(&self) -> bool {
+        self.store.ledger.recovered_partial_line
+    }
+
+    /// Every scope a live STOP still holds.
+    pub fn stopped_scopes(&self) -> Vec<String> {
+        self.stops.stopped_scopes()
     }
 
     /// Mount an adapter for its manifest's arch id, replacing the mock that
@@ -887,7 +947,8 @@ mod tests {
 
         let first = k.boot().unwrap();
         assert!(first.ledger_ok, "a fresh chain verifies");
-        assert_eq!(first.ledger_len, k.ledger().events().len());
+        // The report counts the chain boot *verified*; its own event follows.
+        assert_eq!(first.ledger_len + 1, k.ledger().events().len());
         assert_eq!(boots(&k), 1, "one boot event per boot");
 
         // Every start is on the record, and the event it appends is part of
@@ -897,6 +958,105 @@ mod tests {
         assert_eq!(second.ledger_len, first.ledger_len + 1);
         assert_eq!(boots(&k), 2);
         assert!(k.ledger().verify_chain());
+
+        // The event commits to the report, so the record says what the node
+        // found at boot and not merely that it started.
+        let logged = k
+            .ledger()
+            .events()
+            .iter()
+            .rfind(|e| e.kind == "boot")
+            .unwrap()
+            .clone();
+        assert_eq!(logged.payload_hash, hash_canonical(&second));
+    }
+
+    /// The whole report, from a node that has something to report: a mounted
+    /// arch, an enrolled device, a held STOP and a policies version that boot
+    /// writes down the first time it does not find one.
+    #[test]
+    fn boot_reports_what_this_node_came_up_with() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let arch = k
+            .mount(Arc::new(arch::MockAdapter {
+                manifest: local(personal()),
+                budget: 100,
+            }))
+            .unwrap();
+        k.enroll_device_persisted("phone-1", [7u8; 32]).unwrap();
+        let stop = k.stop(&human(1), "business:acme").unwrap();
+
+        let r = k.boot().unwrap();
+        assert!(r.ledger_ok);
+        assert!(!r.recovered_partial_line, "nothing was recovered");
+        assert_eq!(r.arches, vec![arch.clone()]);
+        assert_eq!(r.devices, vec!["phone-1".to_string()]);
+        assert_eq!(r.stopped_scopes, vec!["business:acme".to_string()]);
+        assert_eq!(r.policies_version, "0", "the placeholder, written at boot");
+
+        // A resumed scope is not stopped any more, and a restart reports the
+        // same thing this one does: the report is read back from disk.
+        k.resume(&human(2), &stop).unwrap();
+        drop(k);
+        let mut k = open(d.path());
+        let r2 = k.boot().unwrap();
+        assert!(r2.stopped_scopes.is_empty(), "{r2:?}");
+        assert_eq!(r2.arches, vec![arch]);
+        assert_eq!(r2.devices, vec!["phone-1".to_string()]);
+        assert_eq!(r2.policies_version, "0");
+    }
+
+    /// A ledger line changed under the kernel's feet. Boot still starts — the
+    /// node must be able to say what happened — but it says the chain is
+    /// broken, and `vkd` refuses to serve on that unless it is forced.
+    #[test]
+    fn boot_reports_a_tampered_chain_rather_than_trusting_it() {
+        let d = tempfile::tempdir().unwrap();
+        {
+            let mut k = open(d.path());
+            k.boot().unwrap();
+            assert!(k.boot().unwrap().ledger_ok);
+        }
+        let seg = d.path().join("ledger").join("seg-000000.jsonl");
+        let text = std::fs::read_to_string(&seg).unwrap();
+        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+        let mut first: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        first["payload_hash"] = serde_json::json!("sha256:tampered");
+        lines[0] = serde_json::to_string(&first).unwrap();
+        std::fs::write(&seg, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let mut k = open(d.path());
+        let r = k.boot().unwrap();
+        assert!(!r.ledger_ok, "a rewritten line must not pass as the record");
+        assert!(!r.recovered_partial_line);
+    }
+
+    /// A crash mid-append leaves an unterminated last line. The store drops it
+    /// and truncates; boot says so, because "one event is missing" is a thing
+    /// an operator has to be told rather than left to find.
+    #[test]
+    fn boot_reports_a_recovered_partial_line() {
+        let d = tempfile::tempdir().unwrap();
+        {
+            let mut k = open(d.path());
+            k.boot().unwrap();
+        }
+        let seg = d.path().join("ledger").join("seg-000000.jsonl");
+        let mut f = std::fs::OpenOptions::new().append(true).open(&seg).unwrap();
+        std::io::Write::write_all(&mut f, b"{\"seq\":99,\"prev_hash\":\"x\"").unwrap();
+        drop(f);
+
+        {
+            let mut k = open(d.path());
+            let r = k.boot().unwrap();
+            assert!(r.recovered_partial_line);
+            assert!(r.ledger_ok, "what is left of the chain still verifies");
+        }
+        // And the next start has nothing left to recover: the partial line was
+        // truncated away, not merely skipped.
+        let mut k = open(d.path());
+        assert!(!k.boot().unwrap().recovered_partial_line);
     }
 
     #[test]

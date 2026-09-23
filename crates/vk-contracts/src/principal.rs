@@ -121,6 +121,12 @@ impl DeviceRegistry {
     pub fn register(&mut self, device_id: String, vk: [u8; 32]) {
         self.keys.insert(device_id, vk);
     }
+    /// Which devices are enrolled, sorted. Ids only: a verifying key is a
+    /// public value, but nothing outside the registry needs it, and a report
+    /// that carries one invites it into a log.
+    pub fn ids(&self) -> Vec<String> {
+        self.keys.keys().cloned().collect()
+    }
     pub fn verify(
         &self,
         device_id: &str,

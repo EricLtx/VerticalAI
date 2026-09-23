@@ -325,6 +325,12 @@ fn dispatch(
             "arches": k.arches().len(),
             "ledger_len": k.ledger().events().len(),
             "ledger_ok": k.ledger().verify_chain(),
+            // What the boot sequence found, still true for the life of this
+            // daemon: a node serving on a chain that does not verify, or one
+            // event short of its record, says so to every caller and not only
+            // in the log line nobody read.
+            "recovered_partial_line": k.recovered_partial_line(),
+            "stopped_scopes": k.stopped_scopes(),
             "state_dir": k.store().state_dir.display().to_string(),
             // Where a `release` step's `to_dir` is resolved: the client names a
             // subpath and prints the resolved path, so "where did my artefact

@@ -27,17 +27,33 @@ fn vk_exe() -> PathBuf {
 
 /// `vkd` is a package of its own, so testing `vk-cli` does not build it. It
 /// belongs next to `vk` — same target directory, same profile — and is built
-/// once if it is not there yet (`CARGO_TARGET_DIR` is inherited, so the build
-/// lands in the same place this test looks).
+/// here (`CARGO_TARGET_DIR` is inherited, so the build lands in the same place
+/// this test looks).
+///
+/// Always built, never "only if the file is missing": a `vkd` left over from
+/// an earlier checkout is exactly the binary that would make these tests pass
+/// against code nobody is looking at. A fresh one makes the build a no-op.
+///
+/// Once per process, under a lock: the tests in this file run on threads of
+/// one process and each wants `vkd`, and two `cargo build`s on one target
+/// directory serialise on cargo's own lock at best and race the file this
+/// function is about to hand out at worst.
 fn vkd_exe() -> PathBuf {
-    let path = vk_exe().with_file_name(format!("vkd{}", std::env::consts::EXE_SUFFIX));
-    if !path.exists() {
-        let status = Command::new(env!("CARGO"))
+    static BUILT: std::sync::Once = std::sync::Once::new();
+    BUILT.call_once(|| {
+        // Captured, not inherited: a no-op build has nothing to say, and the
+        // one time it does have something the message is in the failure.
+        let out = Command::new(env!("CARGO"))
             .args(["build", "-p", "vkd"])
-            .status()
+            .output()
             .expect("run cargo");
-        assert!(status.success(), "cargo build -p vkd failed");
-    }
+        assert!(
+            out.status.success(),
+            "cargo build -p vkd failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    });
+    let path = vk_exe().with_file_name(format!("vkd{}", std::env::consts::EXE_SUFFIX));
     assert!(path.exists(), "no vkd next to vk at {}", path.display());
     path
 }
@@ -123,15 +139,7 @@ fn the_vk_shell_drives_a_task_from_mount_to_release() {
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let node_key = dir.path().join("node.key");
     let mut daemon = Daemon(
-        Command::new(vkd_exe())
-            .arg("--state-dir")
-            .arg(dir.path())
-            .args(["--endpoint", &endpoint])
-            .arg("--master-key-file")
-            .arg(dir.path().join("master.key"))
-            .arg("--node-key-file")
-            .arg(&node_key)
-            .arg("--auto-enroll-node")
+        vkd_cmd(dir.path(), &endpoint, &[])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -335,4 +343,149 @@ fn vk_boot_detaches_a_daemon_it_can_be_asked_to_stop_and_will_not_serve_two_stat
 
 fn path_of(p: &std::path::Path) -> String {
     p.to_str().expect("utf-8 path").to_string()
+}
+
+/// A `vkd` over this state directory, with file-backed keys so no test ever
+/// touches a keyring.
+fn vkd_cmd(dir: &std::path::Path, endpoint: &str, extra: &[&str]) -> Command {
+    let mut c = Command::new(vkd_exe());
+    c.arg("--state-dir")
+        .arg(dir)
+        .args(["--endpoint", endpoint])
+        .arg("--master-key-file")
+        .arg(dir.join("master.key"))
+        .arg("--node-key-file")
+        .arg(dir.join("node.key"))
+        .arg("--auto-enroll-node")
+        .args(extra);
+    c
+}
+
+/// Wait for the daemon on this shell's endpoint to be there, or to be gone.
+fn wait_until(sh: &Shell, serving_now: bool, what: &str) -> Option<Value> {
+    let start = Instant::now();
+    loop {
+        let answer = serving(sh);
+        if answer.is_some() == serving_now {
+            return answer;
+        }
+        assert!(start.elapsed() < READY_TIMEOUT, "{what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The boot sequence's refusal. A record that does not verify is not a record:
+/// everything a daemon appended to it would chain onto a claim already known
+/// to be false, so it does not serve — while the node stays readable, which is
+/// the whole point of refusing rather than crashing.
+#[test]
+fn vkd_refuses_to_serve_a_ledger_that_does_not_verify_unless_forced() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let sh = Shell {
+        endpoint: endpoint.clone(),
+        node_key: dir.path().join("node.key"),
+    };
+
+    // A node with a record of its own, then stopped.
+    {
+        let _daemon = Daemon(
+            vkd_cmd(dir.path(), &endpoint, &[])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn vkd"),
+        );
+        let status = wait_until(&sh, true, "vkd never answered").expect("status");
+        assert_eq!(status["ledger_ok"], true, "{status}");
+        assert_eq!(status["recovered_partial_line"], false, "{status}");
+    }
+    wait_until(&sh, false, "the killed daemon still holds the endpoint");
+
+    // One line of that record rewritten, exactly as an editor would leave it.
+    let seg = dir.path().join("ledger").join("seg-000000.jsonl");
+    let mut lines: Vec<String> = std::fs::read_to_string(&seg)
+        .expect("a ledger segment")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let mut first: Value = serde_json::from_str(&lines[0]).expect("a ledger event");
+    first["payload_hash"] = Value::String("sha256:tampered".into());
+    lines[0] = serde_json::to_string(&first).unwrap();
+    std::fs::write(&seg, format!("{}\n", lines.join("\n"))).unwrap();
+
+    // Refused: non-zero, one message naming the chain and the way past it.
+    let mut refused = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let start = Instant::now();
+    let exit = loop {
+        match refused.0.try_wait().expect("wait for vkd") {
+            Some(exit) => break exit,
+            None => assert!(
+                start.elapsed() < READY_TIMEOUT,
+                "vkd is serving a ledger that does not verify"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(!exit.success(), "a broken chain must not exit 0: {exit:?}");
+    let mut why = String::new();
+    std::io::Read::read_to_string(refused.0.stderr.as_mut().expect("stderr"), &mut why).unwrap();
+    for named in ["ledger", "--force"] {
+        assert!(why.contains(named), "{why}");
+    }
+    assert!(serving(&sh).is_none(), "nothing is serving that store");
+
+    // Forced: it serves, and says to every caller what it is serving on.
+    let _forced = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &["--force"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let status = wait_until(&sh, true, "--force did not start a daemon").expect("status");
+    assert_eq!(status["ledger_ok"], false, "{status}");
+}
+
+/// `vk man` is the one verb that needs no daemon: the contracts are in the
+/// binary, so they are readable on a machine whose kernel will not start.
+#[test]
+fn vk_man_reads_the_contracts_without_a_daemon() {
+    let man = |args: &[&str]| {
+        Command::new(vk_exe())
+            .args(args)
+            .env("VK_ENDPOINT", "\\\\.\\pipe\\vk-no-daemon-here")
+            .output()
+            .expect("run vk man")
+    };
+
+    let list = man(&["man"]);
+    assert!(list.status.success(), "vk man: {list:?}");
+    let listed = String::from_utf8(list.stdout).unwrap();
+    for name in ["ledger_event", "principal", "stop_event"] {
+        assert!(listed.contains(name), "{listed}");
+    }
+
+    let page = String::from_utf8(man(&["man", "ledger_event"]).stdout).unwrap();
+    assert!(page.contains("LedgerEvent"), "{page}");
+    assert!(page.contains("payload_hash"), "{page}");
+    assert!(page.contains("required:"), "{page}");
+
+    // `--json` is the schema itself: what a generator reads.
+    let raw: Value =
+        serde_json::from_slice(&man(&["man", "ledger_event", "--json"]).stdout).expect("a schema");
+    assert_eq!(raw["title"], "LedgerEvent");
+
+    // A name that is not one: refused, with the list of names that are.
+    let bad = man(&["man", "no-such-contract"]);
+    assert_eq!(bad.status.code(), Some(1), "{bad:?}");
+    let why = String::from_utf8(bad.stderr).unwrap();
+    assert!(why.contains("no-such-contract"), "{why}");
+    assert!(why.contains("ledger_event"), "{why}");
 }
