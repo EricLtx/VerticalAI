@@ -73,6 +73,13 @@ impl StopSet {
         Ok(())
     }
 
+    /// Is this STOP id known? A RESUME must cite one, and a caller has to be
+    /// able to ask *before* it writes anything down: a resume refused after the
+    /// fact still leaves a row that a later STOP taking that id would inherit.
+    pub fn has_stop(&self, stop_id: &str) -> bool {
+        self.stops.contains_key(stop_id)
+    }
+
     pub fn stopped(&self, scope: &str) -> bool {
         let resumed: BTreeSet<&String> = self.resumes.values().map(|r| &r.cites).collect();
         self.stops

@@ -14,7 +14,7 @@ use vk_contracts::locks::{Lease, LockHome, LockTable};
 use vk_contracts::module::{GateKind, GateVerdict, ModuleManifest};
 use vk_contracts::principal::{Approval, ApprovalKind, DeviceRegistry};
 use vk_contracts::register::{ArtefactRef, Register, RegisterId};
-use vk_contracts::stop::{LivenessLease, ResumeEvent, StopEvent, StopSet};
+use vk_contracts::stop::{LivenessLease, ResumeEvent, StopError, StopEvent, StopSet};
 use vk_contracts::storage::BlobEnvelope;
 use vk_contracts::syscalls::{Ctx, InferOutcome, Kernel, KernelError};
 use vk_contracts::testing::KernelTestHooks;
@@ -114,14 +114,42 @@ impl RealKernel {
         }
         // A lease outlives the process that granted it: a restart must not hand
         // the resource to somebody else while the first holder still has time.
+        //
+        // Exactly one live row per (resource, partition) is restored. `acquire`
+        // matches the *first* row it finds, so restoring a superseded one — a
+        // renewal whose predecessor outlived a crash — would let it answer for
+        // a resource whose real holder is somebody else.
         let now = now_ms();
+        let mut newest: BTreeMap<(String, String), (String, Lease)> = BTreeMap::new();
+        let mut stale: Vec<String> = Vec::new();
         for (key, lease) in self.store.db.list_json::<Lease>("leases")? {
             self.home.restore(&lease.resource, lease.fence);
             if lease.expired(now) {
-                self.store.db.delete("leases", &key)?;
-            } else {
-                self.locks.restore(lease);
+                stale.push(key);
+                continue;
             }
+            let slot = (lease.resource.clone(), lease.partition.clone());
+            match newest.remove(&slot) {
+                Some((prev_key, prev))
+                    if (prev.granted_at_ms, prev.fence) >= (lease.granted_at_ms, lease.fence) =>
+                {
+                    stale.push(key);
+                    newest.insert(slot, (prev_key, prev));
+                }
+                Some((prev_key, _)) => {
+                    stale.push(prev_key);
+                    newest.insert(slot, (key, lease));
+                }
+                None => {
+                    newest.insert(slot, (key, lease));
+                }
+            }
+        }
+        for key in stale {
+            self.store.db.delete("leases", &key)?;
+        }
+        for (_, (_, lease)) in newest {
+            self.locks.restore(lease);
         }
         self.counter = self
             .store
@@ -448,6 +476,18 @@ impl Kernel for RealKernel {
     }
 
     fn lease(&mut self, ctx: &Ctx, resource: &str, ttl_ms: u64) -> Result<Lease, KernelError> {
+        // `acquire` retains the superseded lease away in memory when the same
+        // holder renews; the row it was loaded from has to go with it, or a
+        // later boot restores a lease nobody holds any more.
+        let superseded: Vec<String> = self
+            .store
+            .db
+            .list_json::<Lease>("leases")
+            .map_err(store_failed)?
+            .into_iter()
+            .filter(|(_, l)| l.resource == resource && l.partition == ctx.partition)
+            .map(|(key, _)| key)
+            .collect();
         let l = self.locks.acquire(
             resource,
             ctx.principal.clone(),
@@ -460,6 +500,11 @@ impl Kernel for RealKernel {
             .db
             .put_json("leases", &l.id, &l)
             .map_err(store_failed)?;
+        for key in superseded {
+            if key != l.id {
+                self.store.db.delete("leases", &key).map_err(store_failed)?;
+            }
+        }
         // The fence outlives the lease: persist it separately so a resource
         // whose leases have all expired still cannot see a fence reissued.
         self.store
@@ -473,11 +518,13 @@ impl Kernel for RealKernel {
     fn approve(&mut self, ctx: &Ctx, approval: Approval) -> Result<(), KernelError> {
         interceptors::i1_approval(&ctx.principal, &approval, &self.devices, ctx.now_ms)?;
         let key = format!("{}:{}", approval.subject_hash, hash_canonical(&approval));
+        // Ledger first: an approval that is stored but reported as failed would
+        // still satisfy a later promote's human-approval gate.
+        self.log("approval.recorded", ctx.now_ms, &approval)?;
         self.store
             .db
             .put_json("approvals", &key, &approval)
-            .map_err(store_failed)?;
-        self.log("approval.recorded", ctx.now_ms, &approval)
+            .map_err(store_failed)
     }
 
     fn stop(&mut self, ctx: &Ctx, scope: &str) -> Result<String, KernelError> {
@@ -503,6 +550,13 @@ impl Kernel for RealKernel {
 
     fn resume(&mut self, ctx: &Ctx, stop_id: &str) -> Result<(), KernelError> {
         interceptors::i1_presence(&ctx.principal)?;
+        // Before anything is written down. `add_resume` would catch this too,
+        // but only after the row existed, and stop ids are sequential: a resume
+        // citing an id no STOP has taken yet would be waiting on disk to lift
+        // the STOP that takes it after the next reboot.
+        if !self.stops.has_stop(stop_id) {
+            return Err(StopError::UnknownStop.into());
+        }
         let id = self.next_id("resume")?;
         let e = ResumeEvent {
             id: id.clone(),
@@ -510,15 +564,15 @@ impl Kernel for RealKernel {
             issuer: ctx.principal.clone(),
             hlc_ms: ctx.now_ms,
         };
+        // Ledger first: lifting a STOP is granting authority back, and a call
+        // that reports failure must not have lifted anything.
+        self.log("resume", ctx.now_ms, &stop_id)?;
         self.store
             .db
             .put_json("resumes", &id, &e)
             .map_err(store_failed)?;
-        // A resume that cites an unknown stop is refused here; the row left
-        // behind is inert, because `load` replays resumes through this same
-        // check and drops it again.
         self.stops.add_resume(e)?;
-        self.log("resume", ctx.now_ms, &stop_id)
+        Ok(())
     }
 
     fn run_automation(
@@ -566,11 +620,13 @@ impl Kernel for RealKernel {
                 module.name
             )));
         }
+        // Ledger first: a module that is Hot but reported as not promoted would
+        // be running unaudited.
+        self.log("module.promoted", ctx.now_ms, &subject)?;
         self.store
             .db
             .put_json("hot", &subject, module)
-            .map_err(store_failed)?;
-        self.log("module.promoted", ctx.now_ms, &subject)
+            .map_err(store_failed)
     }
 
     fn export(
@@ -870,6 +926,84 @@ mod tests {
         assert!(
             sent < written,
             "the send must reach the ledger before its result: {kinds:?}"
+        );
+    }
+
+    fn lease_rows(k: &RealKernel, resource: &str) -> usize {
+        k.store()
+            .db
+            .list_json::<Lease>("leases")
+            .unwrap()
+            .into_iter()
+            .filter(|(_, l)| l.resource == resource)
+            .count()
+    }
+
+    #[test]
+    fn a_refused_resume_leaves_no_row_and_cannot_lift_a_later_stop() {
+        let d = tempfile::tempdir().unwrap();
+        {
+            let mut k = open(d.path());
+            // Ids are sequential, so this is the one the *next* STOP will take.
+            let ghost = "stop-n1-1";
+            assert!(matches!(
+                k.resume(&human(1), ghost),
+                Err(KernelError::Stop(_))
+            ));
+            assert_eq!(
+                k.store()
+                    .db
+                    .list_json::<ResumeEvent>("resumes")
+                    .unwrap()
+                    .len(),
+                0,
+                "a refused resume must leave nothing durable"
+            );
+            let s = k.stop(&human(2), "business:acme").unwrap();
+            assert_eq!(s, ghost, "the STOP takes the id the refused resume cited");
+            assert!(k.stops().stopped("business:acme"));
+        }
+        let k = open(d.path());
+        assert!(
+            k.stops().stopped("business:acme"),
+            "a resume refused before the STOP existed must not lift it after a reboot"
+        );
+    }
+
+    #[test]
+    fn renewing_a_lease_leaves_one_live_row_and_still_excludes_others() {
+        let d = tempfile::tempdir().unwrap();
+        let t0 = now_ms();
+        {
+            let mut k = open(d.path());
+            let first = k.lease(&machine(t0), "doc:1", 60_000).unwrap();
+            let renewed = k.lease(&machine(t0 + 1_000), "doc:1", 60_000).unwrap();
+            assert_ne!(first.id, renewed.id);
+            assert_eq!(
+                lease_rows(&k, "doc:1"),
+                1,
+                "the superseded row must go with the lease it recorded"
+            );
+            // And if a crash had landed between that write and that delete:
+            k.store().db.put_json("leases", &first.id, &first).unwrap();
+            assert_eq!(lease_rows(&k, "doc:1"), 2);
+        }
+        let mut k = open(d.path());
+        assert_eq!(
+            lease_rows(&k, "doc:1"),
+            1,
+            "boot restores only the newest live row per resource"
+        );
+        let other = Ctx {
+            principal: Principal::Machine {
+                node_id: "n2".into(),
+                lease_id: "cli".into(),
+            },
+            ..machine(t0 + 2_000)
+        };
+        assert!(
+            matches!(k.lease(&other, "doc:1", 1_000), Err(KernelError::Lock(_))),
+            "the renewed lease still runs, so nobody else gets the resource"
         );
     }
 
