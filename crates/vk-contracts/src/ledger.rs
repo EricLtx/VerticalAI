@@ -205,6 +205,11 @@ impl Ledger {
         &self.events
     }
 
+    /// Re-load a persisted event without recomputing it (used by on-disk segments).
+    pub fn push_verified(&mut self, e: LedgerEvent) {
+        self.events.push(e);
+    }
+
     #[doc(hidden)]
     pub fn tamper_for_test(&mut self, idx: usize, payload_hash: &str) {
         self.events[idx].payload_hash = payload_hash.into();
