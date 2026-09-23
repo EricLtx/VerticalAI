@@ -582,14 +582,24 @@ async fn task_subject_is_what_the_approve_step_accepts() {
         .unwrap()
         .to_string();
     let step = || c.call("task.step", json!({"task_id": id}), None);
+    let subject_now = || c.call("task.subject", json!({"task_id": id}), None);
+
+    // Queued: the draft that makes the artefact has not run, so there is
+    // nothing to approve and no hash to hand out — a client that signed one
+    // here would be signing a register the next step rewrites.
+    let err = subject_now().await.unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+    assert!(
+        err.to_string().contains("not waiting for an approval")
+            && err.to_string().contains("queued"),
+        "{err}"
+    );
+
     step().await.unwrap();
     assert_eq!(step().await.unwrap()["status"], "waiting_human");
 
     // The draft attached the task's artefact, so the subject is that blob.
-    let subject = c
-        .call("task.subject", json!({"task_id": id}), None)
-        .await
-        .unwrap()["subject_hash"]
+    let subject = subject_now().await.unwrap()["subject_hash"]
         .as_str()
         .unwrap()
         .to_string();

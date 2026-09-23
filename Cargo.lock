@@ -1879,6 +1879,7 @@ dependencies = [
  "vk-contracts",
  "vk-ipc",
  "vk-kernel",
+ "vk-store",
 ]
 
 [[package]]

@@ -82,6 +82,41 @@ fn str_of<'a>(v: &'a Value, field: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no string field {field} in {v}"))
 }
 
+/// One `vk status --json`: the answer when a daemon is serving this shell's
+/// endpoint, nothing when none is.
+fn serving(sh: &Shell) -> Option<Value> {
+    let o = sh.run(&["status", "--json"]);
+    o.status
+        .success()
+        .then(|| serde_json::from_slice(&o.stdout).expect("status JSON"))
+}
+
+/// A daemon this test knows only by pid — which is all `vk boot --json` gives
+/// a caller, and so exactly what it must be enough to stop it with.
+struct Detached(u64);
+
+impl Detached {
+    fn kill(&self) {
+        let pid = self.0.to_string();
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("taskkill");
+            c.args(["/F", "/PID", &pid]);
+            c
+        } else {
+            let mut c = Command::new("kill");
+            c.args(["-9", &pid]);
+            c
+        };
+        let _ = cmd.stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+}
+
+impl Drop for Detached {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
 #[test]
 fn the_vk_shell_drives_a_task_from_mount_to_release() {
     let dir = tempfile::tempdir().unwrap();
@@ -196,4 +231,108 @@ fn the_vk_shell_drives_a_task_from_mount_to_release() {
     assert_eq!(verified["ok"], true, "{verified}");
     let tail = sh.json(&["dmesg", "-n", "5", "--json"]);
     assert_eq!(tail.as_array().expect("events").len(), 5, "{tail}");
+}
+
+/// `vk boot` is the verb with real logic of its own — find the daemon, refuse
+/// to double it, hand it its state and keys, detach it, wait for it to answer.
+/// It runs here with file-backed keys, so CI never touches a keyring.
+///
+/// Note that `Shell::run` waits for the child's stdout to close: a `vk boot`
+/// that let the daemon inherit that pipe would hang this test rather than fail
+/// it, which is the same thing `out=$(vk boot --json)` does to a user.
+#[test]
+fn vk_boot_detaches_a_daemon_it_can_be_asked_to_stop_and_will_not_serve_two_state_dirs() {
+    // `vk boot` looks for vkd beside itself; build it if this is a bare
+    // `cargo test -p vk-cli`.
+    let vkd = vkd_exe();
+    let dir = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let node_key = dir.path().join("node.key");
+    let sh = Shell {
+        endpoint: vk_ipc::transport::test_endpoint().0,
+        node_key: node_key.clone(),
+    };
+    let (here, elsewhere) = (path_of(dir.path()), path_of(other.path()));
+    let master = path_of(&dir.path().join("master.key"));
+    let key = path_of(&node_key);
+    let boot_here = [
+        "boot",
+        "--state-dir",
+        &here,
+        "--master-key-file",
+        &master,
+        "--node-key-file",
+        &key,
+        "--json",
+    ];
+    let boot_elsewhere = [
+        "boot",
+        "--state-dir",
+        &elsewhere,
+        "--master-key-file",
+        &master,
+        "--node-key-file",
+        &key,
+        "--json",
+    ];
+    assert!(vkd.exists());
+
+    let booted = sh.json(&boot_here);
+    let daemon = Detached(booted["pid"].as_u64().expect("a pid to stop it with"));
+    assert_eq!(str_of(&booted, "endpoint"), sh.endpoint);
+    assert!(
+        dir.path().join("vkd.log").exists(),
+        "the daemon's output belongs in the state dir, not in this terminal"
+    );
+
+    // `vk boot` has already exited, so a daemon that answers now is one that
+    // outlived the shell that started it.
+    let start = Instant::now();
+    let status = loop {
+        if let Some(v) = serving(&sh) {
+            break v;
+        }
+        assert!(
+            start.elapsed() < READY_TIMEOUT,
+            "the detached daemon never answered on {}",
+            sh.endpoint
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(status["ledger_ok"], true, "{status}");
+    assert_eq!(
+        std::fs::canonicalize(str_of(&status, "state_dir")).unwrap(),
+        std::fs::canonicalize(dir.path()).unwrap()
+    );
+
+    // Again, for the same store: the daemon that is already there is the one
+    // that was wanted, so nothing is started.
+    let again = sh.json(&boot_here);
+    assert_eq!(again["already_running"], true, "{again}");
+    assert!(again["pid"].is_null(), "nothing was started: {again}");
+
+    // For a different store on the same endpoint: refused, and both paths are
+    // named — serving this silently from the first store would send every
+    // later task, approval and ledger check somewhere the caller never asked.
+    let clash = sh.run(&boot_elsewhere);
+    assert!(!clash.status.success(), "a second store must be refused");
+    let why = String::from_utf8_lossy(&clash.stderr);
+    for named in [&here, &elsewhere] {
+        assert!(why.contains(named.as_str()), "{why}");
+    }
+
+    // The pid it handed back is the daemon: stopping it stops the node.
+    drop(daemon);
+    let start = Instant::now();
+    while serving(&sh).is_some() {
+        assert!(
+            start.elapsed() < READY_TIMEOUT,
+            "the daemon outlived the pid vk boot reported"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn path_of(p: &std::path::Path) -> String {
+    p.to_str().expect("utf-8 path").to_string()
 }

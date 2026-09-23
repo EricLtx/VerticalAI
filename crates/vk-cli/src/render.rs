@@ -1,6 +1,6 @@
 //! What the syscalls' JSON looks like to a person: fixed-width tables and
 //! label/value blocks. Nothing here talks to the kernel and nothing here
-//! decides anything — `--json` prints the same values unrendered, so this
+//! decides anything — `--json` prints the very same value unrendered, so this
 //! module can never be the reason two callers disagree about what happened.
 use serde_json::Value;
 use std::path::Path;
@@ -24,8 +24,10 @@ fn fields(rows: &[(&str, String)]) -> String {
         .join("\n")
 }
 
-/// A header and its rows, every column as wide as its widest cell. The last
-/// column is not padded, so no line carries trailing spaces.
+/// A header and its rows, every column as wide as its widest cell. No line
+/// carries trailing whitespace: the last column is not padded, and a row whose
+/// last cell is empty (an `approve` step has no detail) is trimmed rather than
+/// left with the separator hanging off the end.
 pub fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
     let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
     for row in rows {
@@ -49,6 +51,8 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
             })
             .collect::<Vec<_>>()
             .join("  ")
+            .trim_end()
+            .to_string()
     };
     let mut out = line(headers.iter().map(|h| (*h).to_string()).collect());
     for row in rows {
@@ -284,15 +288,26 @@ pub fn verified(v: &Value) -> String {
 }
 
 pub fn booted(v: &Value) -> String {
+    let where_ = format!(
+        "on {} serving {}",
+        text(&v["endpoint"]),
+        text(&v["state_dir"])
+    );
     if v["already_running"] == Value::Bool(true) {
-        format!("vkd is already serving on {}", text(&v["endpoint"]))
+        format!("vkd is already running {where_}")
     } else {
-        format!(
-            "vkd running (pid {}) on {}",
-            text(&v["pid"]),
-            text(&v["endpoint"])
-        )
+        format!("vkd running (pid {}) {where_}", text(&v["pid"]))
     }
+}
+
+/// An approval is recorded, not applied: the step that was waiting for it only
+/// moves when the task is stepped again, so say so.
+pub fn approved(v: &Value) -> String {
+    format!(
+        "approved {}\nrun `vk task step {} --all` to continue",
+        text(&v["subject_hash"]),
+        text(&v["task_id"])
+    )
 }
 
 /// For the calls whose whole answer is that they worked.
@@ -312,13 +327,19 @@ mod tests {
             &[
                 vec!["a-very-long-cell".into(), "x".into()],
                 vec!["b".into(), "y".into()],
+                // An `approve` step has no detail: the row must end at the
+                // last cell that has something in it, not at the separator.
+                vec!["c".into(), String::new()],
             ],
         );
         let lines: Vec<&str> = t.lines().collect();
         assert_eq!(lines[0], "A                 LONGHEADER");
         assert_eq!(lines[1], "a-very-long-cell  x");
         assert_eq!(lines[2], "b                 y");
-        assert!(lines.iter().all(|l| !l.ends_with(' ')), "{t}");
+        assert_eq!(lines[3], "c");
+        for l in &lines {
+            assert_eq!(*l, l.trim_end(), "trailing whitespace in {l:?}");
+        }
     }
 
     #[test]

@@ -79,6 +79,15 @@ struct ReleaseRecord<'a> {
     destination: String,
 }
 
+/// A status as the wire spells it (`waiting_human`, not `WaitingHuman`), so a
+/// refusal a person reads names the same state `vk ps` just showed them.
+fn status_name(s: TaskStatus) -> String {
+    serde_json::to_value(s)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{s:?}"))
+}
+
 /// What `top` shows: what each arch has cost so far, what every task is doing,
 /// which scopes are stopped, and until when each business may act unattended.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -146,10 +155,28 @@ impl RealKernel {
     /// transport). One rule in one place: an approval built against a subject
     /// the scheduler would not recognise is an approval that never completes a
     /// step, and a second copy of this expression is how that happens.
+    ///
+    /// Answered only while the task is *at* its `Approve` step. The subject is
+    /// a property of a moment, not of a task: every earlier step rewrites the
+    /// register, so a hash handed out before then names something no step will
+    /// ever ask about — and a human would have signed it, had it recorded, and
+    /// been told `ok` for an approval that can never complete anything. The
+    /// step asks from inside its own run, so it always satisfies this.
     pub fn approval_subject(&mut self, ctx: &Ctx, task_id: &str) -> Result<String, KernelError> {
         let t = self
             .task(task_id)
             .ok_or_else(|| KernelError::NotFound(task_id.into()))?;
+        let current = t
+            .steps
+            .iter()
+            .find(|s| !matches!(s.status, StepStatus::Done))
+            .map(|s| &s.kind);
+        if !matches!(current, Some(StepKind::Approve)) {
+            return Err(KernelError::Gate(format!(
+                "task {task_id} is not waiting for an approval; its status is {}",
+                status_name(t.status)
+            )));
+        }
         let reg = self.read_register(ctx, &t.register)?;
         Ok(reg
             .artefacts
@@ -584,11 +611,7 @@ mod tests {
             *reg.decisions.last().unwrap()
         );
 
-        // It is what an approval must name, and what a release writes out.
-        assert_eq!(
-            k.approval_subject(&machine(4), &t.id).unwrap(),
-            reg.artefacts[0].hash
-        );
+        // It is what a release writes out.
         let t = k.run_task_step(&machine(5), &t.id).unwrap();
         assert!(matches!(t.status, TaskStatus::Done));
         let name = format!(
@@ -597,6 +620,43 @@ mod tests {
         );
         let path = k.export_root().join("out").join(&name);
         assert!(path.exists(), "{}", path.display());
+    }
+
+    /// A subject answered before the task is at its `Approve` step would name a
+    /// register that the very next step rewrites: the human would sign it, the
+    /// approval would be recorded, and the step would still be waiting.
+    #[test]
+    fn the_approval_subject_is_answered_only_while_the_task_waits_at_its_approve_step() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let arch = k.register_arch(crate::tests::local(personal()));
+        let t = k
+            .create_task(
+                &machine(1),
+                "Draft a proposal for Acme",
+                "proposal",
+                Label::bottom(),
+                vec![StepKind::Draft { arch_id: arch }, StepKind::Approve],
+            )
+            .unwrap();
+
+        // Queued: the draft has not run, so there is nothing to approve yet.
+        let err = k.approval_subject(&machine(2), &t.id).unwrap_err();
+        assert!(matches!(err, KernelError::Gate(_)), "{err}");
+        assert!(
+            err.to_string().contains("not waiting for an approval")
+                && err.to_string().contains("queued"),
+            "the refusal must name the status a person just saw: {err}"
+        );
+
+        // At the Approve step: the drafted artefact, and the step agrees.
+        let t = k.run_task_step(&machine(3), &t.id).unwrap();
+        let subject = k.approval_subject(&machine(4), &t.id).unwrap();
+        let reg = k.read_register(&machine(4), &t.register).unwrap();
+        assert_eq!(subject, reg.artefacts[0].hash);
+        let t = k.run_task_step(&machine(5), &t.id).unwrap();
+        assert!(matches!(t.status, TaskStatus::WaitingHuman));
+        assert_eq!(k.approval_subject(&machine(6), &t.id).unwrap(), subject);
     }
 
     #[test]
