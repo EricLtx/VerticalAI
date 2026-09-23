@@ -5,6 +5,7 @@ use base64::Engine;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rand::RngCore;
+use std::io::Write as _;
 use std::path::PathBuf;
 
 pub enum KeySource {
@@ -31,26 +32,41 @@ impl MasterKey {
                 }
             }
             KeySource::File(path) => {
-                if path.exists() {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mode = std::fs::metadata(&path)?.permissions().mode();
-                        if mode & 0o077 != 0 {
-                            anyhow::bail!("{} is readable by others; refusing", path.display());
-                        }
-                    }
-                    Ok(MasterKey(decode(std::fs::read_to_string(&path)?.trim())?))
-                } else {
-                    let k = fresh();
-                    std::fs::write(&path, base64::engine::general_purpose::STANDARD.encode(k))
+                // Atomic create: `create_new` fails with `AlreadyExists` if the
+                // file is already there, so there is no exists()-then-write
+                // TOCTOU window, and on Unix the file is born 0o600 instead of
+                // being briefly world-readable between `write` and
+                // `set_permissions`.
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.mode(0o600);
+                }
+                match opts.open(&path) {
+                    Ok(mut file) => {
+                        let k = fresh();
+                        file.write_all(
+                            base64::engine::general_purpose::STANDARD
+                                .encode(k)
+                                .as_bytes(),
+                        )
                         .with_context(|| format!("write {}", path.display()))?;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+                        Ok(MasterKey(k))
                     }
-                    Ok(MasterKey(k))
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let mode = std::fs::metadata(&path)?.permissions().mode();
+                            if mode & 0o077 != 0 {
+                                anyhow::bail!("{} is readable by others; refusing", path.display());
+                            }
+                        }
+                        Ok(MasterKey(decode(std::fs::read_to_string(&path)?.trim())?))
+                    }
+                    Err(err) => Err(err).with_context(|| format!("create {}", path.display())),
                 }
             }
         }
