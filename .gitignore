@@ -17,3 +17,6 @@ desktop.ini
 
 # Rust build output
 target/
+
+# Git worktrees for parallel sub-project tracks
+.worktrees/
