@@ -25,7 +25,7 @@
 - **No caller-asserted principal.** `Ctx` is built only inside `vk-ipc` from the authenticated connection; every RPC handler receives it, never constructs it from request fields.
 - **Secrets never in registers, blobs, the ledger or the IPC payloads.** The master key lives in the OS keyring (`keyring` crate) under the daemon's account; `VK_MASTER_KEY_FILE` is a test/CI escape hatch only and must refuse to run if the file is world-readable on Unix.
 - **State directory:** `%LOCALAPPDATA%\VerticalAI\vk` on Windows (`directories::ProjectDirs::from("ai", "VerticalAI", "vk")` → data_local_dir), `~/.local/share/vk` on Linux, `~/Library/Application Support/vk` on macOS. Refuse a path under a OneDrive/Dropbox/iCloud folder (substring match on the canonical path) with a clear error.
-- Every ledger event kind used in this plan is one of: `task.submitted`, `task.step`, `register.written`, `infer`, `infer.projected`, `lease.granted`, `approval.recorded`, `stop`, `resume`, `automation.ran`, `module.promoted`, `module.exported`, `arch.mounted`, `arch.unmounted`, `device.enrolled`, `boot`, `shred`.
+- Every ledger event kind used in this plan is one of: `task.submitted`, `task.step`, `artefact.released`, `register.written`, `infer`, `infer.projected`, `lease.granted`, `approval.recorded`, `stop`, `resume`, `automation.ran`, `module.promoted`, `module.exported`, `arch.mounted`, `arch.unmounted`, `device.enrolled`, `boot`, `shred`.
 - SP0 invariants I1–I4′ must stay green on **both** kernels after every task (`cargo test --workspace`).
 - Work happens in the `sp1-kernel` worktree/branch; merge to `master` only through the finishing-a-development-branch skill.
 

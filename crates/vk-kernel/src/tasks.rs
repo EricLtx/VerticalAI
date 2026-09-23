@@ -165,6 +165,35 @@ impl RealKernel {
         Ok(self.export_root().join(rel))
     }
 
+    /// The file name one artefact is released under, `<hash12>.<kind>`.
+    ///
+    /// `kind` is validated when the artefact is attached, but a register is a
+    /// durable document that some other path may have written, and a name is
+    /// joined onto the destination exactly like a directory is: a `kind` of
+    /// `../../x.md` would traverse out through the file name and undo the
+    /// confinement `release_dest` just established. So the composed name is
+    /// held to the same rule — it must be exactly one ordinary path component —
+    /// and the kernel refuses rather than trusting what it read back.
+    fn release_file_name(hash: &str, kind: &str) -> Result<String, KernelError> {
+        let name = format!(
+            "{}.{}",
+            hash.trim_start_matches("sha256:")
+                .get(..12)
+                .unwrap_or("artefact"),
+            kind
+        );
+        let mut parts = Path::new(&name).components();
+        if !matches!(
+            (parts.next(), parts.next()),
+            (Some(Component::Normal(_)), None)
+        ) {
+            return Err(KernelError::Gate(format!(
+                "artefact kind {kind:?} is not a plain file name"
+            )));
+        }
+        Ok(name)
+    }
+
     pub fn tasks(&self) -> Vec<Task> {
         self.store
             .db
@@ -317,6 +346,15 @@ impl RealKernel {
                 // Refuse before anything exists on disk: a destination the
                 // kernel will not write to must not leave a directory behind.
                 let dest = self.release_dest(to_dir)?;
+                // Every name is composed and checked before anything is logged
+                // or created, so a release this kernel will refuse leaves no
+                // directory, no half-written export and no ledger event
+                // claiming one.
+                let files = reg
+                    .artefacts
+                    .iter()
+                    .map(|a| Ok((a.hash.clone(), Self::release_file_name(&a.hash, &a.kind)?)))
+                    .collect::<Result<Vec<_>, KernelError>>()?;
                 // Ledger before the bytes. This is the moment plaintext leaves
                 // the kernel, and an unaudited release is the failure that
                 // cannot be repaired afterwards; a write that fails half way
@@ -331,18 +369,10 @@ impl RealKernel {
                     },
                 )?;
                 std::fs::create_dir_all(&dest).map_err(store_failed)?;
-                for a in &reg.artefacts {
+                for (hash, name) in files {
                     // `read_artefact` re-checks the label against the caller's
                     // clearance: leaving the kernel is exactly where I2 matters.
-                    let bytes = self.read_artefact(ctx, &a.hash)?;
-                    let name = format!(
-                        "{}.{}",
-                        a.hash
-                            .trim_start_matches("sha256:")
-                            .get(..12)
-                            .unwrap_or("artefact"),
-                        a.kind
-                    );
+                    let bytes = self.read_artefact(ctx, &hash)?;
                     std::fs::write(dest.join(name), bytes).map_err(store_failed)?;
                 }
                 Ok((StepStatus::Done, 0))
@@ -620,6 +650,50 @@ mod tests {
         assert!(!d.path().join("escape").exists());
         assert!(!d.path().join("abs").exists());
         assert_eq!(released(&k), 1, "a refused release must not be logged");
+    }
+
+    #[test]
+    fn a_traversing_artefact_kind_cannot_escape_the_export_root() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let t = k
+            .create_task(
+                &machine(1),
+                "x",
+                "proposal",
+                Label::bottom(),
+                vec![StepKind::Release {
+                    to_dir: "out".into(),
+                }],
+            )
+            .unwrap();
+        k.attach_artefact(&machine(2), &t.register, "proposal.md", b"# Proposal")
+            .unwrap();
+        // `attach_artefact` refuses a kind like this, but a register is durable
+        // and some other path may have written one: the release must refuse
+        // what it reads back rather than trust it. Confining the *directory* is
+        // only half the job while the file name can traverse out of it.
+        let mut reg = k.read_register(&machine(3), &t.register).unwrap();
+        reg.artefacts[0].kind = "../../../../vk-escape-marker.md".into();
+        k.write_register(&machine(3), reg).unwrap();
+
+        assert!(matches!(
+            k.run_task_step(&machine(4), &t.id),
+            Err(KernelError::Gate(_))
+        ));
+        let row = k.task(&t.id).unwrap();
+        assert!(matches!(row.status, TaskStatus::Failed));
+        assert!(matches!(row.steps[0].status, StepStatus::Failed(_)));
+        assert!(
+            !d.path()
+                .parent()
+                .unwrap()
+                .join("vk-escape-marker.md")
+                .exists(),
+            "nothing may be written above the state directory"
+        );
+        assert!(!k.export_root().join("out").exists());
+        assert_eq!(released(&k), 0, "a refused release must not be logged");
     }
 
     #[test]

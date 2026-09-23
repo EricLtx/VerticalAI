@@ -31,6 +31,27 @@ fn store_failed(e: impl std::fmt::Display) -> KernelError {
     KernelError::Store(e.to_string())
 }
 
+/// An artefact's `kind` is not free-form text: a `Release` step turns it into a
+/// file name (`<hash12>.<kind>`), so a kind containing a separator or a `..`
+/// would be a path, and a path is an escape from wherever the release was
+/// confined to. It is validated here, at the only door artefacts come in by,
+/// rather than sanitised on the way out — a register is durable, and a value
+/// that must never be written is better refused than repaired forever after.
+fn validate_artefact_kind(kind: &str) -> Result<(), KernelError> {
+    let ok = !kind.is_empty()
+        && kind.len() <= 32
+        && !kind.starts_with('.')
+        && kind
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if !ok {
+        return Err(KernelError::Gate(
+            "artefact kind must be a short plain token".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// An enrolled human device, as the `devices` table stores it.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DeviceRow {
@@ -267,6 +288,7 @@ impl RealKernel {
         kind: &str,
         bytes: &[u8],
     ) -> Result<BlobEnvelope, KernelError> {
+        validate_artefact_kind(kind)?;
         let mut reg = self.read_register(ctx, reg_id)?;
         let env = self
             .store
@@ -1170,5 +1192,46 @@ mod tests {
         );
         let reg = k.read_register(&machine(4), &r).unwrap();
         assert_eq!(reg.artefacts[0].hash, env.hash);
+    }
+
+    #[test]
+    fn an_artefact_kind_that_is_not_a_plain_token_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let r = k.submit_task(&machine(1), "x", Label::bottom()).unwrap();
+        let too_long = "k".repeat(33);
+        // A kind becomes a file name when the artefact is released, so a
+        // separator, a `..`, a leading dot or an unbounded string is refused
+        // here rather than written into a durable register.
+        for bad in [
+            "",
+            "../x",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            "a:b",
+            too_long.as_str(),
+        ] {
+            assert!(
+                matches!(
+                    k.attach_artefact(&machine(2), &r, bad, b"payload"),
+                    Err(KernelError::Gate(_))
+                ),
+                "{bad:?} must be refused"
+            );
+        }
+        assert!(
+            k.read_register(&machine(3), &r)
+                .unwrap()
+                .artefacts
+                .is_empty(),
+            "a refused kind must not reach the register"
+        );
+        let blobs = std::fs::read_dir(d.path().join("blobs"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "bin").unwrap_or(false))
+            .count();
+        assert_eq!(blobs, 0, "a refused kind must store no blob");
     }
 }
