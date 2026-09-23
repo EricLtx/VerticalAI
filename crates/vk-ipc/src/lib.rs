@@ -1,13 +1,22 @@
 //! Syscall transport (spec §3.11): newline-delimited JSON-RPC 2.0 on a local
 //! endpoint (named pipe on Windows, Unix socket elsewhere).
 //!
-//! The endpoint's OS ACL is the first authentication factor: only the same
-//! user account can open it. From there the server derives every principal
-//! from the connection itself (`server::ctx_for` is the only place a `Ctx` is
-//! built) and never from a request field. A connection is a machine principal;
-//! one request becomes human only by carrying a [`PresenceProof`] — a signature
-//! by an enrolled device key over a server-issued, single-use, expiring nonce
-//! (spec §3.6, invariant I1).
+//! The endpoint's OS ACL is the first authentication factor: on Unix a `0600`
+//! socket inside a `0700` directory; on Windows, in SP1a, the default DACL of
+//! a named pipe, which SP1b hardens with an explicit one. From there the
+//! server derives every principal from the connection itself (`server::ctx_for`
+//! is the only place a `Ctx` is built) and never from a request field. A
+//! connection is a machine principal; one request becomes human only by
+//! carrying a [`PresenceProof`] — a signature by an enrolled device key over a
+//! server-issued, single-use, expiring nonce (spec §3.6, invariant I1).
+//!
+//! A proof is spent by the request that carries it, whatever the method: the
+//! server removes its nonce from the challenge map before dispatching
+//! anything, so a nonce shown once is never live for a later request. Only
+//! the methods that derive a principal (`task.create`, `task.step`, `stop`,
+//! `resume`, `approve`) take a proof; every other method refuses a request
+//! carrying one with `-32602` (`"this method does not take a presence
+//! proof"`) — the nonce spent all the same.
 pub mod client;
 pub mod server;
 pub mod transport;

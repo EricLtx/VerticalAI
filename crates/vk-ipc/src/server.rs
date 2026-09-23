@@ -2,7 +2,7 @@
 //! write a line. This module is where principals come from (`ctx_for`), and
 //! it is the only place in the workspace that builds a `Ctx` from a live
 //! connection — spec §3.6, invariant I1.
-use crate::transport::{self, Endpoint};
+use crate::transport::{self, AcceptError, Endpoint};
 use crate::{
     PresenceProof, Request, Response, RpcError, E_BAD_PARAMS, E_INTERNAL, E_INVARIANT, E_METHOD,
     E_NOT_FOUND, E_STORE,
@@ -12,10 +12,11 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use vk_contracts::arch::ArchManifest;
 use vk_contracts::labels::{Clearance, Label, Scope};
-use vk_contracts::principal::{Approval, Principal};
+use vk_contracts::principal::{Approval, ApprovalKind, Principal};
 use vk_contracts::syscalls::{Ctx, Kernel, KernelError};
 use vk_kernel::arch::MockAdapter;
 use vk_kernel::tasks::StepKind;
@@ -32,6 +33,9 @@ const MAX_CHALLENGES: usize = 1024;
 /// Longest request line accepted. Longer, and the connection is dropped
 /// rather than buffered without bound.
 const MAX_LINE: usize = 1 << 20;
+/// Pause after a connection that could not be accepted, so a condition that
+/// is not ours to fix (a burst past the descriptor limit, say) is not spun on.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Outstanding presence nonces, each with its expiry. Single use: `spend`
 /// removes a nonce before looking at anything else about it, so a nonce that
@@ -76,7 +80,20 @@ pub async fn serve(kernel: Shared, endpoint: Endpoint) -> Result<()> {
     let mut listener = transport::os::bind(&endpoint).await?;
     let challenges = Arc::new(Mutex::new(Challenges::default()));
     loop {
-        let stream = listener.accept().await?;
+        let stream = match listener.accept().await {
+            Ok(s) => s,
+            // One connection that could not be taken (a peer gone before the
+            // accept, a burst past the descriptor limit, a pipe instance that
+            // could not be created this once): the listener is still armed,
+            // so say so, let the moment pass and keep serving.
+            Err(AcceptError::Connection(e)) => {
+                tracing::warn!(error = %e, "connection not accepted; still serving");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                continue;
+            }
+            // The listener itself is gone: there is nothing left to serve with.
+            Err(e @ AcceptError::Listener(_)) => return Err(e.into()),
+        };
         let (k, ch) = (kernel.clone(), challenges.clone());
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream, k, ch).await {
@@ -221,23 +238,37 @@ fn to_value<T: serde::Serialize>(v: T) -> Result<Value, RpcError> {
     serde_json::to_value(v).map_err(|e| internal(&format!("cannot encode response: {e}")))
 }
 
+/// A proof as `ctx_for` receives it: its nonce already taken from the map by
+/// `dispatch`, along with the verdict of that taking. The taking happens for
+/// every request that carries a proof, before the method is even looked at.
+struct Presented {
+    proof: PresenceProof,
+    nonce: Result<(), RpcError>,
+}
+
+/// The methods that derive their principal from the request, and so the only
+/// ones a presence proof may accompany. Every other method refuses a request
+/// carrying one — after `dispatch` has spent it.
+fn takes_presence(method: &str) -> bool {
+    matches!(
+        method,
+        "task.create" | "task.step" | "stop" | "resume" | "approve"
+    )
+}
+
 /// The only place a `Ctx` is built. Machine by default — the endpoint's ACL
 /// already proved the peer is this user's process — and human only for the
 /// one request that carries a presence proof the enrolled device key made
-/// over a nonce this server issued and has not seen spent.
-fn ctx_for(
-    k: &RealKernel,
-    challenges: &Mutex<Challenges>,
-    presence: Option<PresenceProof>,
-) -> Result<Ctx, RpcError> {
-    let now = now_ms();
+/// over a nonce this server issued, still unexpired, that no earlier request
+/// had spent.
+fn ctx_for(k: &RealKernel, presence: Option<Presented>, now: u64) -> Result<Ctx, RpcError> {
     let principal = match presence {
         None => Principal::Machine {
             node_id: k.node_id.clone(),
             lease_id: "cli".into(),
         },
-        Some(p) => {
-            lock(challenges)?.spend(&p.nonce, now)?;
+        Some(Presented { proof: p, nonce }) => {
+            nonce?;
             let sig: [u8; 64] = hex::decode(&p.signature_hex)
                 .ok()
                 .and_then(|v| v.try_into().ok())
@@ -266,9 +297,24 @@ fn dispatch(
     challenges: &Mutex<Challenges>,
     req: Request,
 ) -> Result<Value, RpcError> {
+    let now = now_ms();
+    // A nonce presented is a nonce spent, whatever the method and whatever
+    // happens next: it leaves the map here, before anything is dispatched, so
+    // a proof sent to a method that would ignore it cannot be shown again to
+    // one that would not.
+    let presence = match req.presence {
+        None => None,
+        Some(proof) => {
+            let nonce = lock(challenges)?.spend(&proof.nonce, now);
+            Some(Presented { proof, nonce })
+        }
+    };
+    if presence.is_some() && !takes_presence(&req.method) {
+        return Err(bad("this method does not take a presence proof"));
+    }
     // Issuing a challenge touches no kernel state.
     if req.method == "presence.challenge" {
-        let (nonce, exp) = lock(challenges)?.issue(now_ms());
+        let (nonce, exp) = lock(challenges)?.issue(now);
         return Ok(json!({ "nonce": nonce, "expires_at_ms": exp }));
     }
     let mut k = lock(kernel)?;
@@ -317,7 +363,7 @@ fn dispatch(
             Ok(json!({ "ok": true }))
         }
         "task.create" => {
-            let ctx = ctx_for(&k, challenges, req.presence)?;
+            let ctx = ctx_for(&k, presence, now)?;
             let goal = p["goal"].as_str().ok_or_else(|| bad("goal"))?;
             let artefact_type = p["artefact_type"].as_str().unwrap_or("note");
             let steps: Vec<StepKind> = serde_json::from_value(p["steps"].clone())
@@ -327,7 +373,7 @@ fn dispatch(
                 .and_then(to_value)
         }
         "task.step" => {
-            let ctx = ctx_for(&k, challenges, req.presence)?;
+            let ctx = ctx_for(&k, presence, now)?;
             let id = p["task_id"].as_str().ok_or_else(|| bad("task_id"))?;
             k.run_task_step(&ctx, id).map_err(kerr).and_then(to_value)
         }
@@ -338,23 +384,29 @@ fn dispatch(
         "task.ls" => to_value(k.tasks()),
         "top" => to_value(k.top()),
         "stop" => {
-            let ctx = ctx_for(&k, challenges, req.presence)?;
+            let ctx = ctx_for(&k, presence, now)?;
             let scope = p["scope"].as_str().unwrap_or("node");
             k.stop(&ctx, scope)
                 .map(|id| json!({ "stop_id": id }))
                 .map_err(kerr)
         }
         "resume" => {
-            let ctx = ctx_for(&k, challenges, req.presence)?;
+            let ctx = ctx_for(&k, presence, now)?;
             let id = p["stop_id"].as_str().ok_or_else(|| bad("stop_id"))?;
             k.resume(&ctx, id)
                 .map(|_| json!({ "ok": true }))
                 .map_err(kerr)
         }
         "approve" => {
-            let ctx = ctx_for(&k, challenges, req.presence)?;
+            let ctx = ctx_for(&k, presence, now)?;
             let a: Approval = serde_json::from_value(p["approval"].clone())
                 .map_err(|e| bad(&format!("approval: {e}")))?;
+            // The other kinds are the harness's and the auditor's to record,
+            // not a local client's to assert: over the pipe, human only, and
+            // refused here rather than left to the kernel.
+            if a.kind != ApprovalKind::Human {
+                return Err(bad("only human approvals are accepted over the transport"));
+            }
             k.approve(&ctx, a)
                 .map(|_| json!({ "ok": true }))
                 .map_err(kerr)

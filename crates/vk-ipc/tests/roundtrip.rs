@@ -5,7 +5,12 @@
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use vk_contracts::principal::HumanKey;
+use vk_contracts::labels::{Clearance, Scope};
+use vk_contracts::principal::{
+    Approval, ApprovalKind, Challenge, HumanKey, Principal, SoftwareHumanKey,
+};
+use vk_ipc::client::{CallError, Client};
+use vk_ipc::PresenceProof;
 
 /// Write one raw line and read back one raw line, decoded as JSON.
 async fn exchange<W, R>(w: &mut W, lines: &mut tokio::io::Lines<R>, bytes: &[u8]) -> Value
@@ -364,5 +369,235 @@ async fn garbage_lines_get_a_parse_error_and_the_connection_survives() {
         c.call("boot.info", json!({}), None).await.unwrap()["node_id"],
         "n1"
     );
+    server.abort();
+}
+
+/// The JSON-RPC code the server answered with.
+fn code_of(err: &anyhow::Error) -> i32 {
+    err.downcast_ref::<CallError>()
+        .unwrap_or_else(|| panic!("not a server error: {err}"))
+        .code
+}
+
+/// One fresh challenge, signed by `key`: a proof good for exactly one request.
+async fn prove(c: &Client, key: &impl HumanKey) -> PresenceProof {
+    let ch = c.call("presence.challenge", json!({}), None).await.unwrap();
+    PresenceProof::sign(key, ch["nonce"].as_str().unwrap())
+}
+
+/// A full SP0 human approval of `subject` by `key`: the challenge names the
+/// subject as its action digest, and the key signs the challenge's digest.
+fn human_approval(key: &impl HumanKey, subject: &str) -> Approval {
+    let challenge = Challenge {
+        resource: "task".into(),
+        action_digest: subject.into(),
+        nonce: uuid::Uuid::new_v4().simple().to_string(),
+        expires_at_ms: vk_kernel::now_ms() + 60_000,
+    };
+    Approval {
+        subject_hash: subject.into(),
+        kind: ApprovalKind::Human,
+        approver: Principal::Human {
+            device_id: key.device_id(),
+        },
+        signature_hex: Some(hex::encode(key.sign(&challenge.digest()))),
+        challenge: Some(challenge),
+    }
+}
+
+#[tokio::test]
+async fn approve_over_ipc_requires_presence_and_a_matching_human_approval() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let laptop = SoftwareHumanKey::generate("laptop");
+    let tablet = SoftwareHumanKey::generate("tablet");
+    {
+        use vk_contracts::testing::KernelTestHooks;
+        let mut kk = k.lock().unwrap();
+        kk.enroll_device("laptop", laptop.verifying_key_bytes());
+        kk.enroll_device("tablet", tablet.verifying_key_bytes());
+    }
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    // A task that has drafted and now waits at its `approve` step.
+    let arch = c
+        .call("arch.mount_mock", json!({"name": "mock"}), None)
+        .await
+        .unwrap()["arch_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let t = c
+        .call(
+            "task.create",
+            json!({
+                "goal": "Draft a proposal",
+                "artefact_type": "proposal",
+                "steps": [
+                    {"kind": "plan", "arch_id": arch},
+                    {"kind": "draft", "arch_id": arch},
+                    {"kind": "approve"}
+                ]
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    let id = t["id"].as_str().unwrap().to_string();
+    let step = || c.call("task.step", json!({"task_id": id}), None);
+    step().await.unwrap();
+    step().await.unwrap();
+    assert_eq!(step().await.unwrap()["status"], "waiting_human");
+
+    // What the scheduler wants approved: the latest artefact, or the register
+    // itself when none is attached — read through the kernel, as it does.
+    let subject = {
+        use vk_contracts::syscalls::{Ctx, Kernel};
+        let mut kk = k.lock().unwrap();
+        let register = kk.task(&id).unwrap().register;
+        let ctx = Ctx {
+            principal: Principal::Machine {
+                node_id: "n1".into(),
+                lease_id: "test".into(),
+            },
+            clearance: Clearance {
+                max_scope: Scope::Personal,
+                third_party_allowed: true,
+            },
+            partition: "local".into(),
+            now_ms: vk_kernel::now_ms(),
+        };
+        let reg = kk.read_register(&ctx, &register).unwrap();
+        reg.artefacts
+            .last()
+            .map(|a| a.hash.clone())
+            .unwrap_or_else(|| vk_contracts::hash_canonical(&reg))
+    };
+    let params = |a: Approval| json!({ "approval": a });
+
+    // (a) No presence: the connection is a machine principal, and I1 refuses
+    // a human approval that did not arrive on the human's own channel.
+    let err = c
+        .call("approve", params(human_approval(&laptop, &subject)), None)
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+    assert!(err.to_string().contains("I1"), "{err}");
+
+    // (c) Presence from the laptop, approval signed by the tablet: the
+    // approver is not the principal the connection proved.
+    let proof = prove(&c, &laptop).await;
+    let err = c
+        .call(
+            "approve",
+            params(human_approval(&tablet, &subject)),
+            Some(proof),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+    assert!(err.to_string().contains("I1"), "{err}");
+
+    // (d) Only human approvals cross the transport: `kind: test` is a
+    // parameter error, refused before the kernel sees it, presence or not.
+    let mut test_kind = human_approval(&laptop, &subject);
+    test_kind.kind = ApprovalKind::Test;
+    let proof = prove(&c, &laptop).await;
+    let err = c
+        .call("approve", params(test_kind), Some(proof))
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_BAD_PARAMS, "{err}");
+    assert!(
+        err.to_string()
+            .contains("only human approvals are accepted over the transport"),
+        "{err}"
+    );
+
+    // None of the above was recorded: the task still waits.
+    assert_eq!(step().await.unwrap()["status"], "waiting_human");
+
+    // (b) Presence from the laptop and the laptop's own approval of the
+    // subject: accepted, and the waiting step completes the task.
+    let proof = prove(&c, &laptop).await;
+    let ok = c
+        .call(
+            "approve",
+            params(human_approval(&laptop, &subject)),
+            Some(proof),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok["ok"], true);
+    let done = step().await.unwrap();
+    assert_eq!(done["status"], "done", "{done}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_presence_proof_on_a_method_that_takes_none_is_refused_and_still_spent() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let laptop = SoftwareHumanKey::generate("laptop");
+    {
+        use vk_contracts::testing::KernelTestHooks;
+        k.lock()
+            .unwrap()
+            .enroll_device("laptop", laptop.verifying_key_bytes());
+    }
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+    let stopped = || {
+        use vk_contracts::testing::KernelTestHooks;
+        k.lock().unwrap().stops().stopped("node")
+    };
+
+    // `task.show` derives no principal, so a proof there is a parameter error...
+    let proof = prove(&c, &laptop).await;
+    let err = c
+        .call("task.show", json!({"task_id": "t-1"}), Some(proof.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_BAD_PARAMS, "{err}");
+    assert!(
+        err.to_string()
+            .contains("this method does not take a presence proof"),
+        "{err}"
+    );
+    // ...and the nonce it carried is spent all the same: re-presented on
+    // `stop`, it is unknown, and nothing stops.
+    let err = c
+        .call("stop", json!({"scope": "node"}), Some(proof))
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+    assert!(err.to_string().contains("I1"), "{err}");
+    assert!(!stopped());
+
+    // The same holds for the one method answered before the kernel lock.
+    let proof = prove(&c, &laptop).await;
+    let err = c
+        .call("presence.challenge", json!({}), Some(proof.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_BAD_PARAMS, "{err}");
+    let err = c
+        .call("stop", json!({"scope": "node"}), Some(proof))
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+    assert!(!stopped());
+
+    // A fresh proof on a method that takes one is still the human path.
+    let proof = prove(&c, &laptop).await;
+    c.call("stop", json!({"scope": "node"}), Some(proof))
+        .await
+        .unwrap();
+    assert!(stopped());
     server.abort();
 }
