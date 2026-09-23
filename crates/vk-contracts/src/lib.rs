@@ -5,6 +5,7 @@
 
 pub mod arch;
 pub mod federation;
+pub mod interceptors;
 pub mod labels;
 pub mod ledger;
 pub mod locks;

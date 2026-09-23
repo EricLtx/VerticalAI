@@ -1,9 +1,8 @@
 //! In-memory stub kernel: enough behaviour to test invariants I1–I4′.
-pub mod interceptors;
-
 use std::collections::BTreeMap;
 use vk_contracts::arch::{ArchManifest, Capability};
 use vk_contracts::hash_canonical;
+use vk_contracts::interceptors;
 use vk_contracts::labels::{Label, Scope};
 use vk_contracts::ledger::{ClockQuality, HlcClock, Ledger, RetentionClass};
 use vk_contracts::locks::{Lease, LockHome, LockTable};

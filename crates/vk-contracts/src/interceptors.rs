@@ -1,9 +1,9 @@
 //! Interceptors (spec §3.11): decidable invariants only.
-use vk_contracts::arch::ArchManifest;
-use vk_contracts::labels::Label;
-use vk_contracts::principal::{Approval, ApprovalKind, DeviceRegistry, Principal};
-use vk_contracts::stop::{LivenessLease, StopSet};
-use vk_contracts::syscalls::KernelError;
+use crate::arch::ArchManifest;
+use crate::labels::Label;
+use crate::principal::{Approval, ApprovalKind, DeviceRegistry, Principal};
+use crate::stop::{LivenessLease, StopSet};
+use crate::syscalls::KernelError;
 
 /// I1: human approvals only from human ceremonies; STOP/RESUME require human presence.
 pub fn i1_approval(
