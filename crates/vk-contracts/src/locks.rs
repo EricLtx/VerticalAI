@@ -42,6 +42,13 @@ impl LockHome {
         *f += 1;
         *f
     }
+    /// Reinstate the highest fence a restart must not reissue. Fences are only
+    /// useful if they are monotonic for the life of the resource, not for the
+    /// life of the process, so the kernel replays the persisted value on boot.
+    pub fn restore(&mut self, resource: &str, fence: u64) {
+        let f = self.next.entry(resource.to_string()).or_insert(0);
+        *f = (*f).max(fence);
+    }
     pub fn is_stale(&self, resource: &str, fence: u64) -> bool {
         self.next
             .get(resource)
@@ -89,6 +96,19 @@ impl LockTable {
         };
         self.leases.insert(lease.id.clone(), lease.clone());
         Ok(lease)
+    }
+    /// Reinstate a lease granted before a restart, without re-running mutual
+    /// exclusion: a past `acquire` already decided this. Keeps the id counter
+    /// ahead of every restored id so a later `acquire` cannot mint a duplicate.
+    pub fn restore(&mut self, lease: Lease) {
+        if let Some(n) = lease
+            .id
+            .strip_prefix("lease-")
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            self.counter = self.counter.max(n);
+        }
+        self.leases.insert(lease.id.clone(), lease);
     }
     pub fn release(&mut self, lease_id: &str) {
         self.leases.remove(lease_id);

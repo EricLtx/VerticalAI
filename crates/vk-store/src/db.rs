@@ -113,6 +113,30 @@ impl Db {
             .optional()?)
     }
 
+    /// Every `kv` entry whose key starts with `prefix`, ordered by key. The
+    /// kernel replays whole families of small values on boot (lock fences, for
+    /// one) and needs to enumerate them without knowing their names.
+    pub fn kv_list_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, value FROM kv WHERE key LIKE ?1 ESCAPE '\\' ORDER BY key")?;
+        let pattern = format!(
+            "{}%",
+            prefix
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        let rows = stmt.query_map(params![pattern], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn kv_set(&self, key: &str, value: &str) -> Result<()> {
         self.conn.execute("INSERT INTO kv (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![key, value])?;
         Ok(())

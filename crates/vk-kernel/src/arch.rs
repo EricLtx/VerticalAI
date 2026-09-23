@@ -1,4 +1,5 @@
 //! Arch adapters (spec §3.7) and IR lowering/raising (spec §3.2).
+use std::collections::BTreeSet;
 use vk_contracts::arch::ArchManifest;
 use vk_contracts::register::Register;
 
@@ -59,18 +60,131 @@ pub fn lower(reg: &Register, role: &str) -> String {
     s
 }
 
-/// Structural projection when the prompt exceeds the budget (I4'): keep the role,
-/// goal and decisions; truncate evidence, never silently.
-pub fn project(prompt: &str, budget_tokens: u32) -> String {
-    let max_chars = (budget_tokens as usize).saturating_mul(4);
-    if prompt.len() <= max_chars {
-        return prompt.to_string();
+/// One indivisible piece of a lowered prompt. A `CONSTRAINTS:` header owns the
+/// `- ` lines under it, so a projection can never keep a bullet whose heading
+/// it dropped.
+struct Unit {
+    text: String,
+    lines: usize,
+    rank: u8,
+}
+
+/// Priority of a prompt line: lower is kept first. `ROLE:`/`GOAL:` (rank 0) say
+/// what the call *is* and are never dropped; evidence is the first thing to go.
+fn rank_of(line: &str) -> u8 {
+    if line.starts_with("ROLE:") || line.starts_with("GOAL:") {
+        0
+    } else if line.starts_with("DECISION:") {
+        1
+    } else if line.starts_with("CONSTRAINTS:") {
+        2
+    } else if line.starts_with("OPEN:") {
+        3
+    } else if line.starts_with("EVIDENCE") {
+        4
+    } else {
+        5
     }
-    let head: String = prompt.chars().take(max_chars.saturating_sub(40)).collect();
-    format!(
-        "{head}\n[PROJECTED: {} chars dropped]\n",
-        prompt.len() - head.len()
-    )
+}
+
+fn units_of(prompt: &str) -> Vec<Unit> {
+    let lines: Vec<&str> = prompt.lines().collect();
+    let mut units = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let rank = rank_of(lines[i]);
+        let mut text = lines[i].to_string();
+        let mut count = 1;
+        if rank == 2 {
+            while i + count < lines.len() && lines[i + count].starts_with("- ") {
+                text.push('\n');
+                text.push_str(lines[i + count]);
+                count += 1;
+            }
+        }
+        units.push(Unit {
+            text,
+            lines: count,
+            rank,
+        });
+        i += count;
+    }
+    units
+}
+
+fn marker(dropped_lines: usize) -> String {
+    format!("[PROJECTED: {dropped_lines} lines dropped]")
+}
+
+fn render(units: &[Unit], kept: &BTreeSet<usize>, marker_line: Option<&str>) -> String {
+    let mut s = String::new();
+    for i in kept {
+        s.push_str(&units[*i].text);
+        s.push('\n');
+    }
+    if let Some(m) = marker_line {
+        s.push_str(m);
+        s.push('\n');
+    }
+    s
+}
+
+/// Structural projection when the prompt exceeds the budget (I4'). The prompt is
+/// rebuilt from whole lines in priority order — `ROLE:` and `GOAL:` always, then
+/// decisions, constraints, open questions and last of all evidence — admitting a
+/// unit only while `count` of the result stays within `budget_tokens`. Whatever
+/// is left out is declared in a trailing `[PROJECTED: n lines dropped]` marker,
+/// so a projection is never a silent truncation, and the surviving lines are
+/// whole: this is not a byte-wise cut through the middle of the goal.
+///
+/// Returns `None` when the role and goal plus that marker already exceed the
+/// budget. There is no honest prompt to send in that case and the caller must
+/// refuse the inference (I4′) rather than send a mutilated one.
+pub fn project(prompt: &str, budget_tokens: u32, count: &dyn Fn(&str) -> u32) -> Option<String> {
+    if count(prompt) <= budget_tokens {
+        return Some(prompt.to_string());
+    }
+    let units = units_of(prompt);
+    let mut kept: BTreeSet<usize> = units
+        .iter()
+        .enumerate()
+        .filter(|(_, u)| u.rank == 0)
+        .map(|(i, _)| i)
+        .collect();
+
+    // The marker's own size counts against the budget. Reserve the widest one
+    // that can end up being printed, so admitting a unit can never be undone by
+    // the marker growing a digit afterwards.
+    let droppable: usize = units
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !kept.contains(i))
+        .map(|(_, u)| u.lines)
+        .sum();
+    let reserved = marker(droppable);
+
+    if count(&render(&units, &kept, Some(&reserved))) > budget_tokens {
+        return None;
+    }
+    let mut order: Vec<usize> = (0..units.len()).filter(|i| !kept.contains(i)).collect();
+    order.sort_by_key(|i| (units[*i].rank, *i));
+    for i in order {
+        kept.insert(i);
+        if count(&render(&units, &kept, Some(&reserved))) > budget_tokens {
+            kept.remove(&i);
+        }
+    }
+    let dropped: usize = units
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !kept.contains(i))
+        .map(|(_, u)| u.lines)
+        .sum();
+    Some(if dropped == 0 {
+        render(&units, &kept, None)
+    } else {
+        render(&units, &kept, Some(&marker(dropped)))
+    })
 }
 
 pub fn raise(reg: &mut Register, role: &str, output: &str) {

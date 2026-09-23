@@ -46,6 +46,11 @@ pub enum KernelError {
     Gate(String),
     #[error("not found: {0}")]
     NotFound(String),
+    /// A durable write or read failed. A syscall that cannot persist its effect
+    /// must fail loudly: a swallowed write is an invariant that survives only
+    /// until the next restart.
+    #[error("store failure: {0}")]
+    Store(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

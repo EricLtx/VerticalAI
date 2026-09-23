@@ -21,6 +21,14 @@ use vk_contracts::testing::KernelTestHooks;
 use vk_store::keys::KeySource;
 use vk_store::Store;
 
+/// Any durable read or write that failed. A syscall that cannot persist its
+/// effect must not report success: the effect would survive only until the next
+/// restart, and every invariant this kernel enforces is a claim about what is
+/// still true after one.
+fn store_failed(e: impl std::fmt::Display) -> KernelError {
+    KernelError::Store(e.to_string())
+}
+
 /// An enrolled human device, as the `devices` table stores it.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DeviceRow {
@@ -95,6 +103,26 @@ impl RealKernel {
             );
             self.budgets.insert(id, budget);
         }
+        // Fences first, and from `kv` rather than from the lease rows: a fence
+        // must stay monotonic for the life of the resource, including after the
+        // last lease that carried it has expired and been swept away below.
+        for (key, value) in self.store.db.kv_list_prefix("fence:")? {
+            if let (Some(resource), Ok(fence)) = (key.strip_prefix("fence:"), value.parse::<u64>())
+            {
+                self.home.restore(resource, fence);
+            }
+        }
+        // A lease outlives the process that granted it: a restart must not hand
+        // the resource to somebody else while the first holder still has time.
+        let now = now_ms();
+        for (key, lease) in self.store.db.list_json::<Lease>("leases")? {
+            self.home.restore(&lease.resource, lease.fence);
+            if lease.expired(now) {
+                self.store.db.delete("leases", &key)?;
+            } else {
+                self.locks.restore(lease);
+            }
+        }
         self.counter = self
             .store
             .db
@@ -104,15 +132,32 @@ impl RealKernel {
         Ok(())
     }
 
-    /// Mount a real adapter (replaces the mock loaded from the manifest table).
+    /// Mount an adapter for its manifest's arch id, replacing the mock that
+    /// `load` built from the `arches` table.
+    ///
+    /// The arch id hashes only `ArchIdentity`, so two manifests can agree on it
+    /// and still disagree about clearance — the very field `i2_flow` consults.
+    /// Letting the second silently win would relabel a mounted arch, so a
+    /// conflicting manifest is refused; re-mounting an identical one only swaps
+    /// the adapter (a real engine taking over from the mock) and is otherwise a
+    /// no-op.
     pub fn mount(&mut self, adapter: Arc<dyn arch::ArchAdapter>) -> Result<String> {
         let m = adapter.manifest().clone();
         m.validate()?;
         let id = m.arch_id();
+        if let Some(mounted) = self.adapters.get(&id) {
+            anyhow::ensure!(
+                *mounted.manifest() == m,
+                "arch {id} is already mounted with a different manifest; unmount first"
+            );
+            self.budgets.insert(id.clone(), adapter.context_budget());
+            self.adapters.insert(id.clone(), adapter);
+            return Ok(id);
+        }
         self.store.db.put_json("arches", &id, &m)?;
         self.budgets.insert(id.clone(), adapter.context_budget());
         self.adapters.insert(id.clone(), adapter);
-        self.log("arch.mounted", now_ms(), &id);
+        self.log("arch.mounted", now_ms(), &id)?;
         Ok(id)
     }
 
@@ -120,7 +165,7 @@ impl RealKernel {
         self.adapters.remove(arch_id);
         self.budgets.remove(arch_id);
         self.store.db.delete("arches", arch_id)?;
-        self.log("arch.unmounted", now_ms(), &arch_id);
+        self.log("arch.unmounted", now_ms(), &arch_id)?;
         Ok(())
     }
 
@@ -139,6 +184,52 @@ impl RealKernel {
         &self.devices
     }
 
+    /// Enrol a human device. The `KernelTestHooks` hook of the same name cannot
+    /// report a failed write, so production callers (the IPC admin syscall) use
+    /// this one.
+    pub fn enroll_device_persisted(
+        &mut self,
+        device_id: &str,
+        vk: [u8; 32],
+    ) -> Result<(), KernelError> {
+        self.store
+            .db
+            .put_json(
+                "devices",
+                device_id,
+                &DeviceRow {
+                    vk_hex: hex::encode(vk),
+                    trust_class: "full".into(),
+                },
+            )
+            .map_err(store_failed)?;
+        self.devices.register(device_id.into(), vk);
+        self.log("device.enrolled", now_ms(), &device_id)?;
+        Ok(())
+    }
+
+    /// Renew a business's liveness lease (I4). As above: the test hook cannot
+    /// report a failed write, production callers use this one.
+    pub fn renew_liveness_persisted(
+        &mut self,
+        business: &str,
+        device_id: &str,
+        expires_at_ms: u64,
+    ) -> Result<(), KernelError> {
+        self.store
+            .db
+            .put_json(
+                "liveness",
+                business,
+                &LivenessLease {
+                    business: business.into(),
+                    renewed_by_device: device_id.into(),
+                    expires_at_ms,
+                },
+            )
+            .map_err(store_failed)
+    }
+
     pub fn attach_artefact(
         &mut self,
         ctx: &Ctx,
@@ -151,7 +242,7 @@ impl RealKernel {
             .store
             .blobs
             .put(&format!("task:{}", reg.task_id), reg.label.clone(), bytes)
-            .map_err(|e| KernelError::NotFound(e.to_string()))?;
+            .map_err(store_failed)?;
         reg.artefacts.push(ArtefactRef {
             hash: env.hash.clone(),
             kind: kind.into(),
@@ -177,46 +268,61 @@ impl RealKernel {
             .map_err(|e| KernelError::NotFound(e.to_string()))
     }
 
-    fn log(&mut self, kind: &str, wall_ms: u64, payload: &impl serde::Serialize) {
+    fn log(
+        &mut self,
+        kind: &str,
+        wall_ms: u64,
+        payload: &impl serde::Serialize,
+    ) -> Result<(), KernelError> {
         let hlc = self.clock.now(wall_ms);
-        let _ = self.store.ledger.append(
-            kind,
-            RetentionClass::Operational90d,
-            wall_ms,
-            ClockQuality::Synced,
-            hlc,
-            vec![],
-            hash_canonical(payload),
-        );
+        self.store
+            .ledger
+            .append(
+                kind,
+                RetentionClass::Operational90d,
+                wall_ms,
+                ClockQuality::Synced,
+                hlc,
+                vec![],
+                hash_canonical(payload),
+            )
+            .map_err(store_failed)?;
+        Ok(())
     }
 
-    fn next_id(&mut self, prefix: &str) -> String {
+    fn next_id(&mut self, prefix: &str) -> Result<String, KernelError> {
         self.counter += 1;
-        let _ = self.store.db.kv_set("counter", &self.counter.to_string());
-        format!("{prefix}-{}-{}", self.node_id, self.counter)
+        self.store
+            .db
+            .kv_set("counter", &self.counter.to_string())
+            .map_err(store_failed)?;
+        Ok(format!("{prefix}-{}-{}", self.node_id, self.counter))
     }
 
-    fn liveness(&self, business: &str) -> Option<LivenessLease> {
-        self.store.db.get_json("liveness", business).ok().flatten()
+    fn liveness(&self, business: &str) -> Result<Option<LivenessLease>, KernelError> {
+        self.store
+            .db
+            .get_json("liveness", business)
+            .map_err(store_failed)
     }
 
     /// Accumulate the per-arch counters a later cost/quota task reads back.
-    fn bump_stats(&self, arch_id: &str, tokens_in: u32, projected: bool) {
+    fn bump_stats(
+        &self,
+        arch_id: &str,
+        tokens_in: u32,
+        projected: bool,
+    ) -> Result<(), KernelError> {
         let key = format!("stats:{arch_id}");
-        let mut stats: ArchStats = self
-            .store
-            .db
-            .kv_get(&key)
-            .ok()
-            .flatten()
-            .and_then(|v| serde_json::from_str(&v).ok())
-            .unwrap_or_default();
+        let mut stats: ArchStats = match self.store.db.kv_get(&key).map_err(store_failed)? {
+            Some(v) => serde_json::from_str(&v).map_err(store_failed)?,
+            None => ArchStats::default(),
+        };
         stats.calls += 1;
         stats.tokens_in += u64::from(tokens_in);
         stats.projected += u64::from(projected);
-        if let Ok(json) = serde_json::to_string(&stats) {
-            let _ = self.store.db.kv_set(&key, &json);
-        }
+        let json = serde_json::to_string(&stats).map_err(store_failed)?;
+        self.store.db.kv_set(&key, &json).map_err(store_failed)
     }
 }
 
@@ -234,8 +340,8 @@ impl Kernel for RealKernel {
         goal: &str,
         label: Label,
     ) -> Result<RegisterId, KernelError> {
-        let id = RegisterId(self.next_id("reg"));
-        let task_id = self.next_id("task");
+        let id = RegisterId(self.next_id("reg")?);
+        let task_id = self.next_id("task")?;
         let reg = Register {
             id: id.clone(),
             task_id,
@@ -250,8 +356,8 @@ impl Kernel for RealKernel {
         self.store
             .db
             .put_json("registers", &id.0, &reg)
-            .map_err(|e| KernelError::NotFound(e.to_string()))?;
-        self.log("task.submitted", ctx.now_ms, &id);
+            .map_err(store_failed)?;
+        self.log("task.submitted", ctx.now_ms, &id)?;
         Ok(id)
     }
 
@@ -260,8 +366,7 @@ impl Kernel for RealKernel {
             .store
             .db
             .get_json("registers", &id.0)
-            .ok()
-            .flatten()
+            .map_err(store_failed)?
             .ok_or_else(|| KernelError::NotFound(id.0.clone()))?;
         if !reg.label.flows_to(&ctx.clearance) {
             return Err(KernelError::I2(format!(
@@ -276,9 +381,8 @@ impl Kernel for RealKernel {
         self.store
             .db
             .put_json("registers", &reg.id.0, &reg)
-            .map_err(|e| KernelError::NotFound(e.to_string()))?;
-        self.log("register.written", ctx.now_ms, &reg.id);
-        Ok(())
+            .map_err(store_failed)?;
+        self.log("register.written", ctx.now_ms, &reg.id)
     }
 
     fn infer(
@@ -300,8 +404,9 @@ impl Kernel for RealKernel {
             Capability::Judge => "judge",
             _ => "draft",
         };
+        let count = |text: &str| adapter.count_tokens(text);
         let prompt = arch::lower(&reg, role);
-        let tokens = adapter.count_tokens(&prompt);
+        let tokens = count(&prompt);
         let budget = self
             .budgets
             .get(arch_id)
@@ -309,20 +414,32 @@ impl Kernel for RealKernel {
             .unwrap_or_else(|| adapter.context_budget());
         let projected = tokens > budget;
         let prompt = if projected {
-            self.log("infer.projected", ctx.now_ms, &(arch_id, tokens, budget));
-            arch::project(&prompt, budget)
+            // Project first, log second: an `infer.projected` event has to mean
+            // a projection that actually happened.
+            let fitted = arch::project(&prompt, budget, &count).ok_or_else(|| {
+                KernelError::I4Prime(format!(
+                    "arch {arch_id} has {budget} tokens of context, too few for the role and goal \
+                     of register {}; refusing rather than sending a mutilated prompt",
+                    reg_id.0
+                ))
+            })?;
+            self.log("infer.projected", ctx.now_ms, &(arch_id, tokens, budget))?;
+            fitted
         } else {
             prompt
         };
+        // What the arch is actually handed, not a clamp of what we wished for.
+        let tokens_in = count(&prompt);
         let output = adapter
             .complete(&prompt, budget.min(1024))
             .map_err(|e| KernelError::NotFound(format!("arch error: {e}")))?;
+        // The call has left the kernel: record it before doing anything that
+        // could fail, or a real send to a real arch could leave no trace.
+        self.log("infer", ctx.now_ms, &(arch_id, reg_id))?;
+        self.infer_log.push((arch_id.into(), reg.label.clone()));
+        self.bump_stats(arch_id, tokens_in, projected)?;
         arch::raise(&mut reg, role, &output);
-        self.write_register(ctx, reg.clone())?;
-        self.log("infer", ctx.now_ms, &(arch_id, reg_id));
-        self.infer_log.push((arch_id.into(), reg.label));
-        let tokens_in = tokens.min(budget);
-        self.bump_stats(arch_id, tokens_in, projected);
+        self.write_register(ctx, reg)?;
         Ok(InferOutcome {
             arch_id: arch_id.into(),
             projected,
@@ -339,22 +456,33 @@ impl Kernel for RealKernel {
             &ctx.partition,
             &mut self.home,
         )?;
-        let _ = self.store.db.put_json("leases", &l.id, &l);
-        self.log("lease.granted", ctx.now_ms, &l.id);
+        self.store
+            .db
+            .put_json("leases", &l.id, &l)
+            .map_err(store_failed)?;
+        // The fence outlives the lease: persist it separately so a resource
+        // whose leases have all expired still cannot see a fence reissued.
+        self.store
+            .db
+            .kv_set(&format!("fence:{resource}"), &l.fence.to_string())
+            .map_err(store_failed)?;
+        self.log("lease.granted", ctx.now_ms, &l.id)?;
         Ok(l)
     }
 
     fn approve(&mut self, ctx: &Ctx, approval: Approval) -> Result<(), KernelError> {
         interceptors::i1_approval(&ctx.principal, &approval, &self.devices, ctx.now_ms)?;
         let key = format!("{}:{}", approval.subject_hash, hash_canonical(&approval));
-        let _ = self.store.db.put_json("approvals", &key, &approval);
-        self.log("approval.recorded", ctx.now_ms, &approval);
-        Ok(())
+        self.store
+            .db
+            .put_json("approvals", &key, &approval)
+            .map_err(store_failed)?;
+        self.log("approval.recorded", ctx.now_ms, &approval)
     }
 
     fn stop(&mut self, ctx: &Ctx, scope: &str) -> Result<String, KernelError> {
         interceptors::i1_presence(&ctx.principal)?;
-        let id = self.next_id("stop");
+        let id = self.next_id("stop")?;
         let e = StopEvent {
             id: id.clone(),
             scope: scope.into(),
@@ -362,25 +490,35 @@ impl Kernel for RealKernel {
             hlc_ms: ctx.now_ms,
             causal_heads: vec![],
         };
-        self.stops.try_add_stop(e.clone())?;
-        let _ = self.store.db.put_json("stops", &id, &e);
-        self.log("stop", ctx.now_ms, &id);
+        // Durable before in-memory: a STOP that this process believes in but
+        // that no restart would find is the one failure a STOP may never have.
+        self.store
+            .db
+            .put_json("stops", &id, &e)
+            .map_err(store_failed)?;
+        self.stops.try_add_stop(e)?;
+        self.log("stop", ctx.now_ms, &id)?;
         Ok(id)
     }
 
     fn resume(&mut self, ctx: &Ctx, stop_id: &str) -> Result<(), KernelError> {
         interceptors::i1_presence(&ctx.principal)?;
-        let id = self.next_id("resume");
+        let id = self.next_id("resume")?;
         let e = ResumeEvent {
             id: id.clone(),
             cites: stop_id.into(),
             issuer: ctx.principal.clone(),
             hlc_ms: ctx.now_ms,
         };
-        self.stops.add_resume(e.clone())?;
-        let _ = self.store.db.put_json("resumes", &id, &e);
-        self.log("resume", ctx.now_ms, &stop_id);
-        Ok(())
+        self.store
+            .db
+            .put_json("resumes", &id, &e)
+            .map_err(store_failed)?;
+        // A resume that cites an unknown stop is refused here; the row left
+        // behind is inert, because `load` replays resumes through this same
+        // check and drops it again.
+        self.stops.add_resume(e)?;
+        self.log("resume", ctx.now_ms, &stop_id)
     }
 
     fn run_automation(
@@ -392,10 +530,9 @@ impl Kernel for RealKernel {
         if ctx.principal.is_human() {
             return Ok(()); // human-initiated runs are not automations
         }
-        let lease = self.liveness(business);
+        let lease = self.liveness(business)?;
         interceptors::i4_liveness(business, lease.as_ref(), &self.stops, ctx.now_ms)?;
-        self.log("automation.ran", ctx.now_ms, &(business, module));
-        Ok(())
+        self.log("automation.ran", ctx.now_ms, &(business, module))
     }
 
     fn promote(
@@ -429,9 +566,11 @@ impl Kernel for RealKernel {
                 module.name
             )));
         }
-        let _ = self.store.db.put_json("hot", &subject, module);
-        self.log("module.promoted", ctx.now_ms, &subject);
-        Ok(())
+        self.store
+            .db
+            .put_json("hot", &subject, module)
+            .map_err(store_failed)?;
+        self.log("module.promoted", ctx.now_ms, &subject)
     }
 
     fn export(
@@ -450,8 +589,7 @@ impl Kernel for RealKernel {
                 "declassification verdict required to leave the business".into(),
             ));
         }
-        self.log("module.exported", ctx.now_ms, &(module_hash, to_scope));
-        Ok(())
+        self.log("module.exported", ctx.now_ms, &(module_hash, to_scope))
     }
 
     fn ledger(&self) -> &Ledger {
@@ -470,28 +608,13 @@ impl KernelTestHooks for RealKernel {
     }
 
     fn enroll_device(&mut self, device_id: &str, vk: [u8; 32]) {
-        self.devices.register(device_id.into(), vk);
-        let _ = self.store.db.put_json(
-            "devices",
-            device_id,
-            &DeviceRow {
-                vk_hex: hex::encode(vk),
-                trust_class: "full".into(),
-            },
-        );
-        self.log("device.enrolled", now_ms(), &device_id);
+        self.enroll_device_persisted(device_id, vk)
+            .expect("store write");
     }
 
     fn renew_liveness(&mut self, business: &str, device_id: &str, expires_at_ms: u64) {
-        let _ = self.store.db.put_json(
-            "liveness",
-            business,
-            &LivenessLease {
-                business: business.into(),
-                renewed_by_device: device_id.into(),
-                expires_at_ms,
-            },
-        );
+        self.renew_liveness_persisted(business, device_id, expires_at_ms)
+            .expect("store write");
     }
 
     fn set_context_budget(&mut self, arch_id: &str, tokens: u32) {
@@ -499,13 +622,16 @@ impl KernelTestHooks for RealKernel {
     }
 
     fn approvals_for(&self, subject_hash: &str) -> Vec<Approval> {
+        // On the stored value, never on the composite key: `hash_canonical`
+        // contains ':' itself, so a key-prefix match would let the subject
+        // "sha256" stand in for every approval in the table.
         self.store
             .db
             .list_json::<Approval>("approvals")
             .unwrap_or_default()
             .into_iter()
-            .filter(|(k, _)| k.starts_with(&format!("{subject_hash}:")))
             .map(|(_, a)| a)
+            .filter(|a| a.subject_hash == subject_hash)
             .collect()
     }
 
@@ -534,6 +660,7 @@ mod tests {
     use vk_contracts::arch::*;
     use vk_contracts::labels::*;
     use vk_contracts::principal::*;
+    use vk_contracts::register::Evidence;
     use vk_contracts::testing::KernelTestHooks;
     use vk_store::keys::KeySource;
 
@@ -541,9 +668,12 @@ mod tests {
         RealKernel::open(dir, KeySource::File(dir.join("master.key")), "n1").unwrap()
     }
 
-    pub(crate) fn local(clearance: Clearance) -> ArchManifest {
+    /// The arch id hashes `ArchIdentity` alone, so two fixtures that differ only
+    /// in clearance collide on it and `mount` (rightly) refuses the second. Name
+    /// the weights when a test needs two arches mounted at once.
+    pub(crate) fn local_named(name: &str, clearance: Clearance) -> ArchManifest {
         ArchManifest {
-            name: "mock".into(),
+            name: name.into(),
             capabilities: [Capability::Generate, Capability::Plan].into(),
             locality: Locality::Local,
             jurisdiction: "FR".into(),
@@ -553,7 +683,7 @@ mod tests {
             context_ceiling: 100,
             determinism: Determinism::SeededDeterministic,
             identity: ArchIdentity {
-                weights_sha256: "sha256:mock".into(),
+                weights_sha256: format!("sha256:mock-{name}"),
                 engine: "mock".into(),
                 engine_version: "1".into(),
                 backend: "cpu".into(),
@@ -569,16 +699,24 @@ mod tests {
         }
     }
 
+    pub(crate) fn local(clearance: Clearance) -> ArchManifest {
+        local_named("mock", clearance)
+    }
+
+    fn personal() -> Clearance {
+        Clearance {
+            max_scope: Scope::Personal,
+            third_party_allowed: true,
+        }
+    }
+
     fn machine(now: u64) -> Ctx {
         Ctx {
             principal: Principal::Machine {
                 node_id: "n1".into(),
                 lease_id: "cli".into(),
             },
-            clearance: Clearance {
-                max_scope: Scope::Personal,
-                third_party_allowed: true,
-            },
+            clearance: personal(),
             partition: "p1".into(),
             now_ms: now,
         }
@@ -598,10 +736,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let (arch, reg, stop_id) = {
             let mut k = open(d.path());
-            let arch = k.register_arch(local(Clearance {
-                max_scope: Scope::Personal,
-                third_party_allowed: true,
-            }));
+            let arch = k.register_arch(local(personal()));
             let reg = k
                 .submit_task(&machine(1), "draft a proposal", Label::bottom())
                 .unwrap();
@@ -633,10 +768,13 @@ mod tests {
                 max_scope: Scope::Business,
                 third_party_allowed: false,
             },
-            ..local(Clearance {
-                max_scope: Scope::Public,
-                third_party_allowed: false,
-            })
+            ..local_named(
+                "cloud",
+                Clearance {
+                    max_scope: Scope::Public,
+                    third_party_allowed: false,
+                },
+            )
         });
         let r = k
             .submit_task(
@@ -653,24 +791,233 @@ mod tests {
             k.infer(&machine(1), &cloud, Capability::Generate, &r),
             Err(KernelError::I2(_))
         ));
-        let small = k.register_arch(local(Clearance {
-            max_scope: Scope::Personal,
-            third_party_allowed: true,
-        }));
-        k.set_context_budget(&small, 5);
+
+        let small = k.register_arch(local_named("small", personal()));
+        k.set_context_budget(&small, 40);
         let r2 = k
-            .submit_task(&machine(1), &"g".repeat(400), Label::bottom())
+            .submit_task(&machine(1), "draft a proposal", Label::bottom())
             .unwrap();
+        // Bulky evidence: the part a projection is allowed to drop.
+        let mut reg = k.read_register(&machine(1), &r2).unwrap();
+        reg.evidence.push(Evidence {
+            content: "e".repeat(400),
+            origin: Origin::Web,
+            source_hash: "sha256:e".into(),
+        });
+        k.write_register(&machine(1), reg).unwrap();
+
+        let out = k
+            .infer(&machine(1), &small, Capability::Generate, &r2)
+            .unwrap();
+        assert!(out.projected);
         assert!(
-            k.infer(&machine(1), &small, Capability::Generate, &r2)
-                .unwrap()
-                .projected
+            out.tokens_in <= 40,
+            "tokens_in must be what was sent, not a clamp: {}",
+            out.tokens_in
         );
         assert!(k
             .ledger()
             .events()
             .iter()
             .any(|e| e.kind == "infer.projected"));
+        // The mock echoes its prompt back, so the raised decision shows what the
+        // arch really saw: the goal survived and the drop was declared.
+        let raised = k.read_register(&machine(1), &r2).unwrap().decisions[0].clone();
+        assert!(raised.contains("GOAL: draft a proposal"), "{raised}");
+        assert!(raised.contains("1 lines dropped"), "{raised}");
+    }
+
+    #[test]
+    fn a_context_too_small_for_the_goal_is_refused_not_truncated() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let a = k.register_arch(local(personal()));
+        k.set_context_budget(&a, 5);
+        let r = k
+            .submit_task(&machine(1), &"g".repeat(400), Label::bottom())
+            .unwrap();
+        assert!(matches!(
+            k.infer(&machine(1), &a, Capability::Generate, &r),
+            Err(KernelError::I4Prime(_))
+        ));
+        assert!(k.infer_log().is_empty());
+        assert!(
+            !k.ledger()
+                .events()
+                .iter()
+                .any(|e| e.kind == "infer" || e.kind == "infer.projected"),
+            "a refused inference must not claim a projection it never made"
+        );
+    }
+
+    #[test]
+    fn the_infer_event_is_recorded_before_the_register_it_updates() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let a = k.register_arch(local(personal()));
+        let r = k
+            .submit_task(&machine(1), "draft a proposal", Label::bottom())
+            .unwrap();
+        k.infer(&machine(2), &a, Capability::Plan, &r).unwrap();
+        let kinds: Vec<&str> = k
+            .ledger()
+            .events()
+            .iter()
+            .map(|e| e.kind.as_str())
+            .collect();
+        let sent = kinds.iter().position(|x| *x == "infer").unwrap();
+        let written = kinds.iter().position(|x| *x == "register.written").unwrap();
+        assert!(
+            sent < written,
+            "the send must reach the ledger before its result: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn leases_and_fences_survive_reopen() {
+        let d = tempfile::tempdir().unwrap();
+        // Lease expiry is a wall-clock property and `load` sweeps on the wall
+        // clock, so the contexts here are anchored to it as a real caller's are.
+        let t0 = now_ms();
+        let fence_before = {
+            let mut k = open(d.path());
+            k.lease(&machine(t0), "doc:1", 60_000).unwrap().fence
+        };
+        let mut k = open(d.path());
+        let other = Ctx {
+            principal: Principal::Machine {
+                node_id: "n2".into(),
+                lease_id: "cli".into(),
+            },
+            ..machine(t0 + 1_000)
+        };
+        assert!(
+            matches!(k.lease(&other, "doc:1", 1_000), Err(KernelError::Lock(_))),
+            "a restart must not release a lease that still has time to run"
+        );
+        let l2 = k
+            .lease(
+                &Ctx {
+                    now_ms: t0 + 61_000,
+                    ..other
+                },
+                "doc:1",
+                1_000,
+            )
+            .unwrap();
+        assert!(
+            l2.fence > fence_before,
+            "fences must stay monotonic across a restart: {} vs {fence_before}",
+            l2.fence
+        );
+    }
+
+    #[test]
+    fn remounting_a_different_manifest_under_the_same_identity_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let mounted = local(personal());
+        let id = k.register_arch(mounted.clone());
+        // Same ArchIdentity, so the same arch id, but a clearance that would
+        // quietly widen what i2_flow lets through.
+        let widened = ArchManifest {
+            clearance: Clearance {
+                max_scope: Scope::Holdout,
+                third_party_allowed: true,
+            },
+            ..mounted.clone()
+        };
+        let budget = widened.context_ceiling;
+        let err = k
+            .mount(Arc::new(arch::MockAdapter {
+                manifest: widened,
+                budget,
+            }))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("already mounted with a different"),
+            "{err}"
+        );
+        assert_eq!(k.arches()[0].1.clearance, personal());
+
+        // Re-mounting the identical manifest is accepted and logs nothing new.
+        fn mounts(k: &RealKernel) -> usize {
+            k.ledger()
+                .events()
+                .iter()
+                .filter(|e| e.kind == "arch.mounted")
+                .count()
+        }
+        let before = mounts(&k);
+        assert_eq!(k.register_arch(mounted), id);
+        assert_eq!(mounts(&k), before);
+        assert_eq!(k.arches().len(), 1);
+    }
+
+    #[test]
+    fn an_approval_for_one_subject_never_approves_another() {
+        use vk_contracts::module::{ModuleKind, Provenance};
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let key = SoftwareHumanKey::generate("phone-1");
+        k.enroll_device("phone-1", key.verifying_key_bytes());
+        let ch = Challenge {
+            resource: "module:quote-drafter".into(),
+            action_digest: "sha256:c".into(),
+            nonce: "n".into(),
+            expires_at_ms: 10,
+        };
+        let sig = key.sign(&ch.digest());
+        k.approve(
+            &human(2),
+            Approval {
+                subject_hash: "sha256:c".into(),
+                kind: ApprovalKind::Human,
+                approver: Principal::Human {
+                    device_id: "phone-1".into(),
+                },
+                challenge: Some(ch),
+                signature_hex: Some(hex::encode(sig)),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(k.approvals_for("sha256:c").len(), 1);
+        // The row's key is "<subject>:<hash_canonical>" and hash_canonical is
+        // itself "sha256:…", so a key-prefix match would let a module whose
+        // content hash is the bare string "sha256" inherit this approval.
+        assert!(k.approvals_for("sha256").is_empty());
+        assert!(k.approvals_for("sha256:c2").is_empty());
+
+        let impostor = ModuleManifest {
+            name: "impostor".into(),
+            kind: ModuleKind::Skill,
+            version: "0.1.0".into(),
+            machine_evolved: true,
+            files: vec!["SKILL.md".into()],
+            provenance: Provenance {
+                content_hash: "sha256".into(),
+                lineage: vec![],
+                signer: "founder".into(),
+                arch_compat: vec![],
+                origin_taints: Default::default(),
+            },
+            pool_epoch: None,
+            autonomy_profile: None,
+            tags: Default::default(),
+        };
+        let verdict = GateVerdict {
+            gate: GateKind::AnnexIii,
+            subject_hash: "sha256".into(),
+            pass: true,
+            evidence_hash: "sha256:e".into(),
+            signer: "founder".into(),
+        };
+        assert!(matches!(
+            k.promote(&machine(3), &impostor, &[verdict]),
+            Err(KernelError::I1(_))
+        ));
+        assert!(k.hot_modules().is_empty());
     }
 
     #[test]
