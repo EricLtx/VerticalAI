@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>VerticalAI — Decision Record and Architecture Hypotheses</title>
+<style>
+  @page { size: A4; margin: 16mm 15mm 18mm 15mm; }
+  :root {
+    --ink: #1c2430; --muted: #5b6675; --line: #cfd6df; --paper: #ffffff;
+    --kernel: #2b6cb0; --kernel-bg: #e8f1fb; --user: #2f855a; --user-bg: #e9f6ee;
+    --human: #c05621; --human-bg: #fdeee3; --fed: #6b46c1; --fed-bg: #efe9fa;
+    --inv: #b83232; --inv-bg: #fbe9e9; --host: #6b7280; --host-bg: #f1f3f5; --warn: #b7791f;
+  }
+  * { box-sizing: border-box; }
+  html, body { background: var(--paper); color: var(--ink); font: 10.5pt/1.45 "Segoe UI", "Helvetica Neue", Arial, sans-serif; margin: 0; }
+  main { max-width: 180mm; margin: 0 auto; }
+  h1 { font-size: 20pt; margin: 0 0 4pt; letter-spacing: -0.2pt; }
+  h2 { font-size: 14.5pt; margin: 18pt 0 6pt; padding-bottom: 3pt; border-bottom: 1.5pt solid var(--ink); page-break-after: avoid; }
+  h3 { font-size: 11.5pt; margin: 12pt 0 4pt; page-break-after: avoid; }
+  p { margin: 0 0 6pt; }
+  .sub { color: var(--muted); font-size: 10pt; }
+  .cover { padding: 30mm 0 10mm; page-break-after: always; }
+  .cover .kicker { color: var(--kernel); font-weight: 600; letter-spacing: 1pt; text-transform: uppercase; font-size: 9pt; }
+  .cover h1 { font-size: 30pt; line-height: 1.1; margin-top: 8pt; }
+  .cover .meta { margin-top: 18pt; border-top: 1pt solid var(--line); padding-top: 10pt; color: var(--muted); }
+  .cover .meta b { color: var(--ink); }
+  .toc ol { columns: 2; column-gap: 24pt; padding-left: 18pt; margin: 0; }
+  .toc li { margin: 2pt 0; break-inside: avoid; }
+  figure { margin: 8pt 0 12pt; page-break-inside: avoid; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figcaption { font-size: 9pt; color: var(--muted); margin-top: 4pt; }
+  table { border-collapse: collapse; width: 100%; margin: 6pt 0 10pt; font-size: 9.3pt; page-break-inside: auto; }
+  th, td { border: 0.6pt solid var(--line); padding: 3.5pt 5pt; vertical-align: top; text-align: left; }
+  th { background: #f4f6f8; font-weight: 600; }
+  tr { page-break-inside: avoid; }
+  code { font: 9pt Consolas, "Courier New", monospace; background: #f4f6f8; padding: 0 2pt; border-radius: 2pt; }
+  .tag { display: inline-block; font-size: 8pt; font-weight: 600; padding: 1pt 5pt; border-radius: 9pt; border: 0.8pt solid; }
+  .tag.ok { color: var(--user); border-color: var(--user); background: var(--user-bg); }
+  .tag.lit { color: var(--kernel); border-color: var(--kernel); background: var(--kernel-bg); }
+  .tag.test { color: var(--warn); border-color: var(--warn); background: #fdf5e6; }
+  .tag.risk { color: var(--inv); border-color: var(--inv); background: var(--inv-bg); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10pt; }
+  .callout { border-left: 3pt solid var(--kernel); background: var(--kernel-bg); padding: 6pt 9pt; margin: 6pt 0 10pt; font-size: 9.8pt; }
+  .callout.human { border-color: var(--human); background: var(--human-bg); }
+  .callout.inv { border-color: var(--inv); background: var(--inv-bg); }
+  .pb { page-break-before: auto; }
+  section.toc { page-break-after: always; }
+  .small { font-size: 9pt; }
+  /* SVG shared styles */
+  svg text { font-family: "Segoe UI", Arial, sans-serif; font-size: 11px; fill: var(--ink); }
+  svg text.t { font-size: 12.5px; font-weight: 600; }
+  svg text.s { font-size: 9.5px; fill: var(--muted); }
+  svg text.w { fill: #fff; font-weight: 600; }
+  svg .box { fill: #fff; stroke: var(--line); stroke-width: 1.2; }
+  svg .k { fill: var(--kernel-bg); stroke: var(--kernel); }
+  svg .u { fill: var(--user-bg); stroke: var(--user); }
+  svg .h { fill: var(--human-bg); stroke: var(--human); }
+  svg .f { fill: var(--fed-bg); stroke: var(--fed); }
+  svg .i { fill: var(--inv-bg); stroke: var(--inv); }
+  svg .g { fill: var(--host-bg); stroke: var(--host); }
+  svg .solid { fill: var(--kernel); stroke: none; }
+  svg .solid-u { fill: var(--user); stroke: none; }
+  svg .solid-h { fill: var(--human); stroke: none; }
+  svg .solid-f { fill: var(--fed); stroke: none; }
+  svg .solid-i { fill: var(--inv); stroke: none; }
+  svg .arrow { fill: none; stroke: var(--ink); stroke-width: 1.4; marker-end: url(#ah); }
+  svg .arrow.dim { stroke: var(--muted); stroke-dasharray: 4 3; marker-end: url(#ahm); }
+  svg .arrow.red { stroke: var(--inv); marker-end: url(#ahr); }
+  svg .link { fill: none; stroke: var(--muted); stroke-width: 1.2; }
+  svg .dash { stroke-dasharray: 5 4; }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute"><defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1c2430"/></marker>
+  <marker id="ahm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5b6675"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#b83232"/></marker>
+</defs></svg>
+<main>
+
+<section class="cover">
+  <div class="kicker">VerticalAI · internal · v0.1</div>
+  <h1>Decision Record<br>and Architecture Hypotheses</h1>
+  <p class="sub" style="font-size:12pt;margin-top:8pt">Every arbitration taken during the founding design sessions of 22–23 September 2026, the schemas of the kernel and the userland they produce, and the hypotheses the roadmap must validate.</p>
+  <div class="meta">
+    <p><b>Project</b> VerticalAI — self-improving, peer-to-peer, local-first orchestration runtime for businesses<br>
+       <b>Founder</b> Eric LTX · <b>Repository</b> github.com/EricLtx/VerticalAI · <b>State</b> SP0 delivered (tag <code>sp0</code>), CI green on Windows / Linux / macOS<br>
+       <b>Sources</b> design spec <code>docs/superpowers/specs/2026-09-22-verticalai-design.md</code>; SP0 plan; literature brief (32 sources read in full); adversarial design review (47 findings, 40 confirmed)</p>
+    <p class="small">Status legend used throughout: <span class="tag ok">decided</span> arbitration taken by the founder · <span class="tag lit">literature</span> supported by published evidence · <span class="tag test">to validate</span> hypothesis with a named test · <span class="tag risk">known risk</span> accepted with mitigation</p>
+  </div>
+</section>
+
+<section class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li>Vision and value ladder</li>
+    <li>System topology</li>
+    <li>Kernel / userland boundary</li>
+    <li>Registers: the task-state IR as a blackboard</li>
+    <li>Lock surface and partitions</li>
+    <li>Invariants and the interceptor chain</li>
+    <li>Human ceremony, STOP and liveness</li>
+    <li>Storage tiering and the ledger</li>
+    <li>Distribution: partitions and merge</li>
+    <li>Userland object model</li>
+    <li>The vertical process: Cold → Warm → Hot</li>
+    <li>Learning signals and the threshold</li>
+    <li>Scopes and the curated federation</li>
+    <li>Compliance mapping</li>
+    <li>Decision log</li>
+    <li>Hypotheses register</li>
+    <li>Roadmap and SP0 status</li>
+    <li>Open questions and deferred items</li>
+  </ol>
+</section>
+
+<!-- ============================ 1 ============================ -->
+<h2>1. Vision and value ladder</h2>
+<p>VerticalAI is a <b>self-improving, peer-to-peer, local-first orchestration runtime</b> for businesses — from a one-person company to the employees of a large enterprise. The business owns everything it accumulates; that <i>userland</i> is movable, replicated across the business's own machines with no cloud dependency, and shareable within a trade through a curated federation. Cloud models are optional <i>arches</i>, never a dependency.</p>
+<div class="callout"><b>Analogy kept internally:</b> "Linux for AI". A small kernel inspired by micro-architecture — orchestration (pipeline/scheduler), registers, locks — with everything else in userland. Models are the <i>instruction set</i>; the kernel's task-state IR is the common intermediate representation that lets heterogeneous models cooperate. <b>Externally</b> the product is described as an orchestration runtime, not an "AI operating system" (CRA Annex III wording; see §14).</div>
+<figure>
+<svg viewBox="0 0 700 230" xmlns="http://www.w3.org/2000/svg">
+  <rect x="20" y="160" width="150" height="50" rx="6" class="box k"/><text x="95" y="180" text-anchor="middle" class="t">1 · Baseline</text><text x="95" y="197" text-anchor="middle" class="s">inventory of every model &amp; tool</text>
+  <rect x="190" y="115" width="150" height="50" rx="6" class="box k"/><text x="265" y="135" text-anchor="middle" class="t">2 · Shadowing + watch</text><text x="265" y="152" text-anchor="middle" class="s">lawful basis, allow-lists, taint</text>
+  <rect x="360" y="70" width="150" height="50" rx="6" class="box u"/><text x="435" y="90" text-anchor="middle" class="t">3 · Proposals</text><text x="435" y="107" text-anchor="middle" class="s">after maturity × readiness threshold</text>
+  <rect x="530" y="25" width="150" height="50" rx="6" class="box u"/><text x="605" y="45" text-anchor="middle" class="t">4 · Promotion</text><text x="605" y="62" text-anchor="middle" class="s">human lock, delegation, scopes</text>
+  <path d="M170,185 L190,140" class="arrow"/><path d="M340,140 L360,95" class="arrow"/><path d="M510,95 L530,50" class="arrow"/>
+  <text x="95" y="225" text-anchor="middle" class="s">valuable alone (week one)</text>
+  <text x="265" y="225" text-anchor="middle" class="s">produces the data rung 3 needs</text>
+  <text x="435" y="225" text-anchor="middle" class="s">shown as outcomes, never explanations</text>
+  <text x="605" y="225" text-anchor="middle" class="s">owner promotes, tunes, auto-approves kinds</text>
+</svg>
+<figcaption>Figure 1 — The value ladder. Each rung produces the data the next needs; the first rung is useful before anything has been learned.</figcaption>
+</figure>
+<table>
+<tr><th style="width:26%">Arbitration</th><th>Content</th><th style="width:12%">Status</th></tr>
+<tr><td>First trade</td><td>Freelancers and SMEs selling services or products, in any craft (design, consulting, content, AI-native platforms). First user: the founder's one-person company (sole-trader mode).</td><td><span class="tag ok">decided</span></td></tr>
+<tr><td>Commercial model</td><td>Commercial first, to build activity; the kernel is open-sourced later to democratise the commercial offering (userland, federation, support).</td><td><span class="tag ok">decided</span></td></tr>
+<tr><td>Non-functional requirements</td><td>Cybersecurity and privacy by design; user-centric; organic and autonomous construction <i>within gates</i>; pedagogic (show outcomes); compliance by design (AI Act, GDPR, e-Privacy, NIS 2, CRA, PLD); easy and low-cost deployment; movable and traceable configuration; simple migration; ongoing technology watch.</td><td><span class="tag ok">decided</span></td></tr>
+</table>
+
+<!-- ============================ 2 ============================ -->
+<h2 class="pb">2. System topology</h2>
+<p>One shared userland per business, replicated across its own nodes; a phone acts as a thin node for human approvals; a headless node may host arches and relay traffic; cloud arches are reached only through the kernel and only within clearance. Businesses in the same trade share modules through a curated federation.</p>
+<figure>
+<svg viewBox="0 0 700 330" xmlns="http://www.w3.org/2000/svg">
+  <rect x="15" y="15" width="440" height="300" rx="10" class="box g" style="fill:#fafbfc"/>
+  <text x="30" y="35" class="t">Business "Acme" — one shared userland, no cloud dependency</text>
+  <rect x="40" y="60" width="130" height="70" rx="6" class="box k"/><text x="105" y="82" text-anchor="middle" class="t">Full node</text><text x="105" y="98" text-anchor="middle" class="s">owner's laptop · Windows</text><text x="105" y="112" text-anchor="middle" class="s">local arches · app drivers</text>
+  <rect x="300" y="60" width="130" height="70" rx="6" class="box k"/><text x="365" y="82" text-anchor="middle" class="t">Full node</text><text x="365" y="98" text-anchor="middle" class="s">colleague's desktop</text><text x="365" y="112" text-anchor="middle" class="s">local arches · app drivers</text>
+  <rect x="170" y="200" width="130" height="70" rx="6" class="box k"/><text x="235" y="222" text-anchor="middle" class="t">Headless node</text><text x="235" y="238" text-anchor="middle" class="s">server: hosts Gemma for peers</text><text x="235" y="252" text-anchor="middle" class="s">relay / discovery (ciphertext only)</text>
+  <rect x="40" y="215" width="100" height="55" rx="6" class="box h"/><text x="90" y="236" text-anchor="middle" class="t">Thin node</text><text x="90" y="252" text-anchor="middle" class="s">phone · approvals · STOP</text>
+  <path d="M170,95 L300,95" class="link dash"/><path d="M105,130 L200,200" class="link dash"/><path d="M365,130 L270,200" class="link dash"/><path d="M140,242 L170,242" class="link dash"/>
+  <text x="235" y="90" text-anchor="middle" class="s">LAN-first (mDNS), merge on reconnect</text>
+  <text x="235" y="295" text-anchor="middle" class="s">metadata via CRDT · payloads as encrypted blobs by hash</text>
+  <rect x="490" y="60" width="190" height="95" rx="8" class="box"/><text x="585" y="80" text-anchor="middle" class="t">Cloud arches (optional)</text>
+  <text x="585" y="98" text-anchor="middle" class="s">Claude · Gemini · OpenAI</text><text x="585" y="112" text-anchor="middle" class="s">EU-hosted frontier (jurisdiction: EU)</text>
+  <text x="585" y="140" text-anchor="middle" class="s">only via infer(), within clearance</text>
+  <path d="M430,95 L490,95" class="arrow dim"/>
+  <rect x="490" y="200" width="190" height="95" rx="8" class="box f"/><text x="585" y="220" text-anchor="middle" class="t">Vertical federation</text>
+  <text x="585" y="238" text-anchor="middle" class="s">curated: founder root key (2-of-3)</text><text x="585" y="252" text-anchor="middle" class="s">signed modules travel between businesses</text><text x="585" y="266" text-anchor="middle" class="s">no scripts · declassified · revocable</text>
+  <path d="M455,240 L490,240" class="arrow" style="marker-start:url(#ah)"/>
+</svg>
+<figcaption>Figure 2 — Nodes, the business mesh, optional cloud arches and the federation. Node classes differ only by manifest.</figcaption>
+</figure>
+<table>
+<tr><th>Node class</th><th>Hosts arches</th><th>Drives applications</th><th>Role</th></tr>
+<tr><td>Full</td><td>yes</td><td>yes</td><td>The owner's laptop or desktop; runs the kernel daemon natively (Windows first, Linux, macOS)</td></tr>
+<tr><td>Headless</td><td>yes</td><td>no</td><td>Server; also relay / discovery role for the business or the trade (sees ciphertext only)</td></tr>
+<tr><td>Thin</td><td>no</td><td>no</td><td>Phone: identity, channel, STOP, human approvals; persists no registers and no secrets</td></tr>
+</table>
+
+<!-- ============================ 3 ============================ -->
+<h2 class="pb">3. Kernel / userland boundary</h2>
+<p>The kernel <b>owns</b> only mechanism: scheduling, the registers (task-state IR), the lock surface, STOP, principals, the arch layer, storage tiering, the ledger, replication mechanics, and the interceptor chain. It <b>refuses</b> to own any domain knowledge, skill, business memory, policy, specific model, application driver, channel or user interface. Anything policy-shaped is a userland object the kernel reads and enforces but never writes on its own initiative.</p>
+<figure>
+<svg viewBox="0 0 700 470" xmlns="http://www.w3.org/2000/svg">
+  <!-- channels -->
+  <rect x="15" y="15" width="670" height="42" rx="6" class="box" style="fill:#fafbfc"/><text x="30" y="34" class="t">Channels &amp; surfaces</text>
+  <text x="180" y="34" class="s">chat · CLI · phone · local web UI with seven panels (see §4.5 of the spec)</text>
+  <text x="30" y="50" class="s">all are ways into submit_task; their design is deferred</text>
+  <!-- userland -->
+  <rect x="15" y="70" width="670" height="130" rx="6" class="box u"/><text x="30" y="90" class="t" style="fill:#2f855a">USERLAND — policy, knowledge, modules (owned by the business, movable)</text>
+  <g>
+    <rect x="30" y="102" width="100" height="42" rx="4" class="box"/><text x="80" y="119" text-anchor="middle">Arch inventory</text><text x="80" y="134" text-anchor="middle" class="s">credential refs only</text>
+    <rect x="140" y="102" width="100" height="42" rx="4" class="box"/><text x="190" y="119" text-anchor="middle">Knowledge</text><text x="190" y="134" text-anchor="middle" class="s">itemised entries</text>
+    <rect x="250" y="102" width="100" height="42" rx="4" class="box"/><text x="300" y="119" text-anchor="middle">Modules</text><text x="300" y="134" text-anchor="middle" class="s">skill · process · automation</text>
+    <rect x="360" y="102" width="100" height="42" rx="4" class="box"/><text x="410" y="119" text-anchor="middle">Validators</text><text x="410" y="134" text-anchor="middle" class="s">never machine-evolved</text>
+    <rect x="470" y="102" width="100" height="42" rx="4" class="box"/><text x="520" y="119" text-anchor="middle">Policies</text><text x="520" y="134" text-anchor="middle" class="s">read-only for machines</text>
+    <rect x="580" y="102" width="90" height="42" rx="4" class="box"/><text x="625" y="119" text-anchor="middle">Integrations</text><text x="625" y="134" text-anchor="middle" class="s">app drivers</text>
+    <rect x="30" y="152" width="640" height="36" rx="4" class="box"/><text x="350" y="167" text-anchor="middle">Vertical process (Cold → Warm → Hot) · technology watch · gate policies (Annex III classifier, declassification, output marking)</text><text x="350" y="181" text-anchor="middle" class="s">userland services — they call the kernel, the kernel never calls them on its own initiative</text>
+  </g>
+  <!-- syscall surface -->
+  <rect x="15" y="208" width="670" height="38" rx="4" class="box i"/><text x="350" y="223" text-anchor="middle" class="t" style="fill:#b83232">SYSCALL SURFACE + INTERCEPTORS  [ I1 · I2 · I3 · I4 · I4' ]</text>
+  <text x="350" y="239" text-anchor="middle" class="s">submit_task · infer · read/write_register · lease · approve · stop/resume · promote · export/import · log</text>
+  <!-- kernel -->
+  <rect x="15" y="254" width="670" height="130" rx="6" class="box k"/><text x="30" y="274" class="t" style="fill:#2b6cb0">KERNEL — mechanism only (Rust user-space daemon, one static binary per platform)</text>
+  <g>
+    <rect x="30" y="286" width="118" height="42" rx="4" class="box"/><text x="89" y="303" text-anchor="middle">Scheduler + governor</text><text x="89" y="318" text-anchor="middle" class="s">Active Object · budgets</text>
+    <rect x="158" y="286" width="118" height="42" rx="4" class="box"/><text x="217" y="303" text-anchor="middle">Registers (IR)</text><text x="217" y="318" text-anchor="middle" class="s">Blackboard · labels</text>
+    <rect x="286" y="286" width="118" height="42" rx="4" class="box"/><text x="345" y="303" text-anchor="middle">Lock surface</text><text x="345" y="318" text-anchor="middle" class="s">LEASE · APPROVAL · lock home</text>
+    <rect x="414" y="286" width="118" height="42" rx="4" class="box"/><text x="473" y="303" text-anchor="middle">STOP + liveness</text><text x="473" y="318" text-anchor="middle" class="s">grow-only · I4 lease</text>
+    <rect x="542" y="286" width="128" height="42" rx="4" class="box"/><text x="606" y="303" text-anchor="middle">Principals &amp; identity</text><text x="606" y="318" text-anchor="middle" class="s">hardware-key ceremony</text>
+    <rect x="30" y="336" width="150" height="40" rx="4" class="box"/><text x="105" y="352" text-anchor="middle">Arch layer</text><text x="105" y="367" text-anchor="middle" class="s">manifests · adapters · routing</text>
+    <rect x="190" y="336" width="150" height="40" rx="4" class="box"/><text x="265" y="352" text-anchor="middle">Storage tiering</text><text x="265" y="367" text-anchor="middle" class="s">CRDT metadata · encrypted blobs</text>
+    <rect x="350" y="336" width="150" height="40" rx="4" class="box"/><text x="425" y="352" text-anchor="middle">Ledger</text><text x="425" y="367" text-anchor="middle" class="s">hash chain · HLC · retention</text>
+    <rect x="510" y="336" width="160" height="40" rx="4" class="box"/><text x="590" y="352" text-anchor="middle">Replication</text><text x="590" y="367" text-anchor="middle" class="s">LAN-first · relay · merge rules</text>
+  </g>
+  <!-- host -->
+  <rect x="15" y="396" width="670" height="58" rx="6" class="box g"/><text x="30" y="416" class="t" style="fill:#6b7280">HOST OS TREATED AS HARDWARE</text>
+  <text x="30" y="434" class="s">CPU / GPU / RAM · filesystem · network · keyring (DPAPI, Secure Enclave) · applications as devices · inference engines out-of-process</text>
+  <text x="30" y="448" class="s">daemon under a service account · Job Object / AppContainer, landlock, sandbox-exec confine harnesses</text>
+</svg>
+<figcaption>Figure 3 — The boundary. Userland reaches arches, registers and approvals only through the syscall surface; interceptors enforce the invariants on every call. Pattern names: Blackboard, Strategized Locking, Interceptor, Extension Interface, Component Configurator, Active Object, Half-Sync/Half-Async, Kappa.</figcaption>
+</figure>
+
+<!-- ============================ 4 ============================ -->
+<h2 class="pb">4. Registers: the task-state IR as a blackboard</h2>
+<p>A register set holds the state of one task in a model-agnostic form: goal, constraints, evidence with origin taint, decisions, open questions, artefacts by hash, and <b>classification labels</b>. Every hand-off between arches goes through the IR — never through one model's native transcript. Verified fact behind this: provider-side reasoning state (e.g. Anthropic thinking blocks) is bound to the producing model and dropped by any other; kernel-owned state is what makes model swapping mid-task possible.</p>
+<figure>
+<svg viewBox="0 0 700 300" xmlns="http://www.w3.org/2000/svg">
+  <rect x="230" y="90" width="240" height="120" rx="8" class="box k"/>
+  <text x="350" y="112" text-anchor="middle" class="t">REGISTERS — task-state IR</text>
+  <text x="350" y="132" text-anchor="middle" class="s">goal · constraints · evidence(+taint) · decisions</text>
+  <text x="350" y="146" text-anchor="middle" class="s">open questions · artefacts by hash</text>
+  <rect x="255" y="160" width="190" height="34" rx="4" class="box i"/><text x="350" y="175" text-anchor="middle">label = join of everything read</text><text x="350" y="188" text-anchor="middle" class="s">scope · data class · origins</text>
+  <!-- arches -->
+  <rect x="20" y="30" width="150" height="50" rx="6" class="box"/><text x="95" y="50" text-anchor="middle" class="t">Gemma 4 (local)</text><text x="95" y="66" text-anchor="middle" class="s">generate · plan · governed</text>
+  <rect x="20" y="220" width="150" height="50" rx="6" class="box"/><text x="95" y="240" text-anchor="middle" class="t">Classical NLP</text><text x="95" y="256" text-anchor="middle" class="s">embed · perceive</text>
+  <rect x="530" y="30" width="150" height="50" rx="6" class="box"/><text x="605" y="50" text-anchor="middle" class="t">Claude (EU-hosted)</text><text x="605" y="66" text-anchor="middle" class="s">generate · judge · cloud</text>
+  <rect x="530" y="220" width="150" height="50" rx="6" class="box"/><text x="605" y="240" text-anchor="middle" class="t">JEPA world model</text><text x="605" y="256" text-anchor="middle" class="s">predict · embeddings in/out</text>
+  <path d="M170,60 L230,110" class="arrow" style="marker-start:url(#ah)"/><path d="M170,240 L230,190" class="arrow" style="marker-start:url(#ah)"/>
+  <path d="M530,60 L470,110" class="arrow" style="marker-start:url(#ah)"/><path d="M530,240 L470,190" class="arrow" style="marker-start:url(#ah)"/>
+  <text x="190" y="80" class="s">lower</text><text x="190" y="225" class="s">raise</text><text x="485" y="80" class="s">lower</text><text x="485" y="225" class="s">raise</text>
+  <rect x="245" y="20" width="210" height="40" rx="5" class="box g"/><text x="350" y="36" text-anchor="middle">Adapters lower / raise via the manifest</text><text x="350" y="50" text-anchor="middle" class="s">I4': no silent truncation</text>
+  <rect x="245" y="240" width="210" height="40" rx="5" class="box g"/><text x="350" y="256" text-anchor="middle">Manifest: capabilities · locality</text><text x="350" y="270" text-anchor="middle" class="s">jurisdiction · retention · identity → arch id</text>
+</svg>
+<figcaption>Figure 4 — Blackboard: the arches are knowledge sources; the IR is the only common currency. Topology (hierarchy or not) is policy.</figcaption>
+</figure>
+<div class="grid2">
+<div class="callout"><b>Arch identity is content-addressed.</b> Weights hash, engine + version, backend, quantisation, KV-cache type, threads, batch, sampling, seed — any change is a new arch id (Component Configurator event). A peer's network-reached model is a distinct arch.</div>
+<div class="callout"><b>Learning modes per artefact class</b> (policy, visible in the UI): <i>cloud-assisted</i>, <i>derived-only</i> (frontier arches see only declassified outputs), <i>local-only</i> (no machine authoring; memory, search, teaching and imported modules remain).</div>
+</div>
+
+<!-- ============================ 5 ============================ -->
+<h2 class="pb">5. Lock surface and partitions</h2>
+<p>The original arbitration was "one lock primitive with a holder kind {machine, human}". The adversarial review showed it cannot carry its three uses under partition: exclusivity for an irreversible action is a consensus property, and "human locks are local by nature" is exactly what lets two humans each hold "the" lock. The revised arbitration keeps one syscall surface with a <b>tagged union</b>.</p>
+<figure>
+<svg viewBox="0 0 700 275" xmlns="http://www.w3.org/2000/svg">
+  <rect x="15" y="20" width="210" height="130" rx="8" class="box k"/><text x="120" y="42" text-anchor="middle" class="t">LEASE</text>
+  <text x="120" y="62" text-anchor="middle" class="s">resource · ttl · fence · partition</text>
+  <text x="120" y="82" text-anchor="middle">work-in-progress mutex</text><text x="120" y="98" text-anchor="middle" class="s">AP semantics: exclusive within</text><text x="120" y="112" text-anchor="middle" class="s">the connected partition; expires</text><text x="120" y="132" text-anchor="middle" class="s">also a scheduler input</text>
+  <rect x="245" y="20" width="210" height="130" rx="8" class="box h"/><text x="350" y="42" text-anchor="middle" class="t">APPROVAL</text>
+  <text x="350" y="62" text-anchor="middle" class="s">subject hash · kind {test, audit, human}</text>
+  <text x="350" y="82" text-anchor="middle">immutable signed record</text><text x="350" y="98" text-anchor="middle" class="s">mergeable; "promoted" means</text><text x="350" y="112" text-anchor="middle" class="s">a valid approval exists —</text><text x="350" y="132" text-anchor="middle" class="s">never "someone holds a lock"</text>
+  <rect x="475" y="20" width="210" height="130" rx="8" class="box i"/><text x="580" y="42" text-anchor="middle" class="t">LOCK HOME</text>
+  <text x="580" y="62" text-anchor="middle" class="s">per resource class · issues fences</text>
+  <text x="580" y="82" text-anchor="middle">irreversible external actions</text><text x="580" y="98" text-anchor="middle" class="s">default: creating node; later a</text><text x="580" y="112" text-anchor="middle" class="s">1/3/5-node majority group;</text><text x="580" y="132" text-anchor="middle" class="s">drivers reject stale fences</text>
+  <rect x="15" y="170" width="670" height="95" rx="6" class="box" style="fill:#fafbfc"/>
+  <text x="30" y="190" class="t">Partition rule (D5)</text>
+  <text x="30" y="208" class="s">Lock home unreachable → an irreversible action either waits, or proceeds under an explicit, logged HUMAN OVERRIDE ("accept duplicate risk").</text>
+  <text x="30" y="224" class="s">The human path stays reachable offline (I1) without pretending exclusivity exists.</text>
+  <text x="30" y="240" class="s">Merge rules reconcile STATE, never side effects. Partition epochs are diagnostic only.</text>
+  <text x="30" y="256" class="s">Uses of the surface: artefact being edited · module promotion · consequential action · curation grant.</text>
+</svg>
+<figcaption>Figure 5 — Three kinds behind one syscall surface (Strategized Locking). Uses: artefact being edited, module promotion, consequential action, curation grant.</figcaption>
+</figure>
+
+<!-- ============================ 6 ============================ -->
+<h2>6. Invariants and the interceptor chain</h2>
+<p>Only <b>decidable</b> invariants are kernel interceptors. The Annex III classifier and the declassification gate are userland gate policies whose signed verdicts the kernel requires on <code>promote</code>, <code>export</code> and <code>import</code>. All five invariants are property-tested on the SP0 stub kernel.</p>
+<figure>
+<svg viewBox="0 0 700 150" xmlns="http://www.w3.org/2000/svg">
+  <rect x="15" y="50" width="90" height="50" rx="6" class="box u"/><text x="60" y="72" text-anchor="middle" class="t">userland</text><text x="60" y="88" text-anchor="middle" class="s">module · harness</text>
+  <path d="M105,75 L140,75" class="arrow"/>
+  <rect x="140" y="40" width="60" height="70" rx="6" class="box i"/><text x="170" y="70" text-anchor="middle" class="t">I1</text><text x="170" y="86" text-anchor="middle" class="s">human</text><text x="170" y="98" text-anchor="middle" class="s">path</text>
+  <rect x="210" y="40" width="60" height="70" rx="6" class="box i"/><text x="240" y="70" text-anchor="middle" class="t">I2</text><text x="240" y="86" text-anchor="middle" class="s">no read up</text><text x="240" y="98" text-anchor="middle" class="s">join labels</text>
+  <rect x="280" y="40" width="60" height="70" rx="6" class="box i"/><text x="310" y="70" text-anchor="middle" class="t">I3</text><text x="310" y="86" text-anchor="middle" class="s">no silent</text><text x="310" y="98" text-anchor="middle" class="s">discard</text>
+  <rect x="350" y="40" width="60" height="70" rx="6" class="box i"/><text x="380" y="70" text-anchor="middle" class="t">I4</text><text x="380" y="86" text-anchor="middle" class="s">liveness</text><text x="380" y="98" text-anchor="middle" class="s">+ STOP</text>
+  <rect x="420" y="40" width="60" height="70" rx="6" class="box i"/><text x="450" y="70" text-anchor="middle" class="t">I4'</text><text x="450" y="86" text-anchor="middle" class="s">no silent</text><text x="450" y="98" text-anchor="middle" class="s">truncation</text>
+  <path d="M480,75 L520,75" class="arrow"/>
+  <rect x="520" y="50" width="165" height="50" rx="6" class="box k"/><text x="602" y="72" text-anchor="middle" class="t">kernel core</text><text x="602" y="88" text-anchor="middle" class="s">scheduler · registers · ledger</text>
+  <text x="350" y="128" text-anchor="middle" class="s">gate verdicts (Annex III · declassification · output marking) are checked at promote / export / import</text>
+  <text x="350" y="142" text-anchor="middle" class="s">— userland policies, kernel-required</text>
+</svg>
+<figcaption>Figure 6 — The interceptor chain on the syscall path.</figcaption>
+</figure>
+<table>
+<tr><th style="width:7%">Inv.</th><th>Statement (as restated after review)</th><th style="width:30%">SP0 evidence</th></tr>
+<tr><td><b>I1</b></td><td>An approval of kind <i>human</i> can only be produced by a human ceremony; no machine principal can produce or forge it; the human path (STOP, override, approval) is always reachable — no queue, budget or partition can starve it.</td><td>property test: no sequence of machine syscalls yields a human approval; human STOP always accepted</td></tr>
+<tr><td><b>I2</b></td><td>No object whose classification exceeds a principal's or arch's effective clearance is ever projected into its reachable set. Every object written by a task inherits the join of the labels it read; declassification is explicit and measurable.</td><td>property test: no register label ever reaches an arch above its clearance</td></tr>
+<tr><td><b>I3</b></td><td>A merge never silently discards a write; conflicts are resolved by a declared rule or surfaced, and logged. Logged shred events are the one sanctioned deletion.</td><td>property test: every write survives any merge order (kept or surfaced)</td></tr>
+<tr><td><b>I4</b></td><td>Machine principals run non-human-initiated automations only while an autonomy liveness lease, renewed by a human-capable node, is unexpired and no STOP is active in scope.</td><td>property test: no automation after lease expiry; STOP blocks until RESUME cites it</td></tr>
+<tr><td><b>I4'</b></td><td>Every adapter reports its real context budget; <code>infer</code> refuses an over-budget lowering or applies a logged structural projection — never a silent truncation.</td><td>property test: projected ⇔ ledger entry exists</td></tr>
+</table>
+
+<!-- ============================ 7 ============================ -->
+<h2 class="pb">7. Human ceremony, STOP and liveness</h2>
+<p>No syscall accepts a caller-asserted principal; the kernel derives it from the authenticated channel. "Human" is a <b>hardware-key ceremony</b> bound to one action digest, short-lived. STOP needs presence only; authorising writes need verification. The phone is an approval channel, never a lock home.</p>
+<figure>
+<svg viewBox="0 0 700 345" xmlns="http://www.w3.org/2000/svg">
+  <!-- lanes -->
+  <text x="80" y="22" text-anchor="middle" class="t">Module / task</text><text x="260" y="22" text-anchor="middle" class="t">Kernel</text><text x="450" y="22" text-anchor="middle" class="t">Phone (Secure Enclave)</text><text x="620" y="22" text-anchor="middle" class="t">Ledger</text>
+  <path d="M80,30 L80,200" class="link dash"/><path d="M260,30 L260,200" class="link dash"/><path d="M450,30 L450,200" class="link dash"/><path d="M620,30 L620,200" class="link dash"/>
+  <path d="M80,55 L255,55" class="arrow"/><text x="168" y="50" text-anchor="middle" class="s">promote(module) — needs human approval</text>
+  <path d="M260,85 L445,85" class="arrow"/><text x="352" y="80" text-anchor="middle" class="s">challenge = H(resource, action digest, nonce, expiry)</text>
+  <rect x="405" y="95" width="90" height="26" rx="4" class="box h"/><text x="450" y="112" text-anchor="middle" class="s">user verifies · key signs</text>
+  <path d="M445,135 L265,135" class="arrow"/><text x="352" y="130" text-anchor="middle" class="s">signature (device enrolled by admin)</text>
+  <rect x="200" y="145" width="120" height="26" rx="4" class="box i"/><text x="260" y="162" text-anchor="middle" class="s">I1 verify · not expired</text>
+  <path d="M260,175 L615,175" class="arrow"/><text x="437" y="170" text-anchor="middle" class="s">APPROVAL record (immutable, mergeable) + signed test record</text>
+  <path d="M255,195 L85,195" class="arrow"/><text x="168" y="190" text-anchor="middle" class="s">Hot (bound to pool epoch)</text>
+  <!-- STOP -->
+  <rect x="15" y="215" width="670" height="120" rx="6" class="box" style="fill:#fafbfc"/>
+  <text x="30" y="235" class="t">STOP and liveness (I4)</text>
+  <text x="30" y="253" class="s">STOP = grow-only set of signed events; RESUME is valid only if it cites the STOP it lifts; "stopped" is a pure function of causal state.</text>
+  <text x="30" y="268" class="s">Presence suffices — any enrolled device can STOP; authorising writes need user verification on the key.</text>
+  <text x="30" y="286" class="s">Liveness lease: a node cut off from every human-capable node stops automating when the lease lapses (TTL per autonomy profile).</text>
+  <text x="30" y="301" class="s">This is what makes AI Act Art. 14(4)(e) "halt in a safe state" true rather than declared.</text>
+  <text x="30" y="319" class="s">Devices: enrolment and revocation under the business admin key on a full node (ticket + out-of-band code + admin approval);</text>
+  <text x="30" y="331" class="s">revocation propagates and wins merges.</text>
+</svg>
+<figcaption>Figure 7 — The human ceremony for a promotion, and the STOP/liveness primitives.</figcaption>
+</figure>
+
+<!-- ============================ 8 ============================ -->
+<h2>8. Storage tiering and the ledger</h2>
+<p>The original arbitration "Automerge for all mergeable state" was narrowed: full operation history is permanent in a CRDT, tombstones erase nothing, and secrets or traces would replicate to every phone. Three tiers now.</p>
+<figure>
+<svg viewBox="0 0 700 265" xmlns="http://www.w3.org/2000/svg">
+  <rect x="15" y="20" width="215" height="150" rx="8" class="box k"/><text x="122" y="42" text-anchor="middle" class="t">Tier 1 · Metadata (Automerge)</text>
+  <text x="122" y="64" text-anchor="middle" class="s">small per-scope documents</text><text x="122" y="80" text-anchor="middle" class="s">IDs · labels · counters · provenance hashes</text><text x="122" y="96" text-anchor="middle" class="s">policies · register heads</text>
+  <text x="122" y="122" text-anchor="middle" class="s">replicated to every node in scope</text><text x="122" y="138" text-anchor="middle" class="s">document rotation for thin nodes</text><text x="122" y="158" text-anchor="middle" class="s">conflicts surfaced, never LWW</text>
+  <rect x="242" y="20" width="215" height="150" rx="8" class="box u"/><text x="350" y="42" text-anchor="middle" class="t">Tier 2 · Payloads (blobs)</text>
+  <text x="350" y="64" text-anchor="middle" class="s">encrypted, content-addressed</text><text x="350" y="80" text-anchor="middle" class="s">knowledge text · artefacts · candidates</text><text x="350" y="96" text-anchor="middle" class="s">shadow traces · raw imports</text>
+  <text x="350" y="122" text-anchor="middle" class="s">per-subject keys, never escrowed</text><text x="350" y="138" text-anchor="middle" class="s">fetched by hash within clearance</text><text x="350" y="158" text-anchor="middle" class="s">traces and imports never replicated</text>
+  <rect x="469" y="20" width="215" height="150" rx="8" class="box g"/><text x="577" y="42" text-anchor="middle" class="t">Tier 3 · Ledger (per node)</text>
+  <text x="577" y="64" text-anchor="middle" class="s">hash-chained, segmented log</text><text x="577" y="80" text-anchor="middle" class="s">retention class per event type</text><text x="577" y="96" text-anchor="middle" class="s">commits to ciphertext hashes</text>
+  <text x="577" y="122" text-anchor="middle" class="s">three stamps: wall + quality · HLC · causal heads</text><text x="577" y="138" text-anchor="middle" class="s">receive guard: skew → clock_anomaly</text><text x="577" y="158" text-anchor="middle" class="s">Kappa: the log is the source of truth</text>
+  <rect x="15" y="185" width="670" height="72" rx="6" class="box i"/><text x="30" y="204" class="t" style="fill:#b83232">Erasure (GDPR Art. 17)</text>
+  <text x="30" y="221" class="s">= a signed SHRED event (merges like STOP) + tombstone: every blob under that subject key becomes unreadable everywhere.</text>
+  <text x="30" y="236" class="s">The Cold pool is node-local and ephemeral. Secrets live only in the OS keyring of the node that holds the credential;</text>
+  <text x="30" y="250" class="s">the inventory holds a reference and a fingerprint, and infer() routes to the holding node.</text>
+</svg>
+<figcaption>Figure 8 — Storage tiering (D7). SP0 encodes the semantics; SP1 adds real encryption and Automerge.</figcaption>
+</figure>
+
+<!-- ============================ 9 ============================ -->
+<h2 class="pb">9. Distribution: partitions and merge</h2>
+<p>Keep working offline, merge on reconnect, with merge rules per resource class (LAN / VLAN / WAN). Policies merge most-restrictive-wins; STOP, shred and human-override events win merges; "current Hot version" is a set resolved most-restrictive, never a scalar last-writer-wins. Sovereignty restated: <b>no third party ever holds plaintext or performs inference</b>; connectivity may use untrusted, self-hostable relays that see ciphertext only.</p>
+<figure>
+<svg viewBox="0 0 700 300" xmlns="http://www.w3.org/2000/svg">
+  <rect x="15" y="20" width="300" height="130" rx="8" class="box" style="fill:#fafbfc"/><text x="165" y="40" text-anchor="middle" class="t">Partition A (laptop on a train)</text>
+  <text x="165" y="62" text-anchor="middle" class="s">edits skill S (metadata write) · drafts an invoice</text>
+  <text x="165" y="80" text-anchor="middle" class="s">LEASE on invoice:42 valid within A only</text>
+  <text x="165" y="104" text-anchor="middle" class="s">send invoice? lock home unreachable →</text><text x="165" y="120" text-anchor="middle" class="s">wait, or logged HUMAN OVERRIDE</text>
+  <text x="165" y="140" text-anchor="middle" class="s">automations continue while liveness lease alive</text>
+  <rect x="385" y="20" width="300" height="130" rx="8" class="box" style="fill:#fafbfc"/><text x="535" y="40" text-anchor="middle" class="t">Partition B (office)</text>
+  <text x="535" y="62" text-anchor="middle" class="s">also edits skill S · colleague hits STOP</text>
+  <text x="535" y="80" text-anchor="middle" class="s">lock home for invoices lives here</text>
+  <text x="535" y="104" text-anchor="middle" class="s">promotes module M under epoch e2</text>
+  <text x="535" y="140" text-anchor="middle" class="s">STOP takes effect locally at once</text>
+  <path d="M315,85 L385,85" class="arrow dim" style="marker-start:url(#ahm)"/><text x="350" y="78" text-anchor="middle" class="s">link down</text>
+  <rect x="15" y="170" width="670" height="122" rx="8" class="box k"/><text x="30" y="190" class="t" style="fill:#2b6cb0">Reconnect → merge (I3: nothing silently lost)</text>
+  <text x="30" y="208" class="s">skill S: two versions → conflict surfaced for the owner, or resolved by the declared rule · STOP from B wins the merge and A stops</text>
+  <text x="30" y="223" class="s">invoice: the fence check makes a duplicate send impossible unless a human explicitly overrode (logged)</text>
+  <text x="30" y="238" class="s">module M promoted under epoch e2 becomes Hot-pending on A until a cheap re-rehearsal passes</text>
+  <text x="30" y="253" class="s">shred events from either side propagate · a clock anomaly suspends that peer's autonomy lease</text>
+  <text x="30" y="270" class="s">Policies merge most-restrictive-wins (deny &gt; defer &gt; ask &gt; allow).</text>
+  <text x="30" y="284" class="s">Merge reconciles STATE; irreversible ACTIONS need the lock home or a human.</text>
+</svg>
+<figcaption>Figure 9 — Partition behaviour (D3, D5, I3, I4).</figcaption>
+</figure>
+
+<!-- ============================ 10 ============================ -->
+<h2>10. Userland object model</h2>
+<p>Six families; all versioned, mergeable, carrying a classification label and a provenance manifest (content hash, lineage, signer, arch compatibility, cost/applicability contract, origin taint summary).</p>
+<figure>
+<svg viewBox="0 0 700 260" xmlns="http://www.w3.org/2000/svg">
+  <rect x="15" y="20" width="200" height="60" rx="6" class="box u"/><text x="115" y="42" text-anchor="middle" class="t">Arch inventory</text><text x="115" y="58" text-anchor="middle" class="s">every model/tool with metadata;</text><text x="115" y="72" text-anchor="middle" class="s">credential references only</text>
+  <rect x="250" y="20" width="200" height="60" rx="6" class="box u"/><text x="350" y="42" text-anchor="middle" class="t">Knowledge</text><text x="350" y="58" text-anchor="middle" class="s">itemised entries, stable IDs,</text><text x="350" y="72" text-anchor="middle" class="s">helpful/harmful counters — never prose blobs</text>
+  <rect x="485" y="20" width="200" height="60" rx="6" class="box u"/><text x="585" y="42" text-anchor="middle" class="t">Policies</text><text x="585" y="58" text-anchor="middle" class="s">lawful basis, labels, autonomy profiles,</text><text x="585" y="72" text-anchor="middle" class="s">merge rules, thresholds, learning modes, delegations</text>
+  <rect x="15" y="110" width="200" height="70" rx="6" class="box u"/><text x="115" y="132" text-anchor="middle" class="t">Modules</text><text x="115" y="148" text-anchor="middle" class="s">skill · process (+ autonomy profile) · automation</text><text x="115" y="162" text-anchor="middle" class="s">compact directories; no scripts, no validators</text><text x="115" y="175" text-anchor="middle" class="s">in anything machine-evolved</text>
+  <rect x="250" y="110" width="200" height="70" rx="6" class="box h"/><text x="350" y="132" text-anchor="middle" class="t">Validators</text><text x="350" y="148" text-anchor="middle" class="s">structural checks per artefact type + anchor suite</text><text x="350" y="162" text-anchor="middle" class="s">human- or frontier-under-lock authored;</text><text x="350" y="175" text-anchor="middle" class="s">community ones need two signers (D11)</text>
+  <rect x="485" y="110" width="200" height="70" rx="6" class="box u"/><text x="585" y="132" text-anchor="middle" class="t">Integrations</text><text x="585" y="148" text-anchor="middle" class="s">drivers exposing artefacts and events</text><text x="585" y="162" text-anchor="middle" class="s">deny-by-default allow-list contract</text><text x="585" y="175" text-anchor="middle" class="s">(folders, domains, app IDs)</text>
+  <rect x="15" y="200" width="670" height="45" rx="6" class="box g"/><text x="350" y="219" text-anchor="middle" class="t">Ledger (kernel-owned, userland-readable)</text><text x="350" y="236" text-anchor="middle" class="s">register history + lock decisions + rehearsal verdicts + promotions = the Art. 12-style record and the PRIMARY learning signal</text>
+  <path d="M215,145 L250,145" class="arrow dim"/><path d="M115,110 L115,80" class="arrow dim"/><path d="M585,110 L585,80" class="arrow dim"/>
+</svg>
+<figcaption>Figure 10 — The six userland families and the ledger they all write to.</figcaption>
+</figure>
+
+<!-- ============================ 11 ============================ -->
+<h2 class="pb">11. The vertical process: Cold → Warm → Hot</h2>
+<p>The literature is unambiguous: self-authored skills are net negative without a hard verifier; success-only telemetry never yields a useful skill; ungated accumulation collapses and rollback recovers little. So the loop is <b>sparse search with the gate at the front</b>.</p>
+<figure>
+<svg viewBox="0 0 700 330" xmlns="http://www.w3.org/2000/svg">
+  <rect x="15" y="60" width="150" height="90" rx="8" class="box g"/><text x="90" y="82" text-anchor="middle" class="t">COLD</text><text x="90" y="100" text-anchor="middle" class="s">any arch writes a candidate</text><text x="90" y="114" text-anchor="middle" class="s">node-local, ephemeral</text><text x="90" y="128" text-anchor="middle" class="s">origin lint rejects tainted spans</text><text x="90" y="142" text-anchor="middle" class="s">most are discarded — by design</text>
+  <rect x="200" y="40" width="200" height="130" rx="8" class="box k"/><text x="300" y="62" text-anchor="middle" class="t">WARM — rehearsal in sandbox</text><text x="300" y="80" text-anchor="middle" class="s">frozen snapshot, temporal cut-off</text><text x="300" y="94" text-anchor="middle" class="s">before each held-out artefact</text>
+  <text x="300" y="112" text-anchor="middle" class="s">(a) delta vs what the human shipped</text><text x="300" y="126" text-anchor="middle" class="s">(b) validators with anchor suites</text><text x="300" y="140" text-anchor="middle" class="s">(c) frontier check, never sole admission</text><text x="300" y="158" text-anchor="middle" class="s">locked hold-out, never readable (I2)</text>
+  <rect x="435" y="60" width="150" height="90" rx="8" class="box h"/><text x="510" y="82" text-anchor="middle" class="t">HOT — promoted</text><text x="510" y="100" text-anchor="middle" class="s">human-held approval (default)</text><text x="510" y="114" text-anchor="middle" class="s">signed dated test record</text><text x="510" y="128" text-anchor="middle" class="s">bound to a pool epoch</text><text x="510" y="142" text-anchor="middle" class="s">Hot-pending after merge</text>
+  <rect x="610" y="60" width="75" height="90" rx="8" class="box"/><text x="647" y="82" text-anchor="middle" class="t">Retire</text><text x="647" y="100" text-anchor="middle" class="s">tombstone,</text><text x="647" y="114" text-anchor="middle" class="s">never delete</text><text x="647" y="134" text-anchor="middle" class="s">outcomes retire</text>
+  <path d="M165,105 L200,105" class="arrow"/><path d="M400,105 L435,105" class="arrow"/><path d="M585,105 L610,105" class="arrow"/>
+  <path d="M300,170 L300,200 L90,200 L90,150" class="arrow red"/><text x="350" y="215" text-anchor="middle" class="s" style="fill:#b83232">failures with diagnostics are the productive signal; success-only telemetry is never used</text>
+  <rect x="15" y="235" width="670" height="88" rx="6" class="box" style="fill:#fafbfc"/>
+  <text x="30" y="254" class="t">Roles by arch</text>
+  <text x="30" y="270" class="s">Small local arches EXECUTE modules and CONSUME the gated pool. Authoring, reflection and judging are routed to frontier arches</text>
+  <text x="30" y="284" class="s">under the learning mode and clearance — or are off (local-only), with human sign-off as the only admission path.</text>
+  <text x="30" y="302" class="s">Modules tagged decision_about_person can never be auto-approved (GDPR Art. 22).</text>
+  <text x="30" y="316" class="s">Pedagogy: every explanation is paired with an outcome shown on the owner's real artefacts.</text>
+</svg>
+<figcaption>Figure 11 — The gated lifecycle. Promotion is the mutation-gating approval held by the owner: the pedagogic, delegation and oversight surface at once.</figcaption>
+</figure>
+
+<!-- ============================ 12 ============================ -->
+<h2>12. Learning signals and the threshold</h2>
+<div class="grid2">
+<div>
+<p><b>Phase 1 signals (decided):</b> <i>shadowing</i> and <i>technology watch</i>; explicit teaching later. Shadowing captures, within a user-chosen allow-list, artefact created/modified with diff, tool used, duration — no keystrokes, screenshots or page text outside the allow-list; special-category data dropped at ingest. Every trace carries an origin taint {owner-authored, owner-shipped, third-party-inbound, web} and a data class {own, third-party-mandated, unknown} assigned by source. Traces are personal-scope and non-exportable; only derived, declassified candidates move. Technology-watch candidates carry taint <i>web</i> and reach Hot only through human approval.</p>
+<p><b>Threshold (decided, then made two-dimensional):</b> data maturity (volume, artefact-type diversity, lawful-basis coverage) AND verifier readiness per artefact type. VerticalAI sets a floor at which the process fires once automatically for ready artefact types; the owner then owns and adjusts the threshold and is signalled before later runs.</p>
+</div>
+<figure style="margin:0">
+<svg viewBox="0 0 330 260" xmlns="http://www.w3.org/2000/svg">
+  <line x1="40" y1="220" x2="310" y2="220" class="link"/><line x1="40" y1="220" x2="40" y2="20" class="link"/>
+  <text x="175" y="245" text-anchor="middle" class="s">data maturity (volume · diversity · lawful basis)</text>
+  <text x="18" y="120" text-anchor="middle" class="s" transform="rotate(-90 18 120)">verifier readiness per artefact type</text>
+  <rect x="40" y="120" width="135" height="100" class="box g"/><text x="107" y="165" text-anchor="middle" class="s">nothing fires</text><text x="107" y="180" text-anchor="middle" class="s">(baseline only)</text>
+  <rect x="175" y="120" width="135" height="100" class="box g"/><text x="242" y="160" text-anchor="middle" class="s">data, no verifier:</text><text x="242" y="175" text-anchor="middle" class="s">excluded from auto run,</text><text x="242" y="190" text-anchor="middle" class="s">shown as "needs a validator</text><text x="242" y="205" text-anchor="middle" class="s">or N human decisions"</text>
+  <rect x="40" y="20" width="135" height="100" class="box g"/><text x="107" y="65" text-anchor="middle" class="s">verifier, little data:</text><text x="107" y="80" text-anchor="middle" class="s">waits for maturity</text>
+  <rect x="175" y="20" width="135" height="100" class="box u"/><text x="242" y="55" text-anchor="middle" class="t">first run fires</text><text x="242" y="75" text-anchor="middle" class="s">automatically at the floor,</text><text x="242" y="90" text-anchor="middle" class="s">then owner-adjusted,</text><text x="242" y="105" text-anchor="middle" class="s">signalled before each run</text>
+</svg>
+<figcaption>Figure 12 — The two-dimensional threshold.</figcaption>
+</figure>
+</div>
+
+<!-- ============================ 13 ============================ -->
+<h2 class="pb">13. Scopes and the curated federation</h2>
+<p>Three value scopes; each transition is a promotion with the same gates. The vertical scope <b>is part of the product</b>: "the first P2P runtime that brings value and adoption to businesses, local-first". The trust model is a <b>curated federation</b> that decentralises progressively.</p>
+<figure>
+<svg viewBox="0 0 700 300" xmlns="http://www.w3.org/2000/svg">
+  <rect x="15" y="30" width="190" height="110" rx="8" class="box"/><text x="110" y="52" text-anchor="middle" class="t">PERSONAL</text><text x="110" y="72" text-anchor="middle" class="s">a user's nodes</text><text x="110" y="88" text-anchor="middle" class="s">learned from that user's shadowing</text><text x="110" y="104" text-anchor="middle" class="s">raw traces never leave (I2)</text><text x="110" y="126" text-anchor="middle" class="s">e.g. "how Eric drafts a proposal"</text>
+  <rect x="255" y="30" width="190" height="110" rx="8" class="box u"/><text x="350" y="52" text-anchor="middle" class="t">BUSINESS</text><text x="350" y="72" text-anchor="middle" class="s">replicated across the company</text><text x="350" y="88" text-anchor="middle" class="s">promoted personal modules + self-traces</text><text x="350" y="104" text-anchor="middle" class="s">Hot status per node, pool epoch</text><text x="350" y="126" text-anchor="middle" class="s">e.g. "how this firm produces a deliverable"</text>
+  <rect x="495" y="30" width="190" height="110" rx="8" class="box f"/><text x="590" y="52" text-anchor="middle" class="t">VERTICAL</text><text x="590" y="72" text-anchor="middle" class="s">shared within a trade</text><text x="590" y="88" text-anchor="middle" class="s">declassified, script-free, signed</text><text x="590" y="104" text-anchor="middle" class="s">provenance + licence on every module</text><text x="590" y="126" text-anchor="middle" class="s">e.g. "how governance consultancies audit"</text>
+  <path d="M205,85 L255,85" class="arrow"/><text x="230" y="78" text-anchor="middle" class="s">promote</text><path d="M445,85 L495,85" class="arrow"/><text x="470" y="78" text-anchor="middle" class="s">export</text>
+  <!-- TUF -->
+  <rect x="15" y="165" width="670" height="125" rx="8" class="box f"/><text x="30" y="185" class="t" style="fill:#6b46c1">Federation trust — TUF-style roles from SP0 (D10)</text>
+  <rect x="30" y="198" width="150" height="80" rx="5" class="box"/><text x="105" y="216" text-anchor="middle" class="t">root · 2-of-3</text><text x="105" y="232" text-anchor="middle" class="s">offline: founder + custodian</text><text x="105" y="246" text-anchor="middle" class="s">+ sealed recovery share</text><text x="105" y="264" text-anchor="middle" class="s">signs role keys and expiry</text>
+  <rect x="195" y="198" width="150" height="80" rx="5" class="box"/><text x="270" y="216" text-anchor="middle" class="t">targets · signers</text><text x="270" y="232" text-anchor="middle" class="s">short-lived delegations</text><text x="270" y="246" text-anchor="middle" class="s">admitted by legal-entity check,</text><text x="270" y="264" text-anchor="middle" class="s">never by usage evidence (Sybil)</text>
+  <rect x="360" y="198" width="150" height="80" rx="5" class="box"/><text x="435" y="216" text-anchor="middle" class="t">timestamp · freshness</text><text x="435" y="232" text-anchor="middle" class="s">automated; nodes fail closed</text><text x="435" y="246" text-anchor="middle" class="s">after max_age</text>
+  <rect x="525" y="198" width="150" height="80" rx="5" class="box"/><text x="600" y="216" text-anchor="middle" class="t">revocation</text><text x="600" y="232" text-anchor="middle" class="s">signed events; propagate</text><text x="600" y="246" text-anchor="middle" class="s">and win merges</text><text x="600" y="264" text-anchor="middle" class="s">decentralising = a policy change</text>
+  <path d="M180,238 L195,238" class="arrow"/><path d="M345,238 L360,238" class="arrow"/><path d="M510,238 L525,238" class="arrow"/>
+</svg>
+<figcaption>Figure 13 — Scopes (D9) and the curated federation (D10). The end state — businesses vetting each other with no central party — is a goal revisited when Sybil-resistant admission exists.</figcaption>
+</figure>
+
+<!-- ============================ 14 ============================ -->
+<h2 class="pb">14. Compliance mapping (corrected after review)</h2>
+<table>
+<tr><th style="width:24%">Obligation</th><th style="width:16%">Applies</th><th>Mechanism in VerticalAI</th></tr>
+<tr><td>GDPR lawful basis for shadowing</td><td>now</td><td>Sole trader: consent. Workplace: Art. 6(1)(f) legitimate interest + Art. 88 national rules + mandatory DPIA (Art. 35(3)(a)); works-council/CSE attestation object (FR: L2312-38). <b>Employee consent is not a lawful basis</b> (EDPB 05/2020).</td></tr>
+<tr><td>e-Privacy Art. 5(3)</td><td>now</td><td>Browser/app drivers need the device user's consent; sole-trader self-install fits the requested-service exception.</td></tr>
+<tr><td>GDPR Art. 28</td><td>now</td><td>Client artefacts are processed as processor; data class <i>third-party-mandated</i> restricts learning to local/on-prem arches absent documented instructions.</td></tr>
+<tr><td>GDPR Art. 17 erasure</td><td>now</td><td>Per-subject keys + signed shred events (§8).</td></tr>
+<tr><td>GDPR Art. 22</td><td>now</td><td><code>decision_about_person</code> modules cannot be auto-approved; ledger entry is the intervention record.</td></tr>
+<tr><td>AI Act Art. 50 transparency</td><td>2 Aug 2026</td><td>Output-marking gate for every <i>generate</i> arch: C2PA/IPTC for media, provenance record for text; interaction disclosure in channels.</td></tr>
+<tr><td>AI Act Art. 25(2)</td><td>now</td><td>Instructions for use + machine-unwritable policies declare the system "is not to be changed into a high-risk AI system"; Annex III classifier runs at <code>propose_candidate</code>, <code>promote</code>, <code>import</code> <b>and on the shadowing configuration itself</b> (Annex III 4(b)); Art. 6(3) derogation documented where used.</td></tr>
+<tr><td>AI Act Arts. 9, 12, 14, 26, 43(4) / Art. 3(23)</td><td>conditional; Annex III from 2 Dec 2027 (Reg. 2026/1744)</td><td>Ledger, STOP + liveness lease + hardware-key approvals, pre-determined-change envelope per trade. The design prevents high-risk use by default; the mechanisms exist so a deployer who chooses a high-risk purpose can comply.</td></tr>
+<tr><td>Cyber Resilience Act</td><td>reporting from 11 Sep 2026; main application 11 Dec 2027</td><td>Approval-gated, logged self-modification; SBOM incl. weights and runtimes; default-on security updates with opt-out; 24h/72h/14d reporting via ENISA (opt-in security-event telemetry); 5-year support; <b>identity/key/signer component packaged separately</b> (class I "identity management"); "operating system" dropped from external naming.</td></tr>
+<tr><td>Product Liability Directive 2024/2853</td><td>9 Dec 2026</td><td>Software is a product; signer and vendor liability documented in federation terms.</td></tr>
+<tr><td>NIS 2</td><td>customer-side</td><td>Logs, access control and incident evidence supplied to essential/important entities.</td></tr>
+</table>
+<p class="small">All citations are to be re-verified against the consolidated Official Journal text before any external publication.</p>
+
+<!-- ============================ 15 ============================ -->
+<h2 class="pb">15. Decision log</h2>
+<h3>Design decisions (spec §2)</h3>
+<table>
+<tr><th style="width:6%">#</th><th>Decision</th><th style="width:34%">Notes</th></tr>
+<tr><td>D1</td><td>Kernel owns only orchestration, registers, locks; everything else is userland</td><td>mechanism in kernel, policy in userland</td></tr>
+<tr><td>D2</td><td>Model = ISA; heterogeneous arches behind manifests; kernel is model-agnostic</td><td>any AI system: local LLMs, cloud LLMs, world models, classical NLP</td></tr>
+<tr><td>D3</td><td>P2P multi-node, one shared userland per business, no cloud dependency</td><td>offline-first, merge on reconnect</td></tr>
+<tr><td>D4</td><td>Locks: tagged union (LEASE / APPROVAL / lock home) behind one syscall surface</td><td>revises "one lock primitive" after review</td></tr>
+<tr><td>D5</td><td>Irreversible actions: per-resource-class lock home + logged human override when unreachable; quorum groups later</td><td>founder's choice among the review's options</td></tr>
+<tr><td>D6</td><td>Human principal = hardware-key ceremony; phone is an approval channel, never a lock home, persists nothing</td><td></td></tr>
+<tr><td>D7</td><td>Storage tiering: Automerge for small metadata only; encrypted content-addressed blobs; per-node hash-chained ledger</td><td>narrows "Automerge for mergeable state"</td></tr>
+<tr><td>D8</td><td>Learning signals phase 1: shadowing + technology watch; explicit teaching later</td><td></td></tr>
+<tr><td>D9</td><td>Three value scopes: personal → business → vertical; the vertical scope is part of the product</td><td></td></tr>
+<tr><td>D10</td><td>Curated federation: founder as explicit root (2-of-3), signer admission by legal-entity check, progressive delegation</td><td>"no central party" is the end-state goal</td></tr>
+<tr><td>D11</td><td>Validators are a separate object class excluded from machine evolution</td><td></td></tr>
+<tr><td>D12</td><td>Sole-trader mode first; workplace mode deferred until DPIA/LIA/works-council objects exist</td><td></td></tr>
+<tr><td>D13</td><td>EU-hosted frontier arch as first-class adapter ("your data, your jurisdiction")</td><td>Anthropic first-party API has no EU inference geography</td></tr>
+<tr><td>D14</td><td>Spec-first, then a Rust user-space kernel; SP1 demo gated on isolation and code signing</td><td>Go runner-up; Python rejected for the kernel</td></tr>
+<tr><td>D15</td><td>Commercial first; kernel open-sourced later</td><td></td></tr>
+</table>
+<h3>Founder arbitrations during brainstorming (22 Sep 2026)</h3>
+<table>
+<tr><th style="width:30%">Question raised</th><th>Arbitration</th></tr>
+<tr><td>What does the kernel own?</td><td>Micro-architecture analogy: orchestration, registers (memory), lock/semaphore concept applied to AI. The rest is userland — that is what makes the product movable.</td></tr>
+<tr><td>Which lock semantics?</td><td>All three: resource mutual exclusion + resource allocation for the scheduler; mutation gating; human-held semaphores. Human-in-the-loop is a concept CARS puts on top: policy in userland, but the kernel keeps a primitive guaranteeing it is available at all times.</td></tr>
+<tr><td>Which models?</td><td>None specific; one or a combination; open-source local and big providers (Fable cited) are both legitimate arches. Any AI system — JEPA world models, System-1-style, NLP, future paradigms — must be characterisable.</td></tr>
+<tr><td>Decentralised how?</td><td>Several kernels on several nodes sharing one userland, no cloud, P2P propagation with management on top — the same value for a one-person company and a large enterprise.</td></tr>
+<tr><td>Partition behaviour?</td><td>Keep working, merge on reconnect with configurable merge rules (LAN/VLAN/WAN) — the most evolutive option.</td></tr>
+<tr><td>Where does Claude Code sit?</td><td>Corrected: the OS schedules Claude Code when needed; harnesses are opaque userland processes under a lease.</td></tr>
+<tr><td>What is a node?</td><td>Computation as close to the system as possible with a minimum performance floor; a configurable share of machine resources; native on Windows (most businesses), Linux and macOS; must live on the same host as the applications it integrates.</td></tr>
+<tr><td>Which learning signals first?</td><td>Shadowing and technology watch; explicit teaching afterwards. The owner must understand what is built and keep decision-making and personalisation.</td></tr>
+<tr><td>Is the vertical scope part of the product?</td><td>Yes — a wider end point in clients and an innovation: the first P2P runtime bringing value and adoption to businesses, local-first.</td></tr>
+<tr><td>Trust model of the vertical scope?</td><td>VerticalAI curates first; curation is delegated to businesses with enough usage; end state: businesses checking each other and allowing connection ("vertical partnership"). Curated federation with the founder as signer for now.</td></tr>
+<tr><td>First trade?</td><td>Freelancers and SMEs offering services/products — not the founder's audit practice — because SME owners lack the skills and tools to find relevant use cases and many already sell AI-made work.</td></tr>
+<tr><td>Week-one behaviour?</td><td>CARS-style register first: inventory of models and tools with all metadata (conversations, usage, licences, master prompts) into one local workspace; a threshold with a floor that fires the first run automatically, then owner-adjusted; all trades, not just quotes and emails.</td></tr>
+</table>
+<h3>Founder decisions after the adversarial review (23 Sep 2026)</h3>
+<table>
+<tr><th style="width:6%">#</th><th>Decision</th></tr>
+<tr><td>R1</td><td>Locks under partition: lock home + logged human override for irreversible actions; quorum groups later.</td></tr>
+<tr><td>R2</td><td>Licence: commercial first to build activity; the kernel is open-sourced later to democratise the commercial offering.</td></tr>
+<tr><td>R3</td><td>Workplace mode: sole traders first; the 12-person agency waits for DPIA/LIA/CSE objects, employee-held trace keys and k-anonymous deltas.</td></tr>
+<tr><td>R4</td><td>Human identity: hardware-key ceremony (Windows Hello/TPM, Secure Enclave/StrongBox); phone = approval channel; enrolment friction accepted.</td></tr>
+<tr><td>R5</td><td>Local-only businesses: an EU-hosted frontier arch is a first-class adapter so "jurisdiction: EU" is selectable; the product states plainly that fully-local deployments get no machine authoring.</td></tr>
+<tr><td>R6</td><td>Root of trust: the founder under a 2-of-3 threshold key; signer admission anchored to a legal-entity check, never usage evidence.</td></tr>
+<tr><td>R7</td><td>Validators leave the machine-evolution loop entirely.</td></tr>
+<tr><td>R8</td><td>Naming and sequencing: "AI operating system" dropped externally; the SP1 Windows demo is gated on service-account isolation, harness confinement and code signing rather than "demo first, harden later".</td></tr>
+</table>
+
+<!-- ============================ 16 ============================ -->
+<h2 class="pb">16. Hypotheses register</h2>
+<p>Everything below is a bet the roadmap must confirm or refute. "Evidence" is what we already know; "Test" is the sub-project and observable that settles it.</p>
+<table>
+<tr><th style="width:5%">#</th><th style="width:30%">Hypothesis</th><th style="width:31%">Evidence today</th><th>Test</th><th style="width:11%">Status</th></tr>
+<tr><td>H1</td><td>A model-agnostic task-state IR lets heterogeneous models cooperate on one task without losing state.</td><td>Provider reasoning state is model-bound (verified); AIOS/AgentOS keep kernel-side context managers.</td><td>SP1 demo: Gemma 4 + Claude Code on one task with a mid-task arch swap; IR round-trip loses no decision.</td><td><span class="tag test">to validate</span></td></tr>
+<tr><td>H2</td><td>Small local models (4–9B) can execute compact gated modules and consume a gated pool usefully.</td><td>Curated compact skills +16.6 pp; gated pool consumed by a small MoE +16 pp; 7B models weak on long multi-app chains.</td><td>SP3: module execution success on the owner's artefact types with Gemma 4 vs a frontier arch.</td><td><span class="tag lit">literature</span></td></tr>
+<tr><td>H3</td><td>Machine authoring of modules needs a frontier arch; local-only businesses get no machine authoring.</td><td>No source shows a 4–9B model authoring or judging skills; self-authoring net negative without a verifier.</td><td>SP3: candidate acceptance rate by authoring arch class.</td><td><span class="tag lit">literature</span></td></tr>
+<tr><td>H4</td><td>The delta-to-shipped verifier, with temporal cut-off and a locked hold-out, is a valid admission signal.</td><td>Review: leaky and Goodhart-able as first specified; fixed by cut-off + hold-out; still confounded by edits made for non-quality reasons.</td><td>SP3: false-discovery rate on hold-out; correlation of delta with owner accept/reject decisions.</td><td><span class="tag test">to validate</span></td></tr>
+<tr><td>H5</td><td>SME owners will review a proposals inbox when it shows outcomes on their own artefacts.</td><td>"Bot-PR neglect" raised and refuted; explanations without outcome feedback worsen judgment (g = −0.31).</td><td>SP3 pilot: proposals reviewed within 7 days; promotion rate; retention after 30 days.</td><td><span class="tag test">to validate</span></td></tr>
+<tr><td>H6</td><td>The baseline inventory is valuable on its own in week one.</td><td>Review confirmed value only if real content is imported (browser capture driver, receipts importer moved to SP2).</td><td>SP2 pilot: owner uses the workspace daily for a week without any self-improvement.</td><td><span class="tag test">to validate</span></td></tr>
+<tr><td>H7</td><td>Merge-on-reconnect with surfaced conflicts is acceptable to SMEs.</td><td>Local-first literature; I3 property-tested; conflicts must be rare enough not to annoy.</td><td>SP4: conflicts per week per business in the pilot; time-to-resolve.</td><td><span class="tag test">to validate</span></td></tr>
+<tr><td>H8</td><td>An EU-hosted frontier arch satisfies sovereignty-minded customers.</td><td>Anthropic first-party API: US/global only, 30-day retention; Bedrock/Vertex EU exist.</td><td>SP2–3: share of pilots choosing EU-hosted vs local-only vs US cloud.</td><td><span class="tag test">to validate</span></td></tr>
+<tr><td>H9</td><td>A curated federation can bootstrap a vertical before decentralising.</td><td>Pure-P2P skill patches leak ~5% entities; usage-evidence reputation is Sybil-attackable; TUF roles are standard.</td><td>SP5: first trade with ≥3 businesses importing signed modules; zero revocations for provenance failure.</td><td><span class="tag test">to validate</span></td></tr>
+<tr><td>H10</td><td>The hardware-key ceremony's enrolment friction is acceptable.</td><td>Windows Hello/TPM and Secure Enclave APIs exist; no user data yet.</td><td>SP4: enrolment completion rate; approvals per day per owner.</td><td><span class="tag test">to validate</span></td></tr>
+<tr><td>H11</td><td>A two-dimensional threshold (maturity × readiness) fires usefully rather than never.</td><td>Review: gating on volume alone manufactures false Hot modules; readiness needs a validator or N human decisions.</td><td>SP3: time-to-first-run per artefact type; fraction of types that ever become ready.</td><td><span class="tag test">to validate</span></td></tr>
+<tr><td>H12</td><td>Show-outcomes-not-explanations improves owner judgment.</td><td>74-study re-analysis: explanations + outcome feedback g = +0.30; LLM explanations gave zero human gain.</td><td>SP3: A/B of proposal cards with/without explanation text.</td><td><span class="tag lit">literature</span></td></tr>
+<tr><td>H13</td><td>Rust + spec-first does not stall the project.</td><td>SP0 delivered in one day on contracts; toolchain friction on Windows (MSVC required) documented.</td><td>SP1 delivered within its planned window with the demo gate met.</td><td><span class="tag test">to validate</span></td></tr>
+<tr><td>H14</td><td>A user-space daemon can enforce I2 on Windows (service account, keyring, harness confinement).</td><td>Review: unenforceable without these; Job Object / AppContainer exist; Claude Code MCP mode disclaims enforcement.</td><td>SP1 gate: red-team attempt by a confined harness to read the store or reach an arch directly fails.</td><td><span class="tag risk">known risk</span></td></tr>
+<tr><td>H15</td><td>Shadowing can be GDPR-defensible for a sole trader and later for workplaces.</td><td>Consent valid for sole traders; workplaces need Art. 6(1)(f) + Art. 88 + DPIA; shadowing itself may be Annex III 4(b).</td><td>SP3: DPIA template accepted by counsel; Annex III classifier verdict on the shadowing configuration.</td><td><span class="tag risk">known risk</span></td></tr>
+<tr><td>H16</td><td>The three-tier storage keeps replicas bounded and erasure real.</td><td>Review: CRDT-only storage cannot; tiering is standard practice in local-first systems.</td><td>SP4: replica size over 90 days; erasure verified unreadable on every node within one sync.</td><td><span class="tag test">to validate</span></td></tr>
+<tr><td>H17</td><td>"Orchestration runtime" naming avoids CRA class I while the identity component is assessed separately.</td><td>A user-space daemon is not an OS; identity/key/signer matches class I "identity management".</td><td>SP5: CRA classification memo reviewed by counsel before market placement.</td><td><span class="tag risk">known risk</span></td></tr>
+<tr><td>H18</td><td>Technology watch produces candidates worth gating.</td><td>Review: an inbound injection channel with no ground truth; only human approval can admit.</td><td>SP3: share of tech-watch proposals promoted by owners.</td><td><span class="tag test">to validate</span></td></tr>
+</table>
+
+<!-- ============================ 17 ============================ -->
+<h2 class="pb">17. Roadmap and SP0 status</h2>
+<figure>
+<svg viewBox="0 0 700 285" xmlns="http://www.w3.org/2000/svg">
+  <line x1="20" y1="60" x2="680" y2="60" class="link"/>
+  <g>
+    <rect x="20" y="30" width="95" height="60" rx="6" class="box u"/><text x="67" y="52" text-anchor="middle" class="t">SP0</text><text x="67" y="68" text-anchor="middle" class="s">contracts</text><text x="67" y="82" text-anchor="middle" class="s">DONE · tag sp0</text>
+    <rect x="130" y="30" width="95" height="60" rx="6" class="box k"/><text x="177" y="52" text-anchor="middle" class="t">SP1</text><text x="177" y="68" text-anchor="middle" class="s">single-node kernel</text><text x="177" y="82" text-anchor="middle" class="s">Rust · adapters</text>
+    <rect x="240" y="30" width="95" height="60" rx="6" class="box k"/><text x="287" y="52" text-anchor="middle" class="t">SP2</text><text x="287" y="68" text-anchor="middle" class="s">baseline userland</text><text x="287" y="82" text-anchor="middle" class="s">import · UI v0</text>
+    <rect x="350" y="30" width="95" height="60" rx="6" class="box k"/><text x="397" y="52" text-anchor="middle" class="t">SP3</text><text x="397" y="68" text-anchor="middle" class="s">vertical process</text><text x="397" y="82" text-anchor="middle" class="s">Cold/Warm/Hot</text>
+    <rect x="460" y="30" width="95" height="60" rx="6" class="box k"/><text x="507" y="52" text-anchor="middle" class="t">SP4</text><text x="507" y="68" text-anchor="middle" class="s">P2P</text><text x="507" y="82" text-anchor="middle" class="s">replication · phone</text>
+    <rect x="570" y="30" width="95" height="60" rx="6" class="box f"/><text x="617" y="52" text-anchor="middle" class="t">SP5</text><text x="617" y="68" text-anchor="middle" class="s">federation</text><text x="617" y="82" text-anchor="middle" class="s">signing · CRA artefacts</text>
+  </g>
+  <text x="177" y="115" text-anchor="middle" class="s">gate: service isolation,</text><text x="177" y="129" text-anchor="middle" class="s">harness confinement, code signing</text>
+  <text x="287" y="115" text-anchor="middle" class="s">demo: one workspace holding</text><text x="287" y="129" text-anchor="middle" class="s">real conversations, licences, costs</text>
+  <text x="397" y="115" text-anchor="middle" class="s">demo: first self-built module</text><text x="397" y="129" text-anchor="middle" class="s">promoted under a hardware key</text>
+  <text x="507" y="115" text-anchor="middle" class="s">demo: two laptops + a phone,</text><text x="507" y="129" text-anchor="middle" class="s">partition suite green</text>
+  <text x="617" y="115" text-anchor="middle" class="s">demo: first module shared</text><text x="617" y="129" text-anchor="middle" class="s">into a trade, founder-signed</text>
+  <text x="67" y="115" text-anchor="middle" class="s">45 tests · I1–I4' property-</text><text x="67" y="129" text-anchor="middle" class="s">tested · CI green ×3 OS</text>
+  <rect x="20" y="160" width="660" height="115" rx="6" class="box" style="fill:#fafbfc"/>
+  <text x="35" y="180" class="t">Cross-cutting from SP0</text>
+  <text x="35" y="198" class="s">compliance substrate · sandboxed rehearsals · property tests for invariants · technology watch on dependencies</text>
+  <text x="35" y="212" class="s">security: no scripts and no validators in machine-evolved modules</text>
+  <text x="35" y="232" class="s">SP0 deliverables: 19 JSON Schemas generated from Rust types (drift-tested), 18 examples, the Kernel syscall trait,</text>
+  <text x="35" y="246" class="s">an in-memory stub kernel with the interceptor chain, TUF root threshold verification, phone bootstrap protocol,</text>
+  <text x="35" y="260" class="s">TUF roles, trusted-computing-base statement. Repository github.com/EricLtx/VerticalAI — master at tag sp0.</text>
+</svg>
+<figcaption>Figure 14 — Sub-projects, gates and demos (spec §6).</figcaption>
+</figure>
+
+<!-- ============================ 18 ============================ -->
+<h2>18. Open questions and deferred items</h2>
+<table>
+<tr><th style="width:34%">Item</th><th>State</th></tr>
+<tr><td>Channels (chat / CLI / phone UX)</td><td>Deferred; they are ways into <code>submit_task</code>.</td></tr>
+<tr><td>Explicit teaching as a learning signal</td><td>Phase 2, after shadowing and technology watch.</td></tr>
+<tr><td>Workplace-mode objects (DPIA, LIA, CSE attestation, employee-held trace keys, k-anonymous deltas)</td><td>Deferred with R3; move into SP0/SP2 if a multi-person business enters scope before SP3.</td></tr>
+<tr><td>Quorum lock homes (1/3/5-node majority)</td><td>After SP4; default is the creating node + human override.</td></tr>
+<tr><td>"No central party" admission mechanism for the federation</td><td>Goal; revisited when Sybil-resistant admission exists.</td></tr>
+<tr><td>JEPA-style and classical-NLP adapters</td><td>Manifests allow them; no adapter planned before SP3.</td></tr>
+<tr><td>On-device fine-tuning from one business's data</td><td>Not planned: no evidence it helps at 4–9B; the small-model literature itself asks for 10k–100k examples.</td></tr>
+<tr><td>Statistical design of the delta verifier (multiplicity at the Cold gate)</td><td>To be specified in SP3's plan with a locked hold-out and false-discovery control.</td></tr>
+<tr><td>Which business processes have a verifier at all?</td><td>Those without one may stay permanently un-evolvable or use human sign-off as their only signal — to be measured per artefact type in SP3.</td></tr>
+<tr><td>Pedagogic loop when outcomes arrive weeks later, elsewhere, or never</td><td>Outcomes retire modules; they never admit them. Rehearsal-only outcomes are shown as such.</td></tr>
+</table>
+<p class="small" style="margin-top:14pt;color:var(--muted)">Generated from the design spec, the literature brief and the adversarial review on 23 September 2026. This document records arbitrations; the specification remains the normative text.</p>
+
+</main>
+</body>
+</html>
