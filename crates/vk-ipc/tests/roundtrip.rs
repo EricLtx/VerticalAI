@@ -537,6 +537,79 @@ async fn approve_over_ipc_requires_presence_and_a_matching_human_approval() {
     server.abort();
 }
 
+/// A client cannot read a register, so the subject of an approval is something
+/// it has to be told. `task.subject` is that answer, and this pins it to the
+/// only thing that makes it useful: the waiting step accepts what it names.
+#[tokio::test]
+async fn task_subject_is_what_the_approve_step_accepts() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let laptop = SoftwareHumanKey::generate("laptop");
+    {
+        use vk_contracts::testing::KernelTestHooks;
+        k.lock()
+            .unwrap()
+            .enroll_device("laptop", laptop.verifying_key_bytes());
+    }
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    let arch = c
+        .call("arch.mount_mock", json!({"name": "mock"}), None)
+        .await
+        .unwrap()["arch_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let id = c
+        .call(
+            "task.create",
+            json!({
+                "goal": "Draft a proposal",
+                "artefact_type": "proposal",
+                "steps": [
+                    {"kind": "draft", "arch_id": arch},
+                    {"kind": "approve"}
+                ]
+            }),
+            None,
+        )
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let step = || c.call("task.step", json!({"task_id": id}), None);
+    step().await.unwrap();
+    assert_eq!(step().await.unwrap()["status"], "waiting_human");
+
+    // The draft attached the task's artefact, so the subject is that blob.
+    let subject = c
+        .call("task.subject", json!({"task_id": id}), None)
+        .await
+        .unwrap()["subject_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(subject.starts_with("sha256:"), "{subject}");
+
+    // An approval built from nothing but that answer completes the step.
+    let proof = prove(&c, &laptop).await;
+    let ok = c
+        .call(
+            "approve",
+            json!({ "approval": human_approval(&laptop, &subject) }),
+            Some(proof),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok["ok"], true);
+    assert_eq!(step().await.unwrap()["status"], "done");
+    server.abort();
+}
+
 #[tokio::test]
 async fn a_presence_proof_on_a_method_that_takes_none_is_refused_and_still_spent() {
     let d = tempfile::tempdir().unwrap();

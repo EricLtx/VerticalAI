@@ -1872,9 +1872,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hex",
  "serde_json",
+ "tempfile",
+ "tokio",
  "vk-contracts",
  "vk-ipc",
+ "vk-kernel",
 ]
 
 [[package]]

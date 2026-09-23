@@ -60,6 +60,15 @@ struct DeviceRow {
     trust_class: String,
 }
 
+/// What `boot` found. Task 9 grows this into the full report (recovered
+/// partial line, arches, devices, stopped scopes) and makes a failed chain
+/// refuse to serve; SP1a reports and serves.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BootReport {
+    pub ledger_ok: bool,
+    pub ledger_len: usize,
+}
+
 /// Cumulative per-arch call counters, persisted under the `kv` key `stats:<arch_id>`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ArchStats {
@@ -182,6 +191,22 @@ impl RealKernel {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         Ok(())
+    }
+
+    /// Verify the ledger chain and record that this kernel started.
+    ///
+    /// The `boot` event is appended whatever the verdict: a node that came up
+    /// on a chain that does not verify is exactly the thing an auditor must
+    /// find in the record afterwards. Refusing to serve on a failed chain is
+    /// Task 9's, once `--force` exists to override it; here the verdict is
+    /// reported and `vk status` shows it.
+    pub fn boot(&mut self) -> Result<BootReport, KernelError> {
+        let ledger_ok = self.store.ledger.verify();
+        self.log("boot", now_ms(), &ledger_ok)?;
+        Ok(BootReport {
+            ledger_ok,
+            ledger_len: self.store.ledger.len(),
+        })
     }
 
     /// Mount an adapter for its manifest's arch id, replacing the mock that
@@ -846,6 +871,32 @@ mod tests {
             },
             ..machine(now)
         }
+    }
+
+    #[test]
+    fn boot_verifies_the_chain_and_records_that_the_node_started() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let boots = |k: &RealKernel| {
+            k.ledger()
+                .events()
+                .iter()
+                .filter(|e| e.kind == "boot")
+                .count()
+        };
+
+        let first = k.boot().unwrap();
+        assert!(first.ledger_ok, "a fresh chain verifies");
+        assert_eq!(first.ledger_len, k.ledger().events().len());
+        assert_eq!(boots(&k), 1, "one boot event per boot");
+
+        // Every start is on the record, and the event it appends is part of
+        // the chain it just verified.
+        let second = k.boot().unwrap();
+        assert!(second.ledger_ok);
+        assert_eq!(second.ledger_len, first.ledger_len + 1);
+        assert_eq!(boots(&k), 2);
+        assert!(k.ledger().verify_chain());
     }
 
     #[test]

@@ -326,6 +326,10 @@ fn dispatch(
             "ledger_len": k.ledger().events().len(),
             "ledger_ok": k.ledger().verify_chain(),
             "state_dir": k.store().state_dir.display().to_string(),
+            // Where a `release` step's `to_dir` is resolved: the client names a
+            // subpath and prints the resolved path, so "where did my artefact
+            // go?" is answerable without the client guessing the layout.
+            "export_root": k.export_root().display().to_string(),
         })),
         "ns.ls" => {
             let path = p["path"].as_str().unwrap_or("/");
@@ -376,6 +380,17 @@ fn dispatch(
             let ctx = ctx_for(&k, presence, now)?;
             let id = p["task_id"].as_str().ok_or_else(|| bad("task_id"))?;
             k.run_task_step(&ctx, id).map_err(kerr).and_then(to_value)
+        }
+        // What a human approval of this task must name. Reading a hash is not
+        // a human act, so no proof is asked for and the machine principal the
+        // connection already is does the reading; signing what comes back is
+        // the human part, and `approve` is where that is proved.
+        "task.subject" => {
+            let ctx = ctx_for(&k, presence, now)?;
+            let id = p["task_id"].as_str().ok_or_else(|| bad("task_id"))?;
+            k.approval_subject(&ctx, id)
+                .map(|h| json!({ "subject_hash": h }))
+                .map_err(kerr)
         }
         "task.show" => {
             let id = p["task_id"].as_str().ok_or_else(|| bad("task_id"))?;

@@ -137,6 +137,27 @@ impl RealKernel {
         self.store.db.get_json("tasks", id).ok().flatten()
     }
 
+    /// What a human approval of this task has to name as its subject: the
+    /// latest artefact on the register, or — with none attached — the register
+    /// itself.
+    ///
+    /// The `Approve` step below asks the same question of the same function,
+    /// and so does the client that builds the approval (`task.subject` over the
+    /// transport). One rule in one place: an approval built against a subject
+    /// the scheduler would not recognise is an approval that never completes a
+    /// step, and a second copy of this expression is how that happens.
+    pub fn approval_subject(&mut self, ctx: &Ctx, task_id: &str) -> Result<String, KernelError> {
+        let t = self
+            .task(task_id)
+            .ok_or_else(|| KernelError::NotFound(task_id.into()))?;
+        let reg = self.read_register(ctx, &t.register)?;
+        Ok(reg
+            .artefacts
+            .last()
+            .map(|a| a.hash.clone())
+            .unwrap_or_else(|| vk_contracts::hash_canonical(&reg)))
+    }
+
     /// The one directory a `Release` step may write to. Every release
     /// destination is resolved under it, so "where did my artefact go?" has a
     /// single answer: `export_root().join(to_dir)`.
@@ -252,7 +273,7 @@ impl RealKernel {
             self.save_task(&t)?;
         }
         let kind = t.steps[i].kind.clone();
-        match self.run_step(ctx, task_id, &kind, &t.register) {
+        match self.run_step(ctx, task_id, &kind, &t.register, &t.artefact_type) {
             Ok((StepStatus::WaitingHuman, _)) => {
                 if was_waiting {
                     // Still waiting on the same human: nothing transitioned, so
@@ -303,14 +324,28 @@ impl RealKernel {
         task_id: &str,
         kind: &StepKind,
         register: &RegisterId,
+        artefact_type: &str,
     ) -> Result<(StepStatus, u32), KernelError> {
         match kind {
             StepKind::Plan { arch_id } => {
                 let o = self.infer(ctx, arch_id, Capability::Plan, register)?;
                 Ok((StepStatus::Done, o.tokens_in))
             }
+            // The draft is what the task is *for*, so it is the step that
+            // produces the artefact: approval names it, release writes it, and
+            // `artefact_type` is the kind the caller asked for. `infer` returns
+            // no text — it raises the completion into the register — so the
+            // attachment reads it back from there rather than the arch being
+            // called twice.
             StepKind::Draft { arch_id } => {
                 let o = self.infer(ctx, arch_id, Capability::Generate, register)?;
+                let reg = self.read_register(ctx, register)?;
+                let drafted = reg.decisions.last().cloned().ok_or_else(|| {
+                    KernelError::Gate(format!(
+                        "arch {arch_id} returned nothing to attach as the task's {artefact_type}"
+                    ))
+                })?;
+                self.attach_artefact(ctx, register, artefact_type, drafted.as_bytes())?;
                 Ok((StepStatus::Done, o.tokens_in))
             }
             StepKind::Judge { arch_id } => {
@@ -321,16 +356,11 @@ impl RealKernel {
             // honest about needing a human rather than claiming work it did not do.
             StepKind::Harness { .. } => Ok((StepStatus::WaitingHuman, 0)),
             StepKind::Approve => {
-                let reg = self.read_register(ctx, register)?;
-                // The approval has to name *what* was approved. The latest
-                // artefact is that thing; with none attached yet, the register
-                // itself is, and either way a later artefact leaves the
-                // approval behind rather than inheriting it.
-                let subject = reg
-                    .artefacts
-                    .last()
-                    .map(|a| a.hash.clone())
-                    .unwrap_or_else(|| vk_contracts::hash_canonical(&reg));
+                // The approval has to name *what* was approved, and the rule
+                // for that lives in `approval_subject` — the same call the
+                // client makes to learn what to sign. A later artefact leaves
+                // an earlier approval behind rather than inheriting it.
+                let subject = self.approval_subject(ctx, task_id)?;
                 let approved = self
                     .approvals_for(&subject)
                     .iter()
@@ -517,6 +547,56 @@ mod tests {
             before,
             "re-polling a waiting step must not grow the ledger"
         );
+    }
+
+    #[test]
+    fn the_draft_step_attaches_its_output_as_the_tasks_artefact() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let arch = k.register_arch(crate::tests::local(personal()));
+        let t = k
+            .create_task(
+                &machine(1),
+                "Draft a proposal for Acme",
+                "proposal",
+                Label::bottom(),
+                vec![
+                    StepKind::Draft { arch_id: arch },
+                    StepKind::Release {
+                        to_dir: "out".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        let t = k.run_task_step(&machine(2), &t.id).unwrap();
+        assert!(matches!(t.steps[0].status, StepStatus::Done));
+
+        // One artefact, of the kind the task was submitted for, holding what
+        // the arch actually drafted.
+        let reg = k.read_register(&machine(3), &t.register).unwrap();
+        assert_eq!(reg.artefacts.len(), 1, "the draft is the task's artefact");
+        assert_eq!(reg.artefacts[0].kind, "proposal");
+        let bytes = k
+            .read_artefact(&machine(3), &reg.artefacts[0].hash)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            *reg.decisions.last().unwrap()
+        );
+
+        // It is what an approval must name, and what a release writes out.
+        assert_eq!(
+            k.approval_subject(&machine(4), &t.id).unwrap(),
+            reg.artefacts[0].hash
+        );
+        let t = k.run_task_step(&machine(5), &t.id).unwrap();
+        assert!(matches!(t.status, TaskStatus::Done));
+        let name = format!(
+            "{}.proposal",
+            &reg.artefacts[0].hash.trim_start_matches("sha256:")[..12]
+        );
+        let path = k.export_root().join("out").join(&name);
+        assert!(path.exists(), "{}", path.display());
     }
 
     #[test]
