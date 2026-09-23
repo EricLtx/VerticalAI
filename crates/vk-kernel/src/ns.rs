@@ -73,6 +73,17 @@ pub fn resolve(k: &RealKernel, path: &str) -> Result<Entry, KernelError> {
                 .map(|(id, _)| id)
                 .collect(),
         }),
+        // The id alone: a device row holds the verifying key that authenticates
+        // its owner's approvals, and the namespace is a read surface, not a
+        // place to hand that out.
+        ["devices", id] => k
+            .store()
+            .db
+            .get_json::<serde_json::Value>("devices", id)
+            .ok()
+            .flatten()
+            .map(|_| Entry::Device { id: (*id).into() })
+            .ok_or_else(|| KernelError::NotFound(path.into())),
         ["ledger"] => Ok(Entry::LedgerTail {
             events: k.store().ledger.tail(LEDGER_TAIL),
         }),
