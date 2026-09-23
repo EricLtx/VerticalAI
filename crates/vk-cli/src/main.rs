@@ -542,6 +542,19 @@ fn detach(cmd: &mut Command, state_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// How a daemon this shell started stopped being a daemon it is waiting for.
+enum Started {
+    /// It answered on the endpoint.
+    Serving,
+    /// It gave up before answering — a refused ledger, a key it could not
+    /// read, an endpoint already taken.
+    Exited(std::process::ExitStatus),
+    /// The OS will not say whether it is still running.
+    Lost(std::io::Error),
+    /// Still running, still not answering, out of patience.
+    Silent,
+}
+
 /// Start `vkd`, which lives next to this binary, and hand it the state
 /// directory and keys this call named.
 ///
@@ -612,31 +625,55 @@ fn boot(cli: &Cli, rt: &tokio::runtime::Runtime, a: &BootArgs) -> Result<()> {
         .spawn()
         .with_context(|| format!("start {}", exe.display()))?;
     let pid = child.id();
-    // Started is not serving: the daemon is up when it answers.
+    // Started is not serving: the daemon is up when it answers. It is also not
+    // *coming* up if it has already gone — a `vkd` that refuses its own ledger
+    // exits in milliseconds, and waiting out the timeout would tell the one
+    // person who can fix it that their endpoint is slow.
     let start = Instant::now();
-    let ready = rt.block_on(async {
+    let outcome = rt.block_on(async {
         loop {
             if serving(&ep).await.is_some() {
-                return true;
+                return Started::Serving;
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => return Started::Exited(status),
+                Err(e) => return Started::Lost(e),
+                Ok(None) => {}
             }
             if start.elapsed() > BOOT_TIMEOUT {
-                return false;
+                return Started::Silent;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     });
-    if !ready {
-        // It is ours and nobody else knows its pid, so it does not outlive the
-        // call that started it: otherwise it would sit on the endpoint and
-        // every later `vk boot` would refuse, blaming a daemon the user never
-        // sees.
-        let _ = child.kill();
-        let _ = child.wait();
-        anyhow::bail!(
-            "vkd (pid {pid}) did not answer on {} within {BOOT_TIMEOUT:?}; see {}",
+    let log = state_dir.join("vkd.log");
+    match outcome {
+        Started::Serving => {}
+        // It said why on its way out. The log is where a detached daemon
+        // speaks, so its last lines are the answer — naming a file to go and
+        // read is not.
+        Started::Exited(status) => anyhow::bail!(
+            "vkd (pid {pid}) exited with {status} before it answered on {}{}",
             ep.0,
-            state_dir.join("vkd.log").display()
-        );
+            match std::fs::read_to_string(&log) {
+                Ok(c) if !c.trim().is_empty() => format!(", saying:\n{}", render::log_tail(&c, 4)),
+                _ => format!("; see {}", log.display()),
+            }
+        ),
+        Started::Lost(e) => anyhow::bail!("lost track of vkd (pid {pid}): {e}"),
+        Started::Silent => {
+            // It is ours and nobody else knows its pid, so it does not outlive
+            // the call that started it: otherwise it would sit on the endpoint
+            // and every later `vk boot` would refuse, blaming a daemon the
+            // user never sees.
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!(
+                "vkd (pid {pid}) did not answer on {} within {BOOT_TIMEOUT:?}; see {}",
+                ep.0,
+                log.display()
+            );
+        }
     }
     show(
         cli,

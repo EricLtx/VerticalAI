@@ -231,17 +231,24 @@ impl RealKernel {
             arches: self.arches().into_iter().map(|(id, _)| id).collect(),
             devices: self.devices.ids(),
             stopped_scopes: self.stops.stopped_scopes(),
-            policies_version: self.policies_version()?,
+            policies_version: self.load_policies_version()?,
         };
         self.log("boot", now_ms(), &report)?;
         Ok(report)
     }
 
-    /// The policy set this node runs under. SP1a has no policy engine, so the
-    /// key is written once with `"0"` and read back unchanged; the version is
-    /// in the boot report from the start so that the first real policy set has
-    /// a predecessor in the record to migrate from.
-    fn policies_version(&mut self) -> Result<String, KernelError> {
+    /// The policy set this node runs under, as the store has it — `None` on a
+    /// node that has never booted. Read-only, so a status call can report the
+    /// version without being the thing that decides it.
+    pub fn policies_version(&self) -> Option<String> {
+        self.store.db.kv_get(POLICIES_VERSION).ok().flatten()
+    }
+
+    /// The boot step that loads it. SP1a has no policy engine, so the key is
+    /// written once with `"0"` and read back unchanged; the version is in the
+    /// boot report from the start so that the first real policy set has a
+    /// predecessor in the record to migrate from.
+    fn load_policies_version(&mut self) -> Result<String, KernelError> {
         if let Some(v) = self
             .store
             .db

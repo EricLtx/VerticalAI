@@ -245,6 +245,21 @@ fn type_of(p: &Value) -> String {
     if let Some(c) = p["const"].as_str() {
         return format!("\"{c}\"");
     }
+    // `"type": ["integer", "null"]` — the other spelling of `anyOf`, and the
+    // one a generator emits for an `Option<u32>`. Each alternative is rendered
+    // with the rest of the field's keywords still in place, so a format or an
+    // element type survives: `integer (uint32) or null`.
+    if let Some(alts) = p["type"].as_array() {
+        return alts
+            .iter()
+            .map(|t| {
+                let mut one = p.clone();
+                one["type"] = t.clone();
+                type_of(&one)
+            })
+            .collect::<Vec<_>>()
+            .join(" or ");
+    }
     match p["type"].as_str() {
         Some("array") => format!("array of {}", type_of(&p["items"])),
         Some("object") => match p["additionalProperties"].as_object() {
@@ -269,6 +284,21 @@ fn compact(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `(field, type)` pairs a page states: the property lines, which are
+    /// the ones indented by exactly four spaces. Descriptions, enum values and
+    /// nested fields are indented further and are not claims about a type.
+    fn rendered_fields(page: &str) -> Vec<(String, String)> {
+        page.lines()
+            .filter_map(|l| l.strip_prefix("    ").filter(|r| !r.starts_with(' ')))
+            .map(|row| {
+                let row = row.trim_end_matches("(required)").trim_end();
+                let ty = row.rsplit("  ").next().unwrap_or(row).trim();
+                let name = row[..row.len() - ty.len()].trim();
+                (name.to_string(), ty.to_string())
+            })
+            .collect()
+    }
 
     /// The one thing a hand-written table can get wrong. A schema added to
     /// `contracts/schemas/` and not to `SCHEMAS` would be a contract this
@@ -342,6 +372,29 @@ mod tests {
             page.contains("Commits to ciphertext, never to plaintext"),
             "a field's own description belongs on the page: {page}"
         );
+
+        // An optional field, in both spellings a generator uses for it: the
+        // `anyOf` one and the array-`type` one. Neither may print as `any` —
+        // this page is the ABI a client is written against, and a field whose
+        // type it will not name is a field the reader has to guess at.
+        let page = render("approval").unwrap();
+        let field = |name: &str, ty: &str| {
+            page.lines()
+                .any(|l| l.trim().starts_with(&format!("{name} ")) && l.trim().ends_with(ty))
+        };
+        assert!(field("signature_hex", "string or null"), "{page}");
+        assert!(field("challenge", "Challenge or null"), "{page}");
+
+        let page = render("arch_manifest").unwrap();
+        assert!(page.contains("integer (uint32) or null"), "{page}");
+
+        // And no page anywhere may leave a field's type unnamed: `any` is what
+        // this renderer prints when it cannot read a `type` at all.
+        for name in names() {
+            for (field, ty) in rendered_fields(&render(name).unwrap()) {
+                assert_ne!(ty, "any", "vk man {name}: {field} has no type");
+            }
+        }
 
         // A contract that is a choice, not a record.
         let page = render("principal").unwrap();

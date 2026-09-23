@@ -402,17 +402,7 @@ fn vkd_refuses_to_serve_a_ledger_that_does_not_verify_unless_forced() {
     }
     wait_until(&sh, false, "the killed daemon still holds the endpoint");
 
-    // One line of that record rewritten, exactly as an editor would leave it.
-    let seg = dir.path().join("ledger").join("seg-000000.jsonl");
-    let mut lines: Vec<String> = std::fs::read_to_string(&seg)
-        .expect("a ledger segment")
-        .lines()
-        .map(str::to_string)
-        .collect();
-    let mut first: Value = serde_json::from_str(&lines[0]).expect("a ledger event");
-    first["payload_hash"] = Value::String("sha256:tampered".into());
-    lines[0] = serde_json::to_string(&first).unwrap();
-    std::fs::write(&seg, format!("{}\n", lines.join("\n"))).unwrap();
+    tamper_first_ledger_line(dir.path());
 
     // Refused: non-zero, one message naming the chain and the way past it.
     let mut refused = Daemon(
@@ -451,6 +441,86 @@ fn vkd_refuses_to_serve_a_ledger_that_does_not_verify_unless_forced() {
     );
     let status = wait_until(&sh, true, "--force did not start a daemon").expect("status");
     assert_eq!(status["ledger_ok"], false, "{status}");
+}
+
+/// One line of a node's record rewritten, exactly as an editor would leave it:
+/// still valid JSON, so only the recomputed chain hash catches it.
+fn tamper_first_ledger_line(state_dir: &std::path::Path) {
+    let seg = state_dir.join("ledger").join("seg-000000.jsonl");
+    let mut lines: Vec<String> = std::fs::read_to_string(&seg)
+        .expect("a ledger segment")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let mut first: Value = serde_json::from_str(&lines[0]).expect("a ledger event");
+    first["payload_hash"] = Value::String("sha256:tampered".into());
+    lines[0] = serde_json::to_string(&first).unwrap();
+    std::fs::write(&seg, format!("{}\n", lines.join("\n"))).unwrap();
+}
+
+/// The same refusal, through the verb a person actually types. `vk boot` is
+/// the only thing the operator is looking at, so a daemon that refused its own
+/// ledger must come back as that reason — now, not as a timeout ten seconds
+/// later on an endpoint that was never the problem.
+#[test]
+fn vk_boot_reports_the_daemons_refusal_and_serves_only_when_forced() {
+    // `vk boot` spawns the vkd beside it without asking this test first, so the
+    // build has to happen before the first boot rather than under it.
+    assert!(vkd_exe().exists());
+    let dir = tempfile::tempdir().unwrap();
+    let node_key = dir.path().join("node.key");
+    let sh = Shell {
+        endpoint: vk_ipc::transport::test_endpoint().0,
+        node_key: node_key.clone(),
+    };
+    let here = path_of(dir.path());
+    let master = path_of(&dir.path().join("master.key"));
+    let key = path_of(&node_key);
+    let boot = [
+        "boot",
+        "--state-dir",
+        &here,
+        "--master-key-file",
+        &master,
+        "--node-key-file",
+        &key,
+        "--json",
+    ];
+
+    // A node with a record of its own, stopped again by the pid it gave back.
+    let booted = sh.json(&boot);
+    Detached(booted["pid"].as_u64().expect("a pid to stop it with")).kill();
+    wait_until(&sh, false, "the daemon outlived the pid vk boot reported");
+
+    tamper_first_ledger_line(dir.path());
+
+    // Refused — with the daemon's own words, and long before the boot timeout.
+    let start = Instant::now();
+    let refused = sh.run(&boot);
+    let waited = start.elapsed();
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    assert!(
+        waited < Duration::from_secs(5),
+        "vk boot waited {waited:?} instead of asking whether the daemon it started was still alive"
+    );
+    let why = String::from_utf8_lossy(&refused.stderr);
+    for named in ["exited", "ledger", "--force"] {
+        assert!(
+            why.contains(named),
+            "the daemon's own reason belongs in this message: {why}"
+        );
+    }
+    assert!(serving(&sh).is_none(), "nothing is serving that store");
+
+    // Forced: the same command starts a node that tells every caller what it
+    // is serving on.
+    let mut forcing = boot.to_vec();
+    forcing.push("--force");
+    let forced = sh.json(&forcing);
+    let _daemon = Detached(forced["pid"].as_u64().expect("a pid to stop it with"));
+    let status = wait_until(&sh, true, "--force did not start a daemon").expect("status");
+    assert_eq!(status["ledger_ok"], false, "{status}");
+    assert_eq!(status["policies_version"], "0", "{status}");
 }
 
 /// `vk man` is the one verb that needs no daemon: the contracts are in the

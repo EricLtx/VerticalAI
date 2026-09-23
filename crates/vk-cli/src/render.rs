@@ -94,9 +94,19 @@ pub fn status(v: &Value) -> String {
         ("state dir", text(&v["state_dir"])),
         ("export root", text(&v["export_root"])),
         ("arches", text(&v["arches"])),
+        ("devices", text(&v["devices"])),
         (
             "ledger",
             format!("{} events, chain {chain}", text(&v["ledger_len"])),
+        ),
+        (
+            "policies",
+            match v["policies_version"].as_str() {
+                Some(version) => format!("version {version}"),
+                // A node that has never booted: the boot sequence is what
+                // writes the version down.
+                None => "none recorded".into(),
+            },
         ),
         (
             "stopped",
@@ -114,6 +124,51 @@ pub fn status(v: &Value) -> String {
         ));
     }
     fields(&rows)
+}
+
+/// The end of a daemon's log, quoted back at the person who started it.
+///
+/// A `vkd` that refuses to serve says why on its way out, into
+/// `<state_dir>/vkd.log`, because it is detached and has no terminal. When the
+/// shell that started it has to report the failure, the daemon's own last
+/// words are the answer — naming a file to go and read is not.
+///
+/// The colour codes go: the subscriber writes them without knowing its output
+/// is a file, and an operator should not have to see them to read the reason.
+pub fn log_tail(contents: &str, lines: usize) -> String {
+    let plain: Vec<String> = contents
+        .lines()
+        .map(uncoloured)
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    plain[plain.len().saturating_sub(lines)..]
+        .iter()
+        .map(|l| format!("    {}", l.trim_end()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One line with its ANSI escape sequences removed.
+fn uncoloured(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // CSI: `ESC [`, parameter and intermediate bytes, then a final byte in
+        // `@`..=`~` that ends the sequence.
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// A namespace entry. A directory is its listing; a ledger path is a dmesg
@@ -371,7 +426,8 @@ mod tests {
         let node = |ledger_ok, recovered, stopped: Value| {
             super::status(&json!({
                 "node_id": "node-1", "state_dir": "S", "export_root": "E",
-                "arches": 1, "ledger_len": 18,
+                "arches": 1, "devices": 2, "ledger_len": 18,
+                "policies_version": "0",
                 "ledger_ok": ledger_ok,
                 "recovered_partial_line": recovered,
                 "stopped_scopes": stopped,
@@ -394,6 +450,24 @@ mod tests {
         );
         assert_eq!(value(&healthy, "stopped").as_deref(), Some("nothing"));
         assert_eq!(value(&healthy, "recovered"), None, "{healthy}");
+        assert_eq!(
+            value(&healthy, "devices").as_deref(),
+            Some("2"),
+            "{healthy}"
+        );
+        // The placeholder is reported, not hidden: the first real policy set
+        // migrates from a version somebody can read.
+        assert_eq!(
+            value(&healthy, "policies").as_deref(),
+            Some("version 0"),
+            "{healthy}"
+        );
+        let unbooted = super::status(&json!({"node_id": "node-1", "ledger_len": 0}));
+        assert_eq!(
+            value(&unbooted, "policies").as_deref(),
+            Some("none recorded"),
+            "{unbooted}"
+        );
 
         let damaged = node(false, true, json!(["node", "business:acme"]));
         assert_eq!(
@@ -411,6 +485,27 @@ mod tests {
                 .is_some_and(|v| v.starts_with("an unterminated last ledger line")),
             "{damaged}"
         );
+    }
+
+    /// What a detached daemon's last words look like when the shell that
+    /// started it has to quote them: the reason, not the escape codes a
+    /// subscriber wrote into a file it thought was a terminal.
+    #[test]
+    fn a_log_tail_is_the_reason_without_the_colour_codes() {
+        let log = "\u{1b}[2m2026-09-23T22:03:16Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m vkd booted\n\
+                   \n\
+                   Error: the ledger chain does not verify: pass --force\n";
+        assert_eq!(
+            super::log_tail(log, 6),
+            "    2026-09-23T22:03:16Z  INFO vkd booted\n\
+             \x20   Error: the ledger chain does not verify: pass --force"
+        );
+        // Only the tail, and an empty log is not a panic.
+        assert_eq!(
+            super::log_tail(log, 1),
+            "    Error: the ledger chain does not verify: pass --force"
+        );
+        assert_eq!(super::log_tail("", 4), "");
     }
 
     #[test]

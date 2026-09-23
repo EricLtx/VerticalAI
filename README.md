@@ -34,7 +34,7 @@ Protocol documents: `contracts/identity/phone-bootstrap.md`, `contracts/federati
 MSRV: Rust 1.98.1 (stable, 2026-09-01), MSVC toolchain on Windows (`rust-toolchain.toml` pins `stable`).
 
 ```
-cargo test --workspace                          # 119 tests: unit, schema drift, examples, stub, properties, end-to-end shell
+cargo test --workspace                          # 121 tests: unit, schema drift, examples, stub, properties, end-to-end shell
 cargo run -p vk-contracts --bin gen-schemas     # regenerate contracts/schemas/ after changing a contract type
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
@@ -56,7 +56,7 @@ table or, with `--json`, as the daemon's own answer.
 |---|---|
 | `vk boot [--force]` | `init`: start `vkd` over a state directory and wait until it answers |
 | `vk status` | `uname`: what this node is, and what its boot sequence found |
-| `vk ls PATH` | the namespace: `/arches`, `/tasks`, `/ledger` as directories |
+| `vk ls PATH` | the namespace: `/arches`, `/tasks`, `/artefacts`, `/devices`, `/ledger` as directories |
 | `vk ps`, `vk top` | the scheduler: what every task is doing, what each arch has cost |
 | `vk mount mock NAME`, `vk umount ID` | drivers: an arch is a device this kernel drives |
 | `vk task submit` / `step` / `show` | processes: a task is the unit of work, its register is its address space |
@@ -75,12 +75,14 @@ the mounted arches, the enrolled devices, the stopped scopes, and
 `policies_version` — a placeholder in SP1a, where there is no policy engine
 yet. The report goes to the log at info level (`<state_dir>/vkd.log` for a
 detached daemon) and into the record: the `boot` event's payload is that
-report's canonical hash. `vk status` shows the parts a person acts on.
+report's canonical hash. `vk status` shows the parts a person acts on, and
+`vk status --json` carries them all.
 
 **A chain that does not verify does not serve.** `vkd` exits non-zero and says
 where the ledger is; `vkd --force` (or `vk boot --force`) serves anyway, for
 recovering a node whose record was damaged — everything appended afterwards
-chains onto a record already known not to hold.
+chains onto a record already known not to hold. A `vk boot` whose daemon
+refused comes back with the daemon's own last words, not with a timeout.
 
 ### Defaults
 
@@ -91,9 +93,11 @@ chains onto a record already known not to hold.
 | node device key | OS keyring | `--node-key-file FILE`, or `$VK_NODE_KEY_FILE` |
 | endpoint | `\\.\pipe\vk-<user>` (Windows), `$XDG_RUNTIME_DIR/vk.sock` (Unix) | `--endpoint EP`, or `$VK_ENDPOINT` |
 
-`$VK_ENDPOINT` and `$VK_NODE_KEY_FILE` are read by `vk` only. `vkd` never reads
-the environment: a daemon on a non-default endpoint is always started with
-`--endpoint`, and `vk boot` passes on the endpoint it resolved.
+`$VK_ENDPOINT` and `$VK_NODE_KEY_FILE` are read by `vk` only: a daemon on a
+non-default endpoint is always started with `--endpoint`, and `vk boot` passes
+on the endpoint it resolved. The one variable `vkd` reads is `$RUST_LOG`, and
+with it unset it logs at **info** — which is why the boot report is in
+`<state_dir>/vkd.log` without anybody having had to ask for it.
 
 ### A node, end to end
 

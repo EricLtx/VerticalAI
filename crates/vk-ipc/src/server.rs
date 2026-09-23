@@ -323,14 +323,21 @@ fn dispatch(
         "boot.info" => Ok(json!({
             "node_id": k.node_id,
             "arches": k.arches().len(),
+            "devices": k.devices().ids().len(),
             "ledger_len": k.ledger().events().len(),
             "ledger_ok": k.ledger().verify_chain(),
-            // What the boot sequence found, still true for the life of this
-            // daemon: a node serving on a chain that does not verify, or one
-            // event short of its record, says so to every caller and not only
-            // in the log line nobody read.
+            // Fixed when this daemon opened its store: one event short of its
+            // record is a thing every caller is told, not only the log line
+            // nobody read.
             "recovered_partial_line": k.recovered_partial_line(),
+            // Read live, not remembered from boot — a STOP issued a minute ago
+            // is exactly the one an operator is asking about.
             "stopped_scopes": k.stopped_scopes(),
+            // What boot wrote down; `null` on a node that has never booted.
+            // There is no policy engine in SP1a, but a placeholder nothing can
+            // read is a predecessor the first real policy set cannot migrate
+            // from.
+            "policies_version": k.policies_version(),
             "state_dir": k.store().state_dir.display().to_string(),
             // Where a `release` step's `to_dir` is resolved: the client names a
             // subpath and prints the resolved path, so "where did my artefact
