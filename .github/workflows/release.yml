@@ -1,0 +1,35 @@
+name: release
+# Builds the vk shell and the vkd daemon in release mode on the three node
+# platforms and publishes them as workflow artifacts. Runs on demand
+# (workflow_dispatch) and on sp*/v* tags. Unsigned until the SP1 signing gate.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'sp*'
+      - 'v*'
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            ext: .exe
+          - os: ubuntu-latest
+            ext: ''
+          - os: macos-latest
+            ext: ''
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release -p vk-cli -p vkd
+      - run: cargo run --release -p vk-cli -- --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vk-${{ matrix.os }}
+          path: |
+            target/release/vk${{ matrix.ext }}
+            target/release/vkd${{ matrix.ext }}
+          if-no-files-found: error
+          retention-days: 30
