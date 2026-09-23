@@ -1,5 +1,7 @@
 //! The real single-node kernel (spec §3): the stub's semantics over vk-store.
 pub mod arch;
+pub mod ns;
+pub mod tasks;
 
 use anyhow::Result;
 use std::collections::BTreeMap;
