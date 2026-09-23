@@ -253,7 +253,11 @@ pub mod os {
         #[test]
         fn only_a_dead_listening_socket_is_fatal() {
             let emfile = std::io::Error::from_raw_os_error(24);
-            let econnaborted = std::io::Error::from_raw_os_error(103);
+            // ECONNABORTED is 103 on Linux but 53 on macOS: naming the number
+            // once per platform is what keeps this case about a lost
+            // connection rather than about whatever 103 means over there.
+            let econnaborted =
+                std::io::Error::from_raw_os_error(if cfg!(target_os = "macos") { 53 } else { 103 });
             let ebadf = std::io::Error::from_raw_os_error(9);
             assert!(matches!(classify(emfile), AcceptError::Connection(_)));
             assert!(matches!(classify(econnaborted), AcceptError::Connection(_)));
@@ -264,7 +268,11 @@ pub mod os {
         async fn a_live_endpoint_is_not_evicted_but_a_stale_one_is() {
             let ep = test_endpoint();
             let live = bind(&ep).await.unwrap();
-            let err = bind(&ep).await.unwrap_err();
+            // `unwrap_err` would need `Listener: Debug`, which the Windows one
+            // deliberately is not; let-else keeps the two ends of the cfg alike.
+            let Err(err) = bind(&ep).await else {
+                panic!("a live endpoint must not be taken from under its daemon");
+            };
             assert!(err.to_string().contains("already in use"), "{err}");
             // Dropping the listener leaves the socket file behind: stale.
             drop(live);
@@ -282,7 +290,9 @@ pub mod os {
             let dir = Path::new(&ep.0).parent().unwrap();
             std::fs::create_dir_all(dir).unwrap();
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let err = bind(&ep).await.unwrap_err();
+            let Err(err) = bind(&ep).await else {
+                panic!("a directory others can reach must not be listened in");
+            };
             assert!(err.to_string().contains("accessible by others"), "{err}");
         }
 
@@ -292,7 +302,9 @@ pub mod os {
             let dir = Path::new(&ep.0).parent().unwrap();
             std::fs::create_dir_all(dir).unwrap();
             std::fs::write(&ep.0, "not a socket").unwrap();
-            let err = bind(&ep).await.unwrap_err();
+            let Err(err) = bind(&ep).await else {
+                panic!("a regular file at the endpoint must not be bound over");
+            };
             assert!(err.to_string().contains("not a socket"), "{err}");
             assert_eq!(std::fs::read_to_string(&ep.0).unwrap(), "not a socket");
         }

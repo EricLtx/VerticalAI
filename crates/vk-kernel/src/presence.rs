@@ -167,7 +167,11 @@ mod tests {
         let path = d.path().join("node.key");
         NodeDevice::load_or_create(KeySource::File(path.clone()), "n1").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let err = NodeDevice::load_or_create(KeySource::File(path), "n1").unwrap_err();
+        // `unwrap_err` would need `NodeDevice: Debug`, and a type holding an
+        // ed25519 secret has no business being printable.
+        let Err(err) = NodeDevice::load_or_create(KeySource::File(path), "n1") else {
+            panic!("a world-readable key file must be refused");
+        };
         assert!(err.to_string().contains("readable by others"), "{err}");
     }
 

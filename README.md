@@ -91,7 +91,7 @@ refused comes back with the daemon's own last words, not with a timeout.
 | state directory | this user's local app data, never a synced folder | `--state-dir DIR` |
 | master key | OS keyring, service `vk`, user `master` | `--master-key-file FILE` (tests and CI) |
 | node device key | OS keyring | `--node-key-file FILE`, or `$VK_NODE_KEY_FILE` |
-| endpoint | `\\.\pipe\vk-<user>` (Windows), `$XDG_RUNTIME_DIR/vk.sock` (Unix) | `--endpoint EP`, or `$VK_ENDPOINT` |
+| endpoint | `\\.\pipe\vk-<user>` (Windows); `$XDG_RUNTIME_DIR/vk.sock`, else `/tmp/vk-<user>/vk.sock` (Unix) | `--endpoint EP`, or `$VK_ENDPOINT` |
 
 `$VK_ENDPOINT` and `$VK_NODE_KEY_FILE` are read by `vk` only: a daemon on a
 non-default endpoint is always started with `--endpoint`, and `vk boot` passes
@@ -106,7 +106,7 @@ keyring. Paste it a line at a time and read what each verb prints; `$ARCH`,
 `$TASK` and `$STOP` are the ids the commands before them printed.
 
 ```
-D=$TEMP/vk-demo                         # any local path outside a synced folder
+D=${TMPDIR:-${TEMP:-/tmp}}/vk-demo      # any local path outside a synced folder
 export VK_NODE_KEY_FILE=$D/node.key
 
 vk boot --state-dir $D --master-key-file $D/master.key
