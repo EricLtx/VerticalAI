@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use vk_contracts::arch::Capability;
 use vk_contracts::labels::Label;
 use vk_contracts::principal::ApprovalKind;
-use vk_contracts::register::RegisterId;
+use vk_contracts::register::{Register, RegisterId};
 use vk_contracts::syscalls::{Ctx, Kernel, KernelError};
 use vk_contracts::testing::KernelTestHooks;
 
@@ -142,8 +142,31 @@ impl RealKernel {
             .map_err(store_failed)
     }
 
-    pub fn task(&self, id: &str) -> Option<Task> {
+    /// The row as stored, with no question asked about who is looking. Every
+    /// read that leaves the kernel goes through `task`, which asks it.
+    fn task_row(&self, id: &str) -> Option<Task> {
         self.store.db.get_json("tasks", id).ok().flatten()
+    }
+
+    /// May `ctx` see this task? A `Task` carries its register's goal and the
+    /// trail of what was done with it, so it is subject to the register's
+    /// label exactly as `read_register` is (I2): the label must flow to the
+    /// caller's clearance. A task whose register cannot be read — or cannot
+    /// be found — is hidden rather than refused: "not found" says nothing,
+    /// where "exceeds your clearance" would say that something is there.
+    fn visible_to(&self, ctx: &Ctx, t: &Task) -> bool {
+        self.store
+            .db
+            .get_json::<Register>("registers", &t.register.0)
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.label.flows_to(&ctx.clearance))
+    }
+
+    /// One task, as `ctx` may see it: `None` for a task that is not there and
+    /// for one whose label the caller is not cleared for, indistinguishably.
+    pub fn task(&self, ctx: &Ctx, id: &str) -> Option<Task> {
+        self.task_row(id).filter(|t| self.visible_to(ctx, t))
     }
 
     /// What a human approval of this task has to name as its subject: the
@@ -164,7 +187,7 @@ impl RealKernel {
     /// step asks from inside its own run, so it always satisfies this.
     pub fn approval_subject(&mut self, ctx: &Ctx, task_id: &str) -> Result<String, KernelError> {
         let t = self
-            .task(task_id)
+            .task(ctx, task_id)
             .ok_or_else(|| KernelError::NotFound(task_id.into()))?;
         let current = t
             .steps
@@ -242,13 +265,16 @@ impl RealKernel {
         Ok(name)
     }
 
-    pub fn tasks(&self) -> Vec<Task> {
+    /// Every task `ctx` may see (I2, as for `task`): the listing is a read
+    /// surface too, and an id in it is a fact about a register.
+    pub fn tasks(&self, ctx: &Ctx) -> Vec<Task> {
         self.store
             .db
             .list_json::<Task>("tasks")
             .unwrap_or_default()
             .into_iter()
             .map(|(_, t)| t)
+            .filter(|t| self.visible_to(ctx, t))
             .collect()
     }
 
@@ -268,8 +294,11 @@ impl RealKernel {
     /// been stopped since it finished. Re-running a failed task is a decision
     /// for a caller who says so, not a side effect of asking after it.
     pub fn run_task_step(&mut self, ctx: &Ctx, task_id: &str) -> Result<Task, KernelError> {
+        // As the caller may see it: a task above the caller's clearance is
+        // not found, and its row is not touched — no step of it could have
+        // run anyway, since every step reads the register.
         let mut t = self
-            .task(task_id)
+            .task(ctx, task_id)
             .ok_or_else(|| KernelError::NotFound(task_id.into()))?;
         if matches!(t.status, TaskStatus::Done | TaskStatus::Failed) {
             return Ok(t);
@@ -425,12 +454,21 @@ impl RealKernel {
                         destination: dest.display().to_string(),
                     },
                 )?;
-                std::fs::create_dir_all(&dest).map_err(store_failed)?;
+                // The export root and the destination under it are the
+                // owner's alone (Unix `0700`), and so is each released file
+                // (`0600`): this is plaintext, outside the encrypted tier.
+                vk_store::paths::private_dir(&self.export_root()).map_err(store_failed)?;
+                vk_store::paths::private_dir(&dest).map_err(store_failed)?;
                 for (hash, name) in files {
                     // `read_artefact` re-checks the label against the caller's
                     // clearance: leaving the kernel is exactly where I2 matters.
                     let bytes = self.read_artefact(ctx, &hash)?;
-                    std::fs::write(dest.join(name), bytes).map_err(store_failed)?;
+                    let path = dest.join(name);
+                    let mut opts = vk_store::paths::private_file_options();
+                    opts.write(true).create(true).truncate(true);
+                    let mut f = opts.open(&path).map_err(store_failed)?;
+                    std::io::Write::write_all(&mut f, &bytes).map_err(store_failed)?;
+                    vk_store::paths::restrict_file(&path).map_err(store_failed)?;
                 }
                 Ok((StepStatus::Done, 0))
             }
@@ -438,8 +476,10 @@ impl RealKernel {
     }
 
     /// The operator's one screen. Everything here is read back from disk, so it
-    /// says the same thing after a restart as it did before one.
-    pub fn top(&self) -> TopView {
+    /// says the same thing after a restart as it did before one. The tasks on
+    /// it are the ones `ctx` may see (I2); arches, STOPs and liveness carry no
+    /// label.
+    pub fn top(&self, ctx: &Ctx) -> TopView {
         let mut v = TopView::default();
         for (key, value) in self.store.db.kv_list_prefix("stats:").unwrap_or_default() {
             if let (Some(arch), Ok(stats)) = (
@@ -449,7 +489,7 @@ impl RealKernel {
                 v.arches.insert(arch.into(), stats);
             }
         }
-        for t in self.tasks() {
+        for t in self.tasks(ctx) {
             v.tasks.insert(t.id, t.status);
         }
         // Every scope a live STOP holds, from the STOP set itself rather than
@@ -556,7 +596,7 @@ mod tests {
         let reg = k.read_register(&machine(5), &t.register).unwrap();
         assert!(reg.decisions.iter().any(|d| d.starts_with("plan:")));
         assert!(reg.decisions.iter().any(|d| d.starts_with("draft:")));
-        assert_eq!(k.top().arches[&arch].calls, 2);
+        assert_eq!(k.top(&machine(0)).arches[&arch].calls, 2);
         // One task, one id: the payload tier keys artefacts under the
         // register's task id, and the `Task` must name the same subject.
         assert_eq!(t.id, reg.task_id);
@@ -718,7 +758,10 @@ mod tests {
         k.stop(&human(6), "node").unwrap();
         let after = k.run_task_step(&machine(7), &done.id).unwrap();
         assert!(matches!(after.status, TaskStatus::Done));
-        assert!(matches!(k.task(&done.id).unwrap().status, TaskStatus::Done));
+        assert!(matches!(
+            k.task(&machine(0), &done.id).unwrap().status,
+            TaskStatus::Done
+        ));
     }
 
     #[test]
@@ -781,7 +824,7 @@ mod tests {
                 ),
                 "{bad} must be refused"
             );
-            let row = k.task(&t.id).unwrap();
+            let row = k.task(&machine(0), &t.id).unwrap();
             assert!(matches!(row.status, TaskStatus::Failed));
             assert!(matches!(row.steps[0].status, StepStatus::Failed(_)));
         }
@@ -819,7 +862,7 @@ mod tests {
             k.run_task_step(&machine(4), &t.id),
             Err(KernelError::Gate(_))
         ));
-        let row = k.task(&t.id).unwrap();
+        let row = k.task(&machine(0), &t.id).unwrap();
         assert!(matches!(row.status, TaskStatus::Failed));
         assert!(matches!(row.steps[0].status, StepStatus::Failed(_)));
         assert!(
@@ -854,7 +897,7 @@ mod tests {
                 k.run_task_step(&machine(2), &failed.id),
                 Err(KernelError::NotFound(_))
             ));
-            let row = k.task(&failed.id).unwrap();
+            let row = k.task(&machine(0), &failed.id).unwrap();
             assert!(matches!(row.status, TaskStatus::Failed));
             match &row.steps[0].status {
                 StepStatus::Failed(reason) => assert!(reason.contains("arch-nope"), "{reason}"),
@@ -877,7 +920,7 @@ mod tests {
                 Err(KernelError::Stopped(_))
             ));
             assert!(matches!(
-                k.task(&stopped.id).unwrap().status,
+                k.task(&machine(0), &stopped.id).unwrap().status,
                 TaskStatus::Stopped
             ));
             (failed.id, stopped.id)
@@ -885,14 +928,14 @@ mod tests {
         // A caller that never comes back must not be the only record of either.
         let k = open(d.path());
         assert!(matches!(
-            k.task(&failed_id).unwrap().status,
+            k.task(&machine(0), &failed_id).unwrap().status,
             TaskStatus::Failed
         ));
         assert!(matches!(
-            k.task(&stopped_id).unwrap().status,
+            k.task(&machine(0), &stopped_id).unwrap().status,
             TaskStatus::Stopped
         ));
-        assert_eq!(k.top().stopped_scopes, vec!["node".to_string()]);
+        assert_eq!(k.top(&machine(0)).stopped_scopes, vec!["node".to_string()]);
     }
 
     /// `top` and `boot`/`vk status` read one set. A scope this screen had to
@@ -904,9 +947,12 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut k = open(d.path());
         let s = k.stop(&human(1), "business:acme").unwrap();
-        assert_eq!(k.top().stopped_scopes, vec!["business:acme".to_string()]);
+        assert_eq!(
+            k.top(&machine(0)).stopped_scopes,
+            vec!["business:acme".to_string()]
+        );
         k.resume(&human(2), &s).unwrap();
-        assert!(k.top().stopped_scopes.is_empty());
+        assert!(k.top(&machine(0)).stopped_scopes.is_empty());
     }
 
     #[test]
@@ -928,11 +974,11 @@ mod tests {
                 .unwrap();
             let t = k.run_task_step(&machine(2), &t.id).unwrap();
             assert!(matches!(t.status, TaskStatus::Done));
-            assert_eq!(k.top().arches[&arch].calls, 1);
+            assert_eq!(k.top(&machine(0)).arches[&arch].calls, 1);
             (arch, t.id)
         };
         let k = open(d.path());
-        let v = k.top();
+        let v = k.top(&machine(0));
         assert_eq!(
             v.arches[&arch].calls, 1,
             "per-arch counters come from disk, not from this process's memory"
@@ -948,18 +994,155 @@ mod tests {
         let arch = k.register_arch(crate::tests::local(personal()));
         k.enroll_device("phone-1", [7u8; 32]);
         assert!(matches!(
-            crate::ns::resolve(&k, "/").unwrap(),
+            crate::ns::resolve(&k, &machine(0), "/").unwrap(),
             crate::ns::Entry::Dir { .. }
         ));
         assert!(matches!(
-            crate::ns::resolve(&k, &format!("/arches/{arch}")).unwrap(),
+            crate::ns::resolve(&k, &machine(0), &format!("/arches/{arch}")).unwrap(),
             crate::ns::Entry::Arch(_)
         ));
-        match crate::ns::resolve(&k, "/devices/phone-1").unwrap() {
+        match crate::ns::resolve(&k, &machine(0), "/devices/phone-1").unwrap() {
             crate::ns::Entry::Device { id } => assert_eq!(id, "phone-1"),
             other => panic!("expected a device, got {other:?}"),
         }
-        assert!(crate::ns::resolve(&k, "/devices/ghost").is_err());
-        assert!(crate::ns::resolve(&k, "/nope").is_err());
+        assert!(crate::ns::resolve(&k, &machine(0), "/devices/ghost").is_err());
+        assert!(crate::ns::resolve(&k, &machine(0), "/nope").is_err());
+    }
+
+    /// I2 on the task views. A task carries its register's goal, so a task
+    /// whose register does not flow to the caller is not merely refused, it
+    /// is not there: absent from `tasks`, `top` and `/tasks`, not found by
+    /// `task`, `/tasks/<id>` and `run_task_step` — and the row untouched by
+    /// the attempt. A caller cleared for the label sees it everywhere, and a
+    /// task at the bottom label is visible to both.
+    #[test]
+    fn a_task_above_the_callers_clearance_is_absent_from_every_task_view() {
+        use crate::ns::{resolve, Entry};
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let arch = k.register_arch(crate::tests::local(personal()));
+        let above = Label {
+            scope: Scope::Business,
+            data_class: DataClass::Own,
+            origins: Default::default(),
+        };
+        let cleared = machine(1);
+        let secret = k
+            .create_task(
+                &cleared,
+                "the confidential goal",
+                "note",
+                above,
+                vec![StepKind::Plan {
+                    arch_id: arch.clone(),
+                }],
+            )
+            .unwrap();
+        let plain = k
+            .create_task(
+                &cleared,
+                "a public goal",
+                "note",
+                Label::bottom(),
+                vec![StepKind::Plan { arch_id: arch }],
+            )
+            .unwrap();
+        let low = Ctx {
+            clearance: Clearance {
+                max_scope: Scope::Public,
+                third_party_allowed: true,
+            },
+            ..machine(2)
+        };
+        fn listed(k: &RealKernel, ctx: &Ctx) -> Vec<String> {
+            match resolve(k, ctx, "/tasks").unwrap() {
+                Entry::Dir { entries } => entries,
+                other => panic!("expected a listing, got {other:?}"),
+            }
+        }
+
+        // Not there, for the caller who is not cleared for it.
+        assert!(k.task(&low, &secret.id).is_none());
+        assert_eq!(
+            k.tasks(&low)
+                .iter()
+                .map(|t| t.id.clone())
+                .collect::<Vec<_>>(),
+            vec![plain.id.clone()]
+        );
+        assert_eq!(
+            k.top(&low).tasks.keys().cloned().collect::<Vec<_>>(),
+            vec![plain.id.clone()]
+        );
+        assert_eq!(listed(&k, &low), vec![plain.id.clone()]);
+        assert!(matches!(
+            resolve(&k, &low, &format!("/tasks/{}", secret.id)),
+            Err(KernelError::NotFound(_))
+        ));
+        assert!(matches!(
+            k.run_task_step(&low, &secret.id),
+            Err(KernelError::NotFound(_))
+        ));
+        assert!(matches!(
+            k.approval_subject(&low, &secret.id),
+            Err(KernelError::NotFound(_))
+        ));
+
+        // There, unchanged, for the caller who is.
+        let seen = k
+            .task(&cleared, &secret.id)
+            .expect("visible to a cleared caller");
+        assert_eq!(
+            seen, secret,
+            "the refused step must not have touched the row"
+        );
+        assert_eq!(k.tasks(&cleared).len(), 2);
+        assert!(k.top(&cleared).tasks.contains_key(&secret.id));
+        assert_eq!(listed(&k, &cleared).len(), 2);
+        assert!(matches!(
+            resolve(&k, &cleared, &format!("/tasks/{}", secret.id)),
+            Ok(Entry::Task(_))
+        ));
+    }
+
+    /// Unix only: what a release writes is plaintext outside the encrypted
+    /// tier, so the export root, the destination and each released file are
+    /// the owner's alone — including a root that already existed open to
+    /// others, as a careless `mkdir` would have left it.
+    #[cfg(unix)]
+    #[test]
+    fn on_unix_a_release_leaves_only_owner_readable_directories_and_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let t = k
+            .create_task(
+                &machine(1),
+                "x",
+                "proposal",
+                Label::bottom(),
+                vec![StepKind::Release {
+                    to_dir: "out/deep".into(),
+                }],
+            )
+            .unwrap();
+        let env = k
+            .attach_artefact(&machine(2), &t.register, "proposal.md", b"# Proposal")
+            .unwrap();
+        std::fs::create_dir_all(k.export_root()).unwrap();
+        std::fs::set_permissions(k.export_root(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let t = k.run_task_step(&machine(3), &t.id).unwrap();
+        assert!(matches!(t.status, TaskStatus::Done));
+
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let out = k.export_root().join("out");
+        assert_eq!(mode(&k.export_root()), 0o700, "export root");
+        assert_eq!(mode(&out), 0o700, "out");
+        assert_eq!(mode(&out.join("deep")), 0o700, "out/deep");
+        let name = format!(
+            "{}.proposal.md",
+            &env.hash.trim_start_matches("sha256:")[..12]
+        );
+        assert_eq!(mode(&out.join("deep").join(name)), 0o600, "released file");
     }
 }

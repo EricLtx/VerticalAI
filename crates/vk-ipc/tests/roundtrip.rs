@@ -457,7 +457,6 @@ async fn approve_over_ipc_requires_presence_and_a_matching_human_approval() {
     let subject = {
         use vk_contracts::syscalls::{Ctx, Kernel};
         let mut kk = k.lock().unwrap();
-        let register = kk.task(&id).unwrap().register;
         let ctx = Ctx {
             principal: Principal::Machine {
                 node_id: "n1".into(),
@@ -470,6 +469,7 @@ async fn approve_over_ipc_requires_presence_and_a_matching_human_approval() {
             partition: "local".into(),
             now_ms: vk_kernel::now_ms(),
         };
+        let register = kk.task(&ctx, &id).unwrap().register;
         let reg = kk.read_register(&ctx, &register).unwrap();
         reg.artefacts
             .last()

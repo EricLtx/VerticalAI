@@ -97,21 +97,30 @@ impl BlobStore {
         Ok(dek)
     }
 
+    /// The fingerprint of the master key this store opens its DEKs with, for
+    /// the boot log: a keyring entry replaced or deleted since the blobs were
+    /// written turns every read into "not found", and this is the one line
+    /// that tells that case from a missing blob.
+    pub fn master_fingerprint(&self) -> String {
+        self.master.fingerprint()
+    }
+
     /// `BlobEnvelope.hash` is the storage address — `sha256(key_id || 0x00 ||
     /// plaintext)` — not a hash of the plaintext alone. Two subjects that
     /// `put` byte-identical plaintext land at two different addresses, so
     /// neither overwrites the other's blob/envelope files and shredding one
     /// subject cannot leave the other's (same-looking) ciphertext unreadable
     /// or vice versa.
+    ///
+    /// The address is also the ciphertext's associated data: the AEAD tag
+    /// binds these bytes to this name, so a `.bin` swapped with another of
+    /// the same subject — same DEK, so it would otherwise decrypt cleanly —
+    /// fails to open under the address it was moved to (see `get`).
     pub fn put(&self, key_id: &str, label: Label, plaintext: &[u8]) -> Result<BlobEnvelope> {
         let dek = self.dek_for(key_id, true).map_err(anyhow::Error::from)?;
-        let mut addr_input = Vec::with_capacity(key_id.len() + 1 + plaintext.len());
-        addr_input.extend_from_slice(key_id.as_bytes());
-        addr_input.push(0u8);
-        addr_input.extend_from_slice(plaintext);
-        let hash = vk_contracts::hash_bytes(&addr_input);
+        let hash = address(key_id, plaintext);
         let hex_hash = hash.trim_start_matches("sha256:");
-        let sealed = seal(&dek, plaintext)?;
+        let sealed = seal(&dek, hash.as_bytes(), plaintext)?;
         let env = BlobEnvelope {
             hash: hash.clone(),
             key_id: key_id.into(),
@@ -131,12 +140,37 @@ impl BlobStore {
         serde_json::from_slice(&text).map_err(|_| StorageError::NotFound)
     }
 
-    pub fn get(&self, hash: &str) -> Result<Vec<u8>, StorageError> {
+    /// The plaintext at `hash` — and only that: what comes back is held to
+    /// the address it was asked for, three times over. The envelope must name
+    /// it; the ciphertext must open under it as associated data; and the
+    /// plaintext must derive it again. A blob that fails any of these is an
+    /// integrity failure, reported as its own error (downcastable to neither
+    /// `NotFound` nor `Shredded`): the store has the bytes, and they are not
+    /// the ones the name promised — a swapped or restored `.bin`, a flipped
+    /// byte, an envelope pointed elsewhere. A missing or shredded blob is
+    /// still a `StorageError`, reachable through `downcast_ref`.
+    pub fn get(&self, hash: &str) -> Result<Vec<u8>> {
         let hex_hash = validate_hash(hash)?;
         let env = self.envelope(hash)?;
+        anyhow::ensure!(
+            env.hash == hash,
+            "blob {hash} failed its integrity check: its envelope names {}",
+            env.hash
+        );
         let dek = self.dek_for(&env.key_id, false)?;
         let sealed = std::fs::read(self.blob_path(hex_hash)).map_err(|_| StorageError::NotFound)?;
-        open(&dek, &sealed).map_err(|_| StorageError::NotFound)
+        let plaintext = open(&dek, hash.as_bytes(), &sealed).map_err(|_| {
+            anyhow::anyhow!(
+                "blob {hash} failed its integrity check: the ciphertext on disk was not sealed \
+                 under this address"
+            )
+        })?;
+        let derived = address(&env.key_id, &plaintext);
+        anyhow::ensure!(
+            derived == hash,
+            "blob {hash} failed its integrity check: its plaintext derives {derived}"
+        );
+        Ok(plaintext)
     }
 
     pub fn shred(&self, e: ShredEvent) -> Result<()> {
@@ -163,6 +197,17 @@ impl BlobStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains(key_id)
     }
+}
+
+/// The storage address of `plaintext` under `key_id`: `sha256(key_id || 0x00
+/// || plaintext)`. Computed by `put` to name the blob and again by `get` to
+/// check that what decrypted is what the name says.
+fn address(key_id: &str, plaintext: &[u8]) -> String {
+    let mut input = Vec::with_capacity(key_id.len() + 1 + plaintext.len());
+    input.extend_from_slice(key_id.as_bytes());
+    input.push(0u8);
+    input.extend_from_slice(plaintext);
+    vk_contracts::hash_bytes(&input)
 }
 
 /// `hash` is caller-supplied and, before this check, was used directly to
@@ -196,6 +241,24 @@ mod tests {
             MasterKey::load_or_create(KeySource::File(d.path().join("master.key"))).unwrap();
         let s = BlobStore::open(&d.path().join("blobs"), master).unwrap();
         (d, s)
+    }
+
+    /// A failed `get` that carries `expected` as its `StorageError`; an
+    /// integrity failure is a different error and would downcast to none.
+    fn assert_storage_error(r: Result<Vec<u8>>, expected: StorageError) {
+        let err = r.expect_err("expected a storage error");
+        assert_eq!(err.downcast_ref::<StorageError>(), Some(&expected), "{err}");
+    }
+
+    fn integrity_failure(r: Result<Vec<u8>>) -> String {
+        let err = r.expect_err("a blob that is not what its address says must not be returned");
+        assert!(
+            err.downcast_ref::<StorageError>().is_none(),
+            "an integrity failure is neither not-found nor shredded: {err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("integrity"), "{msg}");
+        msg
     }
 
     #[test]
@@ -237,7 +300,7 @@ mod tests {
             hlc_ms: 1,
         })
         .unwrap();
-        assert_eq!(s.get(&a.hash), Err(StorageError::Shredded));
+        assert_storage_error(s.get(&a.hash), StorageError::Shredded);
         assert_eq!(s.get(&b.hash).unwrap(), b"same-payload".to_vec());
     }
 
@@ -254,7 +317,7 @@ mod tests {
             hlc_ms: 1,
         })
         .unwrap();
-        assert_eq!(s.get(&a.hash), Err(StorageError::Shredded));
+        assert_storage_error(s.get(&a.hash), StorageError::Shredded);
         assert_eq!(s.get(&b.hash).unwrap(), b"b".to_vec());
         let err = s.put("subject-1", Label::bottom(), b"c").unwrap_err();
         assert_eq!(
@@ -265,8 +328,69 @@ mod tests {
         let master =
             MasterKey::load_or_create(KeySource::File(d.path().join("master.key"))).unwrap();
         let s2 = BlobStore::open(&d.path().join("blobs"), master).unwrap();
-        assert_eq!(s2.get(&a.hash), Err(StorageError::Shredded));
+        assert_storage_error(s2.get(&a.hash), StorageError::Shredded);
         assert!(s2.is_shredded("subject-1"));
+    }
+
+    /// Two blobs of one subject share a DEK, so either's ciphertext decrypts
+    /// under the other's name — and the address would then hand out the wrong
+    /// bytes to an approval, a release, a reader. Swapped `.bin` files, and
+    /// swapped `.bin`+`.json` pairs, are both refused; put back, both read.
+    #[test]
+    fn a_blob_swapped_with_another_of_the_same_subject_is_refused() {
+        let (d, s) = store();
+        let a = s.put("subject-1", Label::bottom(), b"alpha").unwrap();
+        let b = s.put("subject-1", Label::bottom(), b"bravo").unwrap();
+        let file = |hash: &str, ext: &str| {
+            d.path()
+                .join("blobs")
+                .join(hash.trim_start_matches("sha256:"))
+                .with_extension(ext)
+        };
+        let swap = |ext: &str| {
+            let tmp = d.path().join("swap.tmp");
+            std::fs::rename(file(&a.hash, ext), &tmp).unwrap();
+            std::fs::rename(file(&b.hash, ext), file(&a.hash, ext)).unwrap();
+            std::fs::rename(&tmp, file(&b.hash, ext)).unwrap();
+        };
+
+        swap("bin");
+        for hash in [&a.hash, &b.hash] {
+            integrity_failure(s.get(hash));
+        }
+        // The envelopes swapped as well, as a restore of one blob's pair over
+        // the other's would leave them: the envelope now names the wrong
+        // address, and that is caught before anything is decrypted.
+        swap("json");
+        for hash in [&a.hash, &b.hash] {
+            let msg = integrity_failure(s.get(hash));
+            assert!(msg.contains("envelope names"), "{msg}");
+        }
+        swap("bin");
+        swap("json");
+        assert_eq!(s.get(&a.hash).unwrap(), b"alpha".to_vec());
+        assert_eq!(s.get(&b.hash).unwrap(), b"bravo".to_vec());
+    }
+
+    #[test]
+    fn a_ciphertext_with_one_byte_changed_is_refused() {
+        let (d, s) = store();
+        let env = s
+            .put("subject-1", Label::bottom(), b"the approved text")
+            .unwrap();
+        let bin = d
+            .path()
+            .join("blobs")
+            .join(env.hash.trim_start_matches("sha256:"))
+            .with_extension("bin");
+        let mut bytes = std::fs::read(&bin).unwrap();
+        // Past the 24-byte nonce, inside the ciphertext proper.
+        bytes[30] ^= 0x01;
+        std::fs::write(&bin, &bytes).unwrap();
+        integrity_failure(s.get(&env.hash));
+        bytes[30] ^= 0x01;
+        std::fs::write(&bin, &bytes).unwrap();
+        assert_eq!(s.get(&env.hash).unwrap(), b"the approved text".to_vec());
     }
 
     #[test]
@@ -281,7 +405,7 @@ mod tests {
     #[test]
     fn malformed_hash_is_rejected_without_touching_the_store() {
         let (_d, s) = store();
-        assert_eq!(s.get("../../x"), Err(StorageError::NotFound));
-        assert_eq!(s.get("sha256:zz"), Err(StorageError::NotFound));
+        assert_storage_error(s.get("../../x"), StorageError::NotFound);
+        assert_storage_error(s.get("sha256:zz"), StorageError::NotFound);
     }
 }

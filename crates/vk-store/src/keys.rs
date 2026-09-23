@@ -2,7 +2,7 @@
 //! never leaves the OS keyring except through the test/CI file source.
 use anyhow::{Context, Result};
 use base64::Engine;
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rand::RngCore;
 use std::io::Write as _;
@@ -78,10 +78,10 @@ impl MasterKey {
 
     /// Wrap a DEK: nonce || ciphertext.
     pub fn wrap(&self, dek: &[u8; 32]) -> Result<Vec<u8>> {
-        seal(&self.0, dek)
+        seal(&self.0, &[], dek)
     }
     pub fn unwrap_dek(&self, wrapped: &[u8]) -> Result<[u8; 32]> {
-        let v = open(&self.0, wrapped)?;
+        let v = open(&self.0, &[], wrapped)?;
         v.try_into().map_err(|_| anyhow::anyhow!("bad DEK length"))
     }
 }
@@ -98,22 +98,40 @@ fn decode(b64: &str) -> Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("master key must be 32 bytes"))
 }
 
-pub fn seal(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
+/// Seal `plaintext` under `key`: nonce || ciphertext, with `aad` bound into
+/// the authentication tag. The tag then vouches not only for the bytes but
+/// for the context they were sealed in — a blob's storage address, say — so
+/// a ciphertext moved under another name fails to open there.
+pub fn seal(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(key.into());
     let mut nonce = [0u8; 24];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
     let ct = cipher
-        .encrypt(XNonce::from_slice(&nonce), plaintext)
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| anyhow::anyhow!("encrypt"))?;
     let mut out = nonce.to_vec();
     out.extend_from_slice(&ct);
     Ok(out)
 }
 
-pub fn open(key: &[u8; 32], sealed: &[u8]) -> Result<Vec<u8>> {
+/// The inverse of `seal`, under the same `aad`; any other associated data,
+/// key or altered byte fails the tag.
+pub fn open(key: &[u8; 32], aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
     anyhow::ensure!(sealed.len() > 24, "sealed blob too short");
     let cipher = XChaCha20Poly1305::new(key.into());
     cipher
-        .decrypt(XNonce::from_slice(&sealed[..24]), &sealed[24..])
+        .decrypt(
+            XNonce::from_slice(&sealed[..24]),
+            Payload {
+                msg: &sealed[24..],
+                aad,
+            },
+        )
         .map_err(|_| anyhow::anyhow!("decrypt failed"))
 }

@@ -13,8 +13,60 @@ const SYNC_MARKERS: &[&str] = &[
 
 pub fn state_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
     let dir = resolve_state_dir(override_dir)?;
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    private_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
     Ok(dir)
+}
+
+/// Create `dir` if it is missing and, on Unix, make it — new or not —
+/// reachable by its owner alone (`0700`). Registers, the ledger and released
+/// plaintext all live under the state directory, and on a shared machine
+/// every other account could otherwise read them. Windows leaves it to the
+/// ACL of the parent, which is per user for `%LOCALAPPDATA%`.
+pub fn private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)?;
+    Ok(())
+}
+
+/// `OpenOptions` for a file the store creates: born `0600` on Unix rather
+/// than briefly world-readable between creation and a later `chmod`. The
+/// caller still chooses the access mode and the disposition.
+#[cfg(unix)]
+pub fn private_file_options() -> std::fs::OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.mode(0o600);
+    opts
+}
+
+/// Windows: the file takes the ACL of its directory, which is per user for
+/// `%LOCALAPPDATA%`; there is no mode to set.
+#[cfg(not(unix))]
+pub fn private_file_options() -> std::fs::OpenOptions {
+    std::fs::OpenOptions::new()
+}
+
+/// Owner-only (`0600`) on Unix for a file that already exists — one a
+/// previous version created with the umask, or one SQLite made beside its
+/// database. A no-op on Windows.
+pub fn restrict_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// Where the state directory *would* be: resolved and refused for the same

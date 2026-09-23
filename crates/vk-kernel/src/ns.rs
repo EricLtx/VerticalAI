@@ -6,7 +6,7 @@ use crate::RealKernel;
 use vk_contracts::arch::ArchManifest;
 use vk_contracts::ledger::LedgerEvent;
 use vk_contracts::storage::BlobEnvelope;
-use vk_contracts::syscalls::KernelError;
+use vk_contracts::syscalls::{Ctx, KernelError};
 
 /// The ledger tail a bare `/ledger` returns: enough to see what just happened,
 /// short enough to print.
@@ -23,7 +23,10 @@ pub enum Entry {
     LedgerTail { events: Vec<LedgerEvent> },
 }
 
-pub fn resolve(k: &RealKernel, path: &str) -> Result<Entry, KernelError> {
+/// Resolve `path` as `ctx` may see it. The namespace is a read surface like
+/// any other: `/tasks` lists, and `/tasks/<id>` shows, only the tasks whose
+/// register flows to the caller's clearance (I2); the rest are not there.
+pub fn resolve(k: &RealKernel, ctx: &Ctx, path: &str) -> Result<Entry, KernelError> {
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     match parts.as_slice() {
         [] => Ok(Entry::Dir {
@@ -49,10 +52,10 @@ pub fn resolve(k: &RealKernel, path: &str) -> Result<Entry, KernelError> {
             .map(|(_, m)| Entry::Arch(m))
             .ok_or_else(|| KernelError::NotFound(path.into())),
         ["tasks"] => Ok(Entry::Dir {
-            entries: k.tasks().into_iter().map(|t| t.id).collect(),
+            entries: k.tasks(ctx).into_iter().map(|t| t.id).collect(),
         }),
         ["tasks", id] => k
-            .task(id)
+            .task(ctx, id)
             .map(Entry::Task)
             .ok_or_else(|| KernelError::NotFound(path.into())),
         // The envelope, never the plaintext: reading the bytes is `read_artefact`,

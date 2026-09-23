@@ -4,6 +4,7 @@
 //! Everything that decides *who* a caller is lives behind the endpoint, in
 //! `vk_ipc::server`: this binary only says where the state, the master key and
 //! the node's device key come from.
+use anyhow::Context;
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -56,7 +57,22 @@ async fn main() -> anyhow::Result<()> {
             user: "master".into(),
         },
     };
+    // Opening the store takes the single-writer lock on the state directory:
+    // a second daemon over a store one is already serving stops here, before
+    // it has read or written anything, and says which lock file it could not
+    // take.
     let mut kernel = vk_kernel::RealKernel::open(&state_dir, key_source, &a.node_id)?;
+    // The endpoint before the record. Binding is the other way a start can be
+    // refused — another daemon is serving this name — and a daemon that will
+    // never serve must not have enrolled a device or appended its `boot`
+    // event first: everything below writes to the ledger.
+    let endpoint = a
+        .endpoint
+        .map(vk_ipc::transport::Endpoint)
+        .unwrap_or_else(vk_ipc::transport::default_endpoint);
+    let listener = vk_ipc::transport::os::bind(&endpoint)
+        .await
+        .with_context(|| format!("bind {}", endpoint.0))?;
     if a.auto_enroll_node {
         let source = match a.node_key_file {
             Some(p) => vk_kernel::presence::KeySource::File(p),
@@ -74,6 +90,10 @@ async fn main() -> anyhow::Result<()> {
         devices = report.devices.len(),
         stopped_scopes = ?report.stopped_scopes,
         policies_version = %report.policies_version,
+        // Which master key the blobs are being opened with: a keyring entry
+        // replaced since they were written is otherwise indistinguishable
+        // from blobs that are not there.
+        master_key = %kernel.store().blobs.master_fingerprint(),
         state_dir = %state_dir.display(),
         "vkd booted"
     );
@@ -89,8 +109,9 @@ async fn main() -> anyhow::Result<()> {
     // already known not to hold.
     if !report.ledger_ok && !a.force {
         anyhow::bail!(
-            "the ledger chain in {} does not verify ({} events): refusing to serve. \
-             Inspect it, restore it from a backup, or pass --force to serve anyway.",
+            "the ledger chain in {} does not verify ({} events): a line was rewritten, or the \
+             tail this node last recorded is gone; refusing to serve. Inspect it, restore it \
+             from a backup, or pass --force to serve anyway.",
             state_dir.join("ledger").display(),
             report.ledger_len
         );
@@ -98,10 +119,6 @@ async fn main() -> anyhow::Result<()> {
     if !report.ledger_ok {
         tracing::warn!("--force: serving on a ledger chain that does not verify");
     }
-    let endpoint = a
-        .endpoint
-        .map(vk_ipc::transport::Endpoint)
-        .unwrap_or_else(vk_ipc::transport::default_endpoint);
     tracing::info!(endpoint = %endpoint.0, "vkd listening");
-    vk_ipc::server::serve(Arc::new(Mutex::new(kernel)), endpoint).await
+    vk_ipc::server::serve_on(Arc::new(Mutex::new(kernel)), listener).await
 }

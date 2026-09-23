@@ -32,6 +32,9 @@ impl LedgerFs {
             let entry = entry?;
             let path = entry.path();
             if path.extension().map(|x| x == "jsonl").unwrap_or(false) {
+                // Owner-only, including a segment an older version created
+                // with the umask; new ones are born that way in `append`.
+                crate::paths::restrict_file(&path)?;
                 segs.push(path);
             }
         }
@@ -90,6 +93,15 @@ impl LedgerFs {
             .join(format!("seg-{:06}.jsonl", seq / SEGMENT_EVENTS))
     }
 
+    /// Append one event: the line is written and synced to its segment, and
+    /// only a line that reached the disk stays in the in-memory chain. On any
+    /// failure the chain is exactly as it was, so the next append computes
+    /// its `seq` and `prev_hash` from the last event the file really has —
+    /// a phantom head in memory would put a gap in the file that no later
+    /// open could verify past.
+    ///
+    /// The seven parameters are the event's own fields as the contract
+    /// orders them; a struct would be built here only to be taken apart.
     #[allow(clippy::too_many_arguments)]
     pub fn append(
         &mut self,
@@ -101,6 +113,10 @@ impl LedgerFs {
         causal_heads: Vec<String>,
         payload_hash: String,
     ) -> Result<LedgerEvent> {
+        // The chain computes the event (its seq and prev_hash come from the
+        // head, and its hash is the contract's to compute); it is the only
+        // way to build one, so it is built in place and rolled back below if
+        // the disk refuses it.
         let e = self
             .chain
             .append(
@@ -113,16 +129,52 @@ impl LedgerFs {
                 payload_hash,
             )
             .clone();
+        if let Err(err) = self.write_line(&e) {
+            self.roll_back(e.seq);
+            return Err(err);
+        }
+        Ok(e)
+    }
+
+    /// One serialised event, newline-terminated, to its segment, synced. A
+    /// segment created here is also made durable in its directory (Unix: a
+    /// directory fsync; NTFS journals the metadata), so a crash right after
+    /// the first append into a fresh segment does not lose the file — which
+    /// would read afterwards as a clean cut of the record's tail.
+    fn write_line(&self, e: &LedgerEvent) -> Result<()> {
         let path = self.segment_path(e.seq);
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
+        let fresh = !path.exists();
+        let mut opts = crate::paths::private_file_options();
+        opts.create(true).append(true);
+        let mut f = opts
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?;
-        f.write_all(serde_json::to_string(&e)?.as_bytes())?;
-        f.write_all(b"\n")?;
-        f.sync_data()?;
-        Ok(e)
+        let mut line = serde_json::to_vec(e)?;
+        line.push(b'\n');
+        let len_before = f.metadata()?.len();
+        let written = f.write_all(&line).and_then(|()| f.sync_data());
+        if let Err(err) = written {
+            // Whatever part of the line landed is taken off again, so the
+            // next append does not start mid-line. Best effort: if this too
+            // fails, `open` drops an unterminated last line anyway.
+            let _ = f.set_len(len_before);
+            return Err(err).with_context(|| format!("append to {}", path.display()));
+        }
+        if fresh {
+            sync_dir(&self.dir)?;
+        }
+        Ok(())
+    }
+
+    /// Undo the in-memory append of the event at `seq`: the chain has no
+    /// `pop`, so it is rebuilt from the events before it.
+    fn roll_back(&mut self, seq: u64) {
+        let kept: Vec<LedgerEvent> = self.chain.events()[..seq as usize].to_vec();
+        let mut chain = Ledger::default();
+        for e in kept {
+            chain.push_verified(e);
+        }
+        self.chain = chain;
     }
 
     pub fn tail(&self, n: usize) -> Vec<LedgerEvent> {
@@ -146,6 +198,21 @@ impl LedgerFs {
     }
 }
 
+/// Make a new directory entry durable. On Unix that is an fsync of the
+/// directory itself; Windows has no equivalent to call and journals the
+/// metadata on NTFS.
+fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("sync {}", dir.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +224,23 @@ mod tests {
             counter: 0,
             node: "n1".into(),
         }
+    }
+
+    /// Undo a `set_readonly(true)`: back to the owner-only mode on Unix; the
+    /// read-only attribute cleared on Windows.
+    #[cfg(unix)]
+    fn make_writable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    // The lint guards against widening a Unix mode to world-writable, which
+    // has no counterpart in clearing a Windows attribute.
+    #[cfg(windows)]
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn make_writable(path: &Path) {
+        let mut rw = std::fs::metadata(path).unwrap().permissions();
+        rw.set_readonly(false);
+        std::fs::set_permissions(path, rw).unwrap();
     }
 
     #[test]
@@ -293,6 +377,75 @@ mod tests {
         assert!(!l.recovered_partial_line);
         let text = std::fs::read_to_string(&seg).unwrap();
         assert!(text.ends_with('\n'));
+    }
+
+    /// A write the disk refuses leaves the chain as it was: no phantom head
+    /// in memory, so the next append that does land chains onto the last
+    /// event the file really has, and a reopen verifies the lot.
+    #[test]
+    fn a_failed_write_leaves_the_chain_unchanged_and_later_appends_verify() {
+        let d = tempfile::tempdir().unwrap();
+        let seg = d.path().join("seg-000000.jsonl");
+        let mut l = LedgerFs::open(d.path()).unwrap();
+        l.append(
+            "boot",
+            RetentionClass::Operational90d,
+            1,
+            ClockQuality::Synced,
+            hlc(1),
+            vec![],
+            "sha256:p".into(),
+        )
+        .unwrap();
+        let before = std::fs::read(&seg).unwrap();
+
+        // The segment made unwritable: the append must fail, and fail clean.
+        let mut ro = std::fs::metadata(&seg).unwrap().permissions();
+        ro.set_readonly(true);
+        std::fs::set_permissions(&seg, ro).unwrap();
+        let err = match l.append(
+            "stop",
+            RetentionClass::Operational90d,
+            2,
+            ClockQuality::Synced,
+            hlc(2),
+            vec![],
+            "sha256:q".into(),
+        ) {
+            Ok(_) => panic!("an append the disk refused must not report success"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("seg-000000.jsonl"), "{err}");
+        assert_eq!(l.chain().events().len(), 1, "no phantom event in memory");
+        assert_eq!(l.len(), 1);
+        assert!(l.verify());
+        assert_eq!(
+            std::fs::read(&seg).unwrap(),
+            before,
+            "nothing landed on disk"
+        );
+
+        // Writable again: the next append takes seq 1, and the file verifies
+        // on a reopen — no gap where the refused event would have been.
+        make_writable(&seg);
+        let e = l
+            .append(
+                "resume",
+                RetentionClass::Operational90d,
+                3,
+                ClockQuality::Synced,
+                hlc(3),
+                vec![],
+                "sha256:r".into(),
+            )
+            .unwrap();
+        assert_eq!(e.seq, 1);
+        assert_eq!(l.len(), 2);
+        drop(l);
+        let l = LedgerFs::open(d.path()).unwrap();
+        assert_eq!(l.len(), 2);
+        assert!(l.verify());
+        assert_eq!(l.tail(1)[0].kind, "resume");
     }
 
     #[test]

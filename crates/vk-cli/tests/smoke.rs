@@ -374,12 +374,40 @@ fn wait_until(sh: &Shell, serving_now: bool, what: &str) -> Option<Value> {
     }
 }
 
+/// Wait for a spawned daemon to exit, and hand back its status and stderr.
+/// A daemon that is still running when the timeout passes fails the test
+/// with `why`.
+fn exit_of(mut daemon: Daemon, why: &str) -> (std::process::ExitStatus, String) {
+    let start = Instant::now();
+    let exit = loop {
+        match daemon.0.try_wait().expect("wait for vkd") {
+            Some(exit) => break exit,
+            None => assert!(start.elapsed() < READY_TIMEOUT, "{why}"),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(daemon.0.stderr.as_mut().expect("stderr"), &mut stderr).unwrap();
+    (exit, stderr)
+}
+
+/// How many events the node's record has on disk.
+fn ledger_lines(state_dir: &std::path::Path) -> usize {
+    std::fs::read_to_string(state_dir.join("ledger").join("seg-000000.jsonl"))
+        .expect("a ledger segment")
+        .lines()
+        .count()
+}
+
 /// The boot sequence's refusal. A record that does not verify is not a record:
 /// everything a daemon appended to it would chain onto a claim already known
 /// to be false, so it does not serve — while the node stays readable, which is
 /// the whole point of refusing rather than crashing.
-#[test]
-fn vkd_refuses_to_serve_a_ledger_that_does_not_verify_unless_forced() {
+///
+/// The record is a mounted arch and a STOP on top of the node's own start,
+/// then `damage` is done to it with the daemon gone; the refusal, and the
+/// forced start that still serves on it, are the same for every kind.
+fn vkd_refuses_to_serve_a_damaged_ledger_unless_forced(damage: fn(&std::path::Path)) {
     let dir = tempfile::tempdir().unwrap();
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let sh = Shell {
@@ -399,39 +427,30 @@ fn vkd_refuses_to_serve_a_ledger_that_does_not_verify_unless_forced() {
         let status = wait_until(&sh, true, "vkd never answered").expect("status");
         assert_eq!(status["ledger_ok"], true, "{status}");
         assert_eq!(status["recovered_partial_line"], false, "{status}");
+        sh.ok(&["mount", "mock", "m1", "--ctx", "4096"]);
+        sh.ok(&["stop"]);
     }
     wait_until(&sh, false, "the killed daemon still holds the endpoint");
 
-    tamper_first_ledger_line(dir.path());
+    damage(dir.path());
 
     // Refused: non-zero, one message naming the chain and the way past it.
-    let mut refused = Daemon(
+    let refused = Daemon(
         vkd_cmd(dir.path(), &endpoint, &[])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn vkd"),
     );
-    let start = Instant::now();
-    let exit = loop {
-        match refused.0.try_wait().expect("wait for vkd") {
-            Some(exit) => break exit,
-            None => assert!(
-                start.elapsed() < READY_TIMEOUT,
-                "vkd is serving a ledger that does not verify"
-            ),
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    let (exit, why) = exit_of(refused, "vkd is serving a ledger that does not verify");
     assert!(!exit.success(), "a broken chain must not exit 0: {exit:?}");
-    let mut why = String::new();
-    std::io::Read::read_to_string(refused.0.stderr.as_mut().expect("stderr"), &mut why).unwrap();
     for named in ["ledger", "--force"] {
         assert!(why.contains(named), "{why}");
     }
     assert!(serving(&sh).is_none(), "nothing is serving that store");
 
-    // Forced: it serves, and says to every caller what it is serving on.
+    // Forced: it serves, and says to every caller what it is serving on —
+    // and the STOP, which the record may no longer hold, still holds.
     let _forced = Daemon(
         vkd_cmd(dir.path(), &endpoint, &["--force"])
             .stdout(Stdio::null())
@@ -441,6 +460,109 @@ fn vkd_refuses_to_serve_a_ledger_that_does_not_verify_unless_forced() {
     );
     let status = wait_until(&sh, true, "--force did not start a daemon").expect("status");
     assert_eq!(status["ledger_ok"], false, "{status}");
+    assert_eq!(
+        status["stopped_scopes"],
+        serde_json::json!(["node"]),
+        "{status}"
+    );
+}
+
+#[test]
+fn vkd_refuses_to_serve_a_ledger_that_does_not_verify_unless_forced() {
+    vkd_refuses_to_serve_a_damaged_ledger_unless_forced(tamper_first_ledger_line);
+}
+
+/// A shortened record: the last two lines — the mount and the STOP — cut off.
+/// What is left chains perfectly; only the head the store recorded says the
+/// record used to be longer, and that is enough to refuse.
+#[test]
+fn vkd_refuses_to_serve_a_ledger_whose_tail_was_cut_unless_forced() {
+    vkd_refuses_to_serve_a_damaged_ledger_unless_forced(cut_ledger_tail);
+}
+
+/// The most ordinary operator mistake: the daemon started again over a state
+/// directory one is already serving. The second must fail at once — it holds
+/// no lock — without a line appended to the record, while the first keeps
+/// serving and the record still verifies; and once the first is gone, the
+/// same directory serves again.
+#[test]
+fn a_second_vkd_over_a_served_state_dir_is_refused_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = Shell {
+        endpoint: vk_ipc::transport::test_endpoint().0,
+        node_key: dir.path().join("node.key"),
+    };
+    let second = Shell {
+        endpoint: vk_ipc::transport::test_endpoint().0,
+        node_key: dir.path().join("node.key"),
+    };
+    let daemon = Daemon(
+        vkd_cmd(dir.path(), &first.endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    wait_until(&first, true, "vkd never answered");
+    let before = ledger_lines(dir.path());
+
+    // Its own endpoint, so nothing but the state directory is in the way.
+    let intruder = Daemon(
+        vkd_cmd(dir.path(), &second.endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let (exit, why) = exit_of(intruder, "a second vkd is serving the same state directory");
+    assert!(
+        !exit.success(),
+        "a second daemon over one store must not exit 0: {exit:?}"
+    );
+    assert!(
+        why.contains("already open") && why.contains(&path_of(&dir.path().join("lock"))),
+        "the refusal must name the lock it could not take: {why}"
+    );
+    assert_eq!(
+        ledger_lines(dir.path()),
+        before,
+        "the refused daemon must not have appended to the record"
+    );
+    assert!(
+        serving(&second).is_none(),
+        "nothing serves the intruder's endpoint"
+    );
+
+    // The first is untouched: still serving, record intact.
+    let status = serving(&first).expect("the first daemon still serves");
+    assert_eq!(status["ledger_ok"], true, "{status}");
+    let verified = first.json(&["ledger", "verify", "--json"]);
+    assert_eq!(verified["ok"], true, "{verified}");
+
+    // The lock goes with its holder: the same directory serves again.
+    drop(daemon);
+    wait_until(&first, false, "the killed daemon still holds the endpoint");
+    let _again = Daemon(
+        vkd_cmd(dir.path(), &second.endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let status = wait_until(&second, true, "the directory did not serve again").expect("status");
+    assert_eq!(status["ledger_ok"], true, "{status}");
+    assert_eq!(second.json(&["ledger", "verify", "--json"])["ok"], true);
+}
+
+/// The last two lines of a node's record removed, as a restore of an older
+/// copy of the segment would leave it: still a chain that verifies.
+fn cut_ledger_tail(state_dir: &std::path::Path) {
+    let seg = state_dir.join("ledger").join("seg-000000.jsonl");
+    let text = std::fs::read_to_string(&seg).expect("a ledger segment");
+    let mut lines: Vec<&str> = text.lines().collect();
+    assert!(lines.len() >= 3, "a record worth cutting: {}", lines.len());
+    lines.truncate(lines.len() - 2);
+    std::fs::write(&seg, format!("{}\n", lines.join("\n"))).unwrap();
 }
 
 /// One line of a node's record rewritten, exactly as an editor would leave it:

@@ -18,11 +18,11 @@ use vk_contracts::module::{GateKind, GateVerdict, ModuleManifest};
 use vk_contracts::principal::{Approval, ApprovalKind, DeviceRegistry};
 use vk_contracts::register::{ArtefactRef, Register, RegisterId};
 use vk_contracts::stop::{LivenessLease, ResumeEvent, StopError, StopEvent, StopSet};
-use vk_contracts::storage::BlobEnvelope;
+use vk_contracts::storage::{BlobEnvelope, StorageError};
 use vk_contracts::syscalls::{Ctx, InferOutcome, Kernel, KernelError};
 use vk_contracts::testing::KernelTestHooks;
 use vk_store::keys::KeySource;
-use vk_store::Store;
+use vk_store::{HeadVerdict, Store};
 
 /// Any durable read or write that failed. A syscall that cannot persist its
 /// effect must not report success: the effect would survive only until the next
@@ -223,9 +223,24 @@ impl RealKernel {
     ///
     /// The event's payload is the hash of this very report, so the record says
     /// what the node found and not merely that it started.
+    ///
+    /// `ledger_ok` asks two things of the chain: that every link and hash
+    /// recomputes, and that it still reaches the head the store recorded the
+    /// last time it appended. A hash chain proves nothing about its length —
+    /// the tail cut off the newest segment would still "verify" — and the
+    /// tail is where the latest STOP, approval or release lives.
     pub fn boot(&mut self) -> Result<BootReport, KernelError> {
+        if let HeadVerdict::Diverged { recorded, found } = &self.store.ledger_head {
+            tracing::warn!(
+                recorded_seq = recorded.seq,
+                recorded_hash = %recorded.hash,
+                found_seq = found.as_ref().map(|h| h.seq),
+                "the ledger on disk no longer contains the head this node last recorded: \
+                 its tail was cut or rewritten"
+            );
+        }
         let report = BootReport {
-            ledger_ok: self.store.ledger.verify(),
+            ledger_ok: self.ledger_holds(),
             ledger_len: self.store.ledger.len(),
             recovered_partial_line: self.recovered_partial_line(),
             arches: self.arches().into_iter().map(|(id, _)| id).collect(),
@@ -235,6 +250,18 @@ impl RealKernel {
         };
         self.log("boot", now_ms(), &report)?;
         Ok(report)
+    }
+
+    /// Does the record hold? Both halves of the verdict `boot` reports, for
+    /// every caller that asks after it (`boot.info`, `ledger.verify`): the
+    /// chain's links and hashes recompute, and the chain still reaches the
+    /// head the store recorded. The second half is fixed when the store is
+    /// opened — a cut tail is not something this process can repair — so a
+    /// node serving under `--force` on a shortened record says so for as
+    /// long as it runs.
+    pub fn ledger_holds(&self) -> bool {
+        self.store.ledger.verify()
+            && !matches!(self.store.ledger_head, HeadVerdict::Diverged { .. })
     }
 
     /// The policy set this node runs under, as the store has it — `None` on a
@@ -446,7 +473,14 @@ impl RealKernel {
         self.store
             .blobs
             .get(hash)
-            .map_err(|e| KernelError::NotFound(e.to_string()))
+            .map_err(|e| match e.downcast_ref::<StorageError>() {
+                Some(missing) => KernelError::NotFound(missing.to_string()),
+                // The store has bytes at this address and they are not the
+                // ones the address names: a swapped, restored or altered
+                // blob. That is a store that cannot be trusted for this
+                // artefact, not an artefact that is not there.
+                None => KernelError::Store(e.to_string()),
+            })
     }
 
     fn log(
@@ -456,9 +490,11 @@ impl RealKernel {
         payload: &impl serde::Serialize,
     ) -> Result<(), KernelError> {
         let hlc = self.clock.now(wall_ms);
+        // Through the store, not the ledger tier alone: the store records the
+        // new head beside the event, which is what lets the next boot tell a
+        // record that was shortened from one that verifies.
         self.store
-            .ledger
-            .append(
+            .append_event(
                 kind,
                 RetentionClass::Operational90d,
                 wall_ms,
@@ -1039,6 +1075,49 @@ mod tests {
         assert!(!r.recovered_partial_line);
     }
 
+    /// The last two lines of the record removed — where a STOP and a mount
+    /// live. What is left still chains, so `verify_chain` is satisfied; boot
+    /// is not, because the store knows where its head was. And it stays not
+    /// satisfied on the next start: the boot event it appends onto the cut
+    /// chain must not turn that chain into the record.
+    #[test]
+    fn boot_reports_a_cut_tail_rather_than_trusting_the_shorter_chain() {
+        let d = tempfile::tempdir().unwrap();
+        {
+            let mut k = open(d.path());
+            k.boot().unwrap();
+            k.register_arch(local(personal()));
+            k.stop(&human(1), "node").unwrap();
+        }
+        let seg = d.path().join("ledger").join("seg-000000.jsonl");
+        let text = std::fs::read_to_string(&seg).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines.truncate(lines.len() - 2);
+        std::fs::write(&seg, format!("{}\n", lines.join("\n"))).unwrap();
+
+        {
+            let mut k = open(d.path());
+            let r = k.boot().unwrap();
+            assert!(
+                !r.ledger_ok,
+                "a shortened record must not pass as the record"
+            );
+            assert!(
+                k.ledger().verify_chain(),
+                "the chain itself still links: only the recorded head says it is short"
+            );
+            assert!(
+                k.stops().stopped("node"),
+                "the STOP the record lost still holds in the state"
+            );
+        }
+        let mut k = open(d.path());
+        assert!(
+            !k.boot().unwrap().ledger_ok,
+            "the verdict must survive the boot event appended onto the cut chain"
+        );
+    }
+
     /// A crash mid-append leaves an unterminated last line. The store drops it
     /// and truncates; boot says so, because "one event is missing" is a thing
     /// an operator has to be told rather than left to find.
@@ -1447,6 +1526,40 @@ mod tests {
         );
         let reg = k.read_register(&machine(4), &r).unwrap();
         assert_eq!(reg.artefacts[0].hash, env.hash);
+    }
+
+    /// Two artefacts of one task share a DEK; their ciphertexts swapped on
+    /// disk would decrypt cleanly under each other's address. The kernel must
+    /// not hand out the wrong bytes under the right hash — the approval that
+    /// named the hash would have bound nothing — and must not call it "not
+    /// found" either, since something is there.
+    #[test]
+    fn a_swapped_artefact_is_refused_as_a_store_failure_not_served_under_the_wrong_hash() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let r = k.submit_task(&machine(1), "x", Label::bottom()).unwrap();
+        let a = k
+            .attach_artefact(&machine(2), &r, "proposal.md", b"# Draft one")
+            .unwrap();
+        let b = k
+            .attach_artefact(&machine(2), &r, "proposal.md", b"# Draft two")
+            .unwrap();
+        let bin = |hash: &str| {
+            d.path()
+                .join("blobs")
+                .join(hash.trim_start_matches("sha256:"))
+                .with_extension("bin")
+        };
+        let tmp = d.path().join("swap.tmp");
+        std::fs::rename(bin(&a.hash), &tmp).unwrap();
+        std::fs::rename(bin(&b.hash), bin(&a.hash)).unwrap();
+        std::fs::rename(&tmp, bin(&b.hash)).unwrap();
+        for hash in [&a.hash, &b.hash] {
+            match k.read_artefact(&machine(3), hash) {
+                Err(KernelError::Store(msg)) => assert!(msg.contains("integrity"), "{msg}"),
+                other => panic!("a swapped blob must be a store failure, got {other:?}"),
+            }
+        }
     }
 
     #[test]

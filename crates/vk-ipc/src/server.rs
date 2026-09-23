@@ -77,7 +77,15 @@ impl Challenges {
 }
 
 pub async fn serve(kernel: Shared, endpoint: Endpoint) -> Result<()> {
-    let mut listener = transport::os::bind(&endpoint).await?;
+    let listener = transport::os::bind(&endpoint).await?;
+    serve_on(kernel, listener).await
+}
+
+/// Serve on an endpoint the caller has already bound. `vkd` binds before it
+/// boots the kernel, so a daemon refused its endpoint — another one is
+/// serving there — has not yet appended its `boot` event to a record it will
+/// never serve.
+pub async fn serve_on(kernel: Shared, mut listener: transport::os::Listener) -> Result<()> {
     let challenges = Arc::new(Mutex::new(Challenges::default()));
     loop {
         let stream = match listener.accept().await {
@@ -325,7 +333,10 @@ fn dispatch(
             "arches": k.arches().len(),
             "devices": k.devices().ids().len(),
             "ledger_len": k.ledger().events().len(),
-            "ledger_ok": k.ledger().verify_chain(),
+            // The verdict boot reports, not a recomputation of the chain
+            // alone: a chain shortened since the store last wrote it still
+            // links, and only the kernel knows where its head was.
+            "ledger_ok": k.ledger_holds(),
             // Fixed when this daemon opened its store: one event short of its
             // record is a thing every caller is told, not only the log line
             // nobody read.
@@ -344,9 +355,13 @@ fn dispatch(
             // go?" is answerable without the client guessing the layout.
             "export_root": k.export_root().display().to_string(),
         })),
+        // The read surfaces carry a `Ctx` too: a task shows its register's
+        // goal, and what a caller may see of it is the register's label
+        // against the caller's clearance (I2), as for `read_register`.
         "ns.ls" => {
+            let ctx = ctx_for(&k, presence, now)?;
             let path = p["path"].as_str().unwrap_or("/");
-            vk_kernel::ns::resolve(&k, path)
+            vk_kernel::ns::resolve(&k, &ctx, path)
                 .map_err(kerr)
                 .and_then(to_value)
         }
@@ -406,11 +421,20 @@ fn dispatch(
                 .map_err(kerr)
         }
         "task.show" => {
+            let ctx = ctx_for(&k, presence, now)?;
             let id = p["task_id"].as_str().ok_or_else(|| bad("task_id"))?;
-            k.task(id).ok_or_else(|| not_found(id)).and_then(to_value)
+            k.task(&ctx, id)
+                .ok_or_else(|| not_found(id))
+                .and_then(to_value)
         }
-        "task.ls" => to_value(k.tasks()),
-        "top" => to_value(k.top()),
+        "task.ls" => {
+            let ctx = ctx_for(&k, presence, now)?;
+            to_value(k.tasks(&ctx))
+        }
+        "top" => {
+            let ctx = ctx_for(&k, presence, now)?;
+            to_value(k.top(&ctx))
+        }
         "stop" => {
             let ctx = ctx_for(&k, presence, now)?;
             let scope = p["scope"].as_str().unwrap_or("node");
@@ -464,7 +488,7 @@ fn dispatch(
             to_value(k.store().ledger.tail(n))
         }
         "ledger.verify" => Ok(json!({
-            "ok": k.ledger().verify_chain(),
+            "ok": k.ledger_holds(),
             "len": k.ledger().events().len(),
         })),
         m => Err(RpcError {

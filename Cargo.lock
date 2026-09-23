@@ -2026,6 +2026,7 @@ dependencies = [
  "directories",
  "hex",
  "keyring",
+ "libc",
  "rand 0.8.8",
  "rusqlite",
  "serde",

@@ -24,11 +24,34 @@ pub struct Db {
 
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
+        // The database file exists, owner-only, before SQLite first opens it:
+        // SQLite gives `-wal` and `-shm` the main file's mode, so a file born
+        // `0600` keeps its companions private too. An empty file is an empty
+        // database. (Made explicit below as well, for a store an older
+        // version created with the umask.)
+        let mut opts = crate::paths::private_file_options();
+        opts.write(true).create(true);
+        opts.open(path)
+            .with_context(|| format!("create {}", path.display()))?;
+        crate::paths::restrict_file(path)?;
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // FULL, not NORMAL: in WAL mode NORMAL syncs at checkpoints only, so a
+        // committed STOP, resume or approval row would survive a process crash
+        // but not a power cut — while the ledger event that recorded it, synced
+        // per append, would. The rows here are the state the ledger describes;
+        // they have to be at least as durable as the record.
+        conn.pragma_update(None, "synchronous", "FULL")?;
         let db = Db { conn };
         db.migrate()?;
+        for companion in ["-wal", "-shm"] {
+            let mut side = path.as_os_str().to_owned();
+            side.push(companion);
+            let side = Path::new(&side);
+            if side.exists() {
+                crate::paths::restrict_file(side)?;
+            }
+        }
         Ok(db)
     }
 
@@ -164,6 +187,24 @@ mod tests {
         db.delete("kv_test", "a").unwrap();
         assert_eq!(db.get_json::<Thing>("kv_test", "a").unwrap(), None);
     }
+    /// Durability across a power cut, not only across a process crash: WAL
+    /// with `synchronous=FULL` (2) syncs the log on every commit.
+    #[test]
+    fn commits_are_synced_on_every_transaction() {
+        let d = tempfile::tempdir().unwrap();
+        let db = Db::open(&d.path().join("vk.sqlite")).unwrap();
+        let synchronous: i64 = db
+            .conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 2, "PRAGMA synchronous must be FULL");
+        let journal: String = db
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(journal, "wal");
+    }
+
     #[test]
     fn migrate_is_idempotent() {
         let d = tempfile::tempdir().unwrap();
