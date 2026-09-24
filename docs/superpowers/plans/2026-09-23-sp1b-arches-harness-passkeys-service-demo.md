@@ -28,8 +28,8 @@
 - Everything in SP1a's Global Constraints, plus the founder rule above.
 - **Ollama runs in a Docker container managed through the `docker` CLI.** Image `ollama/ollama` pinned by tag in the manifest and recorded by digest (`docker image inspect --format '{{index .RepoDigests 0}}'`); container name `vk-ollama`; port published on loopback only (`-p 127.0.0.1:11434:11434`); weights in the named volume `vk-ollama`; caps `--memory` and `--cpus` from the mount command. `governed: true` only when both caps were applied. `--external URL` mounts an Ollama the kernel does not manage as `governed: false`.
 - **Model identity is content-addressed:** the model digest from `GET /api/tags` (`models[].digest`) plus `POST /api/show` details (`details.family`, `details.parameter_size`, `details.quantization_level`, `model_info["<family>.context_length"]`). Two tags: `VK_DEMO_MODEL` (4B-class Gemma, latest generation in the Ollama library) and `VK_TEST_MODEL` (1B-class Gemma). Spike 1a pins both tags in Task 1's "Pinned values" block; until then no code hard-codes a tag.
-- **I4′ against Ollama:** Ollama silently truncates a prompt longer than `num_ctx`. The adapter always sends `options.num_ctx`, pre-checks the prompt (`POST /api/tokenize` when spike 1a finds it available, else the estimate `bytes/3 + 64`) and refuses above 90 % of the ceiling with the existing I4′ error; after the call it checks `prompt_eval_count < num_ctx - 8` and fails the step when the check fails. No silent truncation, ever.
-- **Claude Code as an arch (Task 2) is a pure completion on the founder's subscription:** `claude -p --output-format json --model <id> --max-turns 1` with all tools disabled (the exact flag comes from spike 2a), prompt on stdin, cwd an empty temp dir, never an API key. Manifest `locality: cloud`, `jurisdiction: "US"`, `retention_days: Some(30)`, `clearance: Business / third_party_allowed: false`. Customer nodes must use Task 2b's API arches (consumer terms); the README says so.
+- **I4′ against Ollama (measured by spike 1a on Ollama 0.33.3):** Ollama silently truncates an oversize prompt to `num_ctx / 2 + 3` tokens — HTTP 200, `done_reason: "stop"`, only a WARN in its own log — so the honest ceiling is **half** of the context. The adapter always sends `options.num_ctx`; the manifest's `context_ceiling` is `min(num_ctx, context_length) / 2`; there is no `/api/tokenize` on this version (404), so the pre-check uses the estimate `bytes/3 + 64` (measured 1.25× the real count) and refuses above 90 % of the ceiling with the existing I4′ error; after the call it fails the step when `prompt_eval_count >= num_ctx / 2`. Gemma 4 thinks by default (`message.thinking` consumes `eval_count`), so every chat request sends top-level `"think": false`. No silent truncation, ever.
+- **Claude Code as an arch (Task 2) is a pure completion on the founder's subscription:** the launch line pinned by spike 2a (Task 2, "Pinned values"), prompt on stdin, cwd = one fixed empty directory `<state_dir>/claude-code-cwd` (Ruling 4: `--no-session-persistence` still creates a `memory/` directory per cwd), never an API key. Manifest `locality: cloud`, `jurisdiction: "US"`, `retention_days: Some(30)`, `clearance: Business / third_party_allowed: false`. Customer nodes must use Task 2b's API arches (consumer terms); the README says so.
 - **Anthropic API calls (Task 2b) use raw HTTPS**: `POST https://api.anthropic.com/v1/messages`, header `anthropic-version: 2023-06-01`, default model `claude-opus-5`, `thinking: {"type":"adaptive"}`, `max_tokens` ≤ 4096; API key from the OS keyring entry `vk/anthropic`, never a file, never a manifest. **EU-hosted** = Bedrock `eu-central-1`/`eu-west-1` via `converse`; runs only when AWS credentials are present.
 - **Claude Code as the harness (Task 4)** is launched non-interactively: `claude -p "<prompt>" --mcp-config <path> --allowedTools "mcp__vk__*,Read,Write,Edit,Glob,Grep" --permission-mode acceptEdits --output-format json`, cwd = the materialised workspace.
 - **The passkey page is a secure context only on loopback**; it binds to loopback exclusively in SP1b. TLS + LAN comes with SP4.
@@ -88,7 +88,14 @@ docs/sp1-gate-checklist.md    the VM gate
 4. Time one 400-token completion of the 4B on CPU (`eval_count / eval_duration`) and the container's memory (`docker stats --no-stream`).
 5. **Founder checkpoint:** if the 4B runs below ~4 tokens/s, ask whether the demo uses the 1B-class model or the optional llama-server Vulkan path; otherwise proceed with the 4B for the demo and the 1B for tests.
 
-**Pinned values (filled by spike 1a, then verbatim in the code):** `VK_DEMO_MODEL = "<tag>"`, `VK_TEST_MODEL = "<tag>"`, image tag `ollama/ollama:<tag>` and digest, `tokenize_available = true|false`, context-length JSON path.
+**Pinned values (filled by spike 1a on 2026-09-24, then verbatim in the code; full log in `.superpowers/sdd/2026-09-23-sp1b-arches-harness-passkeys-service-demo/spike-1a-report.md`):**
+- `VK_DEMO_MODEL = "gemma4:e4b"` — digest `c6eb396dbd5992bbe3f5cdb947e8bbc0ee413d7c17e2beaae69f5d569cf982eb`; `details.family` `"gemma4"`, `details.parameter_size` `"8.0B"` (Gemma 4 E4B, effective 4B — the raw count includes per-layer embeddings), `details.quantization_level` `"Q4_K_M"`; 9.6 GB (alias of `gemma4:e4b-it-q4_K_M` and `gemma4:latest`).
+- `VK_TEST_MODEL = "gemma3:1b"` — digest `8648f39daa8fbf5b18c7b4e6a8fb4990c692751d49917417b8842ca5758e7ffc`; `"gemma3"`, `"999.89M"`, `"Q4_K_M"`; 815 MB (Gemma 4 has no 1B-class tag; its smallest, `gemma4:e2b`, is 7.2 GB).
+- Image `ollama/ollama:0.33.3`, digest `sha256:32931b46719f673c05fdbaa81ccb26da18ea4a1c57590a754874ab28ba269eb2` (`GET /api/version` → `"0.33.3"`; Hub `latest` had already moved to `0.34.3`, unmeasured).
+- `tokenize_available = false` — `POST /api/tokenize` → 404 `404 page not found` on 0.33.3; the estimate `bytes/3 + 64` measured 1.25× the real count on 36 kB of prose and 1.9× on a 1.3 kB prompt (real counts include the chat template).
+- Context-length JSON path: `model_info["<details.family>.context_length"]` from `POST /api/show` (`gemma4.context_length` = 131072, `gemma3.context_length` = 32768). A `capabilities` array exists on `/api/show` (e4b: `completion, vision, audio, tools, thinking`) and on `/api/tags` (e4b: `completion, tools, thinking`).
+- Measured on CPU, `num_ctx 8192`, seed 7, temperature 0.2: `gemma4:e4b` **10.1 tokens/s** generation (34 tokens/s prompt eval, 25 s cold load, container at 9.66 GiB of the 12 GiB cap, `OOMKilled=false`); `gemma3:1b` **22.5 tokens/s** (158 tokens/s prompt eval, 9 s load, ~1.9 GiB). Founder checkpoint not triggered.
+- Truncation observed: a 9,605-token prompt at `num_ctx 2048` returns HTTP 200, `done_reason "stop"`, no error field, `prompt_eval_count 1027`; Ollama cuts the prompt to **`num_ctx/2 + 3` tokens** (515 at 1024, 1027 at 2048, 2051 at 4096, independent of `num_predict`) and only logs `WARN "truncating input prompt"`. So the I4′ pre-check ceiling is `min(num_ctx, context_length) / 2` and the post-check is `prompt_eval_count < num_ctx/2` (the plan's `num_ctx − 8` never fires). The demo model also needs top-level `"think": false` on `/api/chat` (verified honoured) or the tokens go to `message.thinking`.
 
 **Interfaces:**
 
@@ -101,12 +108,12 @@ pub struct OllamaAdapter { /* cfg, client, identity, ollama_version, tokenize_av
 impl OllamaAdapter {
     pub fn mount(cfg: OllamaConfig) -> anyhow::Result<OllamaAdapter>;   // container::ensure when cfg.container is Some; wait GET /api/version ≤ 60 s; pull the model if absent (POST /api/pull, stream:false); read identity; probe /api/tokenize once
     pub fn manifest_for(cfg: &OllamaConfig, id: &ModelIdentity, ollama_version: &str, governed: bool) -> ArchManifest;
-    // context_ceiling = min(cfg.num_ctx, id.context_length); locality Local; jurisdiction "local"; identity tuple = (family, parameter_size, quantization, digest, ollama_version, num_ctx, seed); governed as given
+    // context_ceiling = min(cfg.num_ctx, id.context_length) / 2 (spike 1a: Ollama truncates at half); locality Local; jurisdiction "local"; identity tuple = (family, parameter_size, quantization, digest, ollama_version, num_ctx, seed); governed as given
     pub fn estimate_tokens(text: &str) -> u32;   // text.len() / 3 + 64
-    pub fn chat_request(cfg: &OllamaConfig, prompt: &str) -> api::ChatRequest;   // {model, messages:[{role:"user", content}], stream:false, options:{num_ctx, seed, temperature}}
+    pub fn chat_request(cfg: &OllamaConfig, prompt: &str) -> api::ChatRequest;   // {model, messages:[{role:"user", content}], stream:false, think:false, options:{num_ctx, seed, temperature}}
 }
 impl ArchAdapter for OllamaAdapter { … }
-// complete: pre-check (tokenize or estimate) > 0.9 * ceiling → I4′ error; POST /api/chat; post-check prompt_eval_count < num_ctx - 8 else I4′ error; returns message.content and usage {tokens_in: prompt_eval_count, tokens_out: eval_count}
+// complete: ceiling = min(num_ctx, context_length) / 2; pre-check estimate_tokens(prompt) > 0.9 * ceiling → I4′ error; POST /api/chat with "think": false; post-check prompt_eval_count >= num_ctx / 2 → I4′ error (Ollama truncated); returns message.content and usage {tokens_in: prompt_eval_count, tokens_out: eval_count}
 // count_tokens: POST /api/tokenize when available, else estimate_tokens
 pub mod container {
     pub enum State { Started, AlreadyRunning }
@@ -120,10 +127,10 @@ pub mod container {
 - [ ] **Step 1: Failing tests** (`tests/api.rs`, against a loopback fake Ollama built with `axum` in the test: canned `/api/version`, `/api/tags`, `/api/show`, `/api/tokenize`, `/api/chat`):
 
 ```rust
-#[test] fn chat_request_pins_num_ctx_seed_and_no_streaming()   // serialised JSON contains "stream":false, "num_ctx":8192, "seed":7
-#[test] fn manifest_identity_changes_with_digest_num_ctx_or_seed()   // three manifests, three arch ids; context_ceiling == min(num_ctx, context_length); governed as given
-#[test] fn refuses_a_prompt_the_model_would_truncate()   // fake /api/tokenize returns 0.95 * ceiling tokens → complete() is the I4′ error, and the fake /api/chat was never hit
-#[test] fn fails_when_the_server_reports_a_full_context()   // fake /api/chat returns prompt_eval_count == num_ctx → I4′ error
+#[test] fn chat_request_pins_num_ctx_seed_no_streaming_and_no_thinking()   // serialised JSON contains "stream":false, "think":false, "num_ctx":8192, "seed":7
+#[test] fn manifest_identity_changes_with_digest_num_ctx_or_seed()   // three manifests, three arch ids; context_ceiling == min(num_ctx, context_length) / 2; governed as given
+#[test] fn refuses_a_prompt_the_model_would_truncate()   // a prompt whose estimate is 0.95 * ceiling → complete() is the I4′ error, and the fake /api/chat was never hit
+#[test] fn fails_when_the_server_reports_a_truncated_prompt()   // fake /api/chat returns prompt_eval_count == num_ctx / 2 + 3 → I4′ error
 #[test] fn estimate_is_conservative()   // for 20 English sentences estimate_tokens ≥ 1.2 × the fake tokenizer's count
 #[test] fn usage_is_measured_not_guessed()   // tokens_in == prompt_eval_count from the fake
 ```
@@ -145,7 +152,13 @@ pub mod container {
 
 **Spike 2a (time-box 30 min, Fable):** on the installed Claude Code: confirm `-p`, `--output-format json`, `--model`, `--max-turns`, the flag that disables every tool (candidates: `--tools ""`, `--disallowedTools "*"`, `--allowedTools ""`), whether a prompt can be passed on stdin with `-p` and no positional argument, and the JSON fields (`result`, `is_error`, `usage.input_tokens`, `usage.output_tokens`, `total_cost_usd`, `duration_ms`, `session_id`, `modelUsage`). Time a 300-token completion under the subscription login. Record the exact launch line in this task's "Pinned values" block. **Founder checkpoint** only if no flag disables tools (then the adapter runs in an empty, read-only temp dir and the TCB note says so).
 
-**Pinned values (filled by spike 2a):** launch line, tool-disabling flag, JSON field paths, measured latency.
+**Pinned values (filled by spike 2a on 2026-09-24; full log in `.superpowers/sdd/2026-09-23-sp1b-arches-harness-passkeys-service-demo/spike-2a-report.md`):**
+- Claude Code 2.1.281 (native `claude.exe`); auth `claude.ai` subscription; no `ANTHROPIC_*` variable; no nested-session variable needs clearing.
+- Launch line (argv; prompt on stdin, no positional argument; cwd = `<state_dir>/claude-code-cwd`): `claude -p --output-format json --model <id> --max-turns 1 --tools "" --safe-mode --strict-mcp-config --no-session-persistence --system-prompt "You are a text completion engine with no tools. Answer the prompt directly in plain text."`
+- Tool disabling: `--tools ""` removes every built-in; `--safe-mode --strict-mcp-config` keep MCP connectors out (verified `tools: []`, `mcp_servers: []`, `num_turns: 1`, zero tool_use on a tempting prompt); `--allowedTools ""` is a no-op; never `--bare` (drops the login); `--max-turns` is enforced (exit 1, `error_max_turns`).
+- JSON: `result`, `is_error` (also `terminal_reason`, `api_error_status`; `subtype` stays `"success"` on API errors; process exit 1 on error), `session_id`, `num_turns`, `duration_ms`, `duration_api_ms`, `ttft_ms`, `total_cost_usd` (list-price equivalent, `modelUsage.<id>.costBasis == "list"`, not billed under the subscription), `usage.input_tokens` (uncached only; prompt total = `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`), `usage.output_tokens`, `modelUsage.<id>.{inputTokens, outputTokens, cacheReadInputTokens, cacheCreationInputTokens, costUSD, contextWindow}`.
+- Latency: ≈ 9–11 s wall for ~500 output tokens on `claude-sonnet-5`, ≈ 14 s on `claude-opus-5`, ~3 s of it process start-up; a 6 KB stdin prompt works.
+- Session files: `--no-session-persistence` writes no transcript but still creates an empty `~/.claude/projects/<mangled-cwd>/memory/` per call → one fixed cwd (Ruling 4).
 
 **Interfaces:**
 
@@ -328,6 +341,6 @@ From `docs/superpowers/reviews/2026-09-24-sp1a-final-review.md`. One commit per 
 
 **Spec coverage (SP1 design §4–§9, spec §3.3/§3.6/§3.7/§3.8):** governed local arch with honest context → Task 1 (container caps + I4′), optional llama-server path retained in history; Claude via subscription → Task 2; API arches US + EU-hosted → Task 2b; MCP façade + confined harness + egress telemetry + TCB gap stated → Tasks 3, 4; passkey ceremony in-process with kernel-minted challenges and the I1 argument → Task 5; service account, DACL, state dir → Task 6; demo with role swap (H1) → Task 7; shell additions and `vk fsck` → Task 8; signing, install, gate → Task 9; the SP1a review backlog → Tasks 0, 1, 5, 8, 10. Out-of-scope items match SP1 design §9.
 
-**Placeholder scan:** spikes 1a, 2a, 3a, 4a, 6a are explicit, time-boxed, and each names the values it must pin (tags, digest, tokenize availability, launch line, constant names, flag verification, SDDL, Docker under the service account); Task 1's and Task 2's "Pinned values" blocks are the only intentionally empty fields and are filled before Step 1 of each task.
+**Placeholder scan:** spikes 1a, 2a, 3a, 4a, 6a are explicit, time-boxed, and each names the values it must pin (tags, digest, tokenize availability, launch line, constant names, flag verification, SDDL, Docker under the service account); Task 1's and Task 2's "Pinned values" blocks were filled by spikes 1a and 2a on 2026-09-24 before either task's Step 1.
 
 **Type consistency:** `ArchAdapter` methods as defined in SP1a Task 4; `Governor::contain(&Child)` identical in Tasks 3 and 4; `StepKind::Harness { name }` as in SP1a Task 6; `Approval`/`Challenge` fields as in SP0; `record_verified_human_approval` and `mint_approval_challenge` named identically in Task 5 and the file structure; `boot.forced` payload identical in Task 0 and Task 8.
