@@ -17,7 +17,7 @@
 | Tier | Model / effort | Tasks |
 |---|---|---|
 | Hard — process confinement, security descriptors, WebAuthn binding, governor, crypto hardening | Fable 5.1 / xhigh | 3, 4, 5, 6, 10 |
-| Standard — adapters, MCP façade, service wrapper, demo orchestration, shell | Opus 5 / high | 1, 2, 2b, 7, 8 |
+| Standard — adapters, adapter re-mount, MCP façade, service wrapper, demo orchestration, shell | Opus 5 / high | 1, 1b, 2, 2b, 7, 8 |
 | Mechanical — `boot.forced` event, CI signing job, docs, checklist | Sonnet 5 / medium | 0, 9 |
 | Spikes (time-boxed, throwaway code allowed, findings recorded in the plan) | Fable 5.1 / xhigh | 1a, 2a, 3a, 4a, 6a |
 
@@ -141,6 +141,23 @@ pub mod container {
 - [ ] **Step 4: Wire** — `vk mount ollama …` builds the config (defaults: `--ctx 8192`, `--memory 12g`, `--cpus 6`, container mode), mounts, prints the arch id and `governed`. `vk top` shows `governed` per arch.
 - [ ] **Step 5: CI** — job `arch-ollama` on `ubuntu-latest` (Docker preinstalled): `VK_OLLAMA=1 cargo test -p vk-arch-ollama -- --ignored` with `VK_TEST_MODEL`, on push to master and `workflow_dispatch` (the 1B pull per run is accepted; add `actions/cache` for the volume only if it stays under 2 GB).
 - [ ] **Step 6: Commit** — `feat(arch): Ollama adapter — containerised Gemma with content-addressed identity, caps as governor, and honest context (I4′)`.
+
+---
+
+### Task 1b: Adapter re-mount at boot (Ruling 6, 2026-09-24)
+
+Found during Task 2: `RealKernel::load` rebuilds a `MockAdapter` for every persisted manifest, so a real arch silently degrades to the mock after a `vkd` restart. Restarts are the normal case once Task 6 installs the service, so this lands before Task 3.
+
+**Files:**
+- Modify: `crates/vk-store/src/db.rs` (table `mounts(arch_id TEXT PRIMARY KEY, kind TEXT, config_json TEXT)`), `crates/vk-kernel/src/lib.rs` (`AdapterFactory`, `RealKernel::open_with_factory`, `load` no longer fabricates mocks, `ArchState::{Ready, Unavailable(String)}` on the arch table), `crates/vk-kernel/src/arch.rs` (`MountSpec { kind, config }` stored alongside the manifest; secrets are never part of `config`), `crates/vk-ipc/src/server.rs` (`arch.mount` persists the spec; `arch.ls` and `ns.ls /arches/<id>` show `state`), `crates/vkd/src/main.rs` (builds the factory from the compiled-in kinds: `mock`, `claude-code`, `ollama` once Task 1 exists), `crates/vk-cli/src/render.rs` (`state` column in `vk ls /arches` and `vk top`)
+
+**Interfaces:**
+- `pub type AdapterFactory = Box<dyn Fn(&MountSpec) -> anyhow::Result<Box<dyn ArchAdapter>> + Send + Sync>;`
+- `RealKernel::open_with_factory(state_dir, key_source, node_id, factory: AdapterFactory)`; `RealKernel::open` keeps its signature and uses a factory that knows only `mock` (tests).
+- On load, every persisted manifest is re-created through the factory: `Ok(adapter)` → `Ready`; `Err(e)` → `Unavailable(e.to_string())`, logged at warn, listed by `arch.ls` with its state, refused by the scheduler with a clear step failure (never a mock). `arch.mount` on an `Unavailable` id with the same manifest re-attaches (the SP1a "identical re-mount swaps the adapter" rule).
+
+- [ ] **Step 1: Failing tests** — kernel: mount a stand-in adapter whose factory succeeds, drop and reopen the kernel with the same factory → the arch is `Ready` and `infer` reaches the stand-in (not a mock); reopen with a factory that fails for that kind → `Unavailable`, `run_task_step` on a step naming it → `Failed("arch unavailable: …")`, no `infer` event. IPC: `arch.ls` shows `state`. Smoke: `vk mount claude-code --bin <stand-in>`, `vk boot` again on the same store → `vk ls /arches --json` shows `ready` and `vk task step` runs through the stand-in.
+- [ ] **Step 2: Implement**; **Step 3: Run** both OSes, clippy, fmt; **Step 4: Commit** — `fix(kernel): re-create real adapters at boot from a persisted mount spec; unavailable arches are listed, never mocked`.
 
 ---
 
