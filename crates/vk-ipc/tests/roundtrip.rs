@@ -684,3 +684,42 @@ async fn a_presence_proof_on_a_method_that_takes_none_is_refused_and_still_spent
     assert!(stopped());
     server.abort();
 }
+
+/// Ruling 13: mounting an arch that is already mounted answers with the same
+/// id and says so, rather than swapping the adapter underneath it. Over the
+/// real transport, because that answer is what a client acts on.
+#[tokio::test]
+async fn mounting_the_same_arch_twice_is_idempotent_and_says_so() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    let mount = || c.call("arch.mount_mock", json!({"name": "twice"}), None);
+    let first = mount().await.unwrap();
+    assert_eq!(
+        first["already_mounted"], false,
+        "the first mount mounts it: {first}"
+    );
+    let again = mount().await.unwrap();
+    assert_eq!(again["arch_id"], first["arch_id"], "{again}");
+    assert_eq!(
+        again["already_mounted"], true,
+        "the second is the same arch, not a new one: {again}"
+    );
+
+    // And the record says it happened once.
+    let mounted = c
+        .call("ledger.tail", json!({"n": 50}), None)
+        .await
+        .unwrap()
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter(|e| e["kind"] == "arch.mounted")
+        .count();
+    assert_eq!(mounted, 1, "an idempotent re-mount appends nothing");
+    server.abort();
+}

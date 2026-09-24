@@ -160,6 +160,11 @@ pub struct OllamaAdapter {
     /// Did this mount start the container? Only then is it this arch's to stop
     /// when it is unmounted.
     started_here: bool,
+    /// Docker's id for the container this mount handled — not its name. A
+    /// `--recreate` puts a *different* container behind the same name, so the
+    /// arch it replaced must be able to tell that the thing now called
+    /// `vk-ollama` is not the one it started (Ruling 13).
+    container_id: String,
     governed: bool,
     manifest: ArchManifest,
 }
@@ -173,6 +178,11 @@ pub struct OllamaAdapter {
 /// started it — another mount of another model, or a person — and stopping it
 /// would be this arch reaching outside itself.
 ///
+/// It is also the *same* container: a `--recreate` mount replaces the arch
+/// and puts a new container behind the same name, and stopping that would
+/// break the mount that replaced this one, so the id is checked first
+/// (Ruling 13).
+///
 /// Best effort, as every `Drop` must be: the error has nowhere to go but the
 /// log, and a failed stop must not panic a daemon that is unmounting.
 impl Drop for OllamaAdapter {
@@ -180,8 +190,19 @@ impl Drop for OllamaAdapter {
         let Some(spec) = self.cfg.container.as_ref().filter(|_| self.started_here) else {
             return;
         };
-        if let Err(e) = container::stop(spec) {
-            tracing::warn!(container = %spec.name, "could not stop the container this arch started: {e:#}");
+        match container::inspected(spec) {
+            Ok(Some(now)) if now.id == self.container_id => {
+                if let Err(e) = container::stop(spec) {
+                    tracing::warn!(container = %spec.name, "could not stop the container this arch started: {e:#}");
+                }
+            }
+            Ok(_) => tracing::debug!(
+                container = %spec.name,
+                "not stopping it: the container there is not the one this arch started"
+            ),
+            Err(e) => {
+                tracing::warn!(container = %spec.name, "could not check the container before stopping it: {e:#}");
+            }
         }
     }
 }
@@ -206,7 +227,7 @@ impl OllamaAdapter {
         // adopt a container that is not the one asked for (Ruling 10), and
         // what is claimed afterwards is read off the container — never taken
         // from the request.
-        let (governor, started_here) = match &cfg.container {
+        let (governor, started_here, container_id) = match &cfg.container {
             Some(spec) => {
                 // Before anything is started or adopted: if somebody else is
                 // already on the published port, this mount would either fail
@@ -218,12 +239,14 @@ impl OllamaAdapter {
                 } else {
                     container::ensure(spec)?
                 };
-                (
-                    Some(container::governor(spec)?),
-                    container::started_here(state),
-                )
+                // One inspect for all three: the caps that decide `governed`,
+                // and the id that decides, later, whether the container still
+                // there is the one this mount handled.
+                let now = container::inspected(spec)?
+                    .with_context(|| format!("no container {} to read the caps off", spec.name))?;
+                (Some(now.governor), container::started_here(state), now.id)
             }
-            None => (None, false),
+            None => (None, false, String::new()),
         };
         let governed = governor.as_ref().is_some_and(Governor::capped);
         let client = api::client()?;
@@ -277,6 +300,7 @@ impl OllamaAdapter {
             tokenize_available,
             governor,
             started_here,
+            container_id,
             governed,
             manifest,
         })

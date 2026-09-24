@@ -165,6 +165,36 @@ struct InferRecord<'a> {
     details: Option<&'a serde_json::Value>,
 }
 
+/// What a mount did, and what it left the caller holding (Ruling 13).
+///
+/// `replaced` is the whole point of the type: an adapter that was swapped out
+/// leaves the kernel by this field, so the daemon can release the kernel mutex
+/// before dropping it. Dropping an adapter can be slow and can reach outside
+/// the process — the Ollama arch stops the container it started — and the
+/// kernel lock is the one thing that must never be held across that.
+pub struct MountOutcome {
+    pub arch_id: String,
+    /// The adapter this mount took the place of, for the caller to drop
+    /// *after* releasing the lock. `None` on a first mount and on an
+    /// idempotent re-mount, which replaces nothing.
+    pub replaced: Option<Arc<dyn arch::ArchAdapter>>,
+    /// Was this arch already mounted? True both for the idempotent case and
+    /// for a deliberate replacement, so a client can say "already mounted"
+    /// rather than pretending something new happened.
+    pub already_mounted: bool,
+}
+
+/// What to do about an arch that is already mounted under the same id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Remount {
+    /// Keep it: the arch that is there is the answer. The default, and what
+    /// makes a repeat mount idempotent.
+    Keep,
+    /// Replace it: the caller has re-made whatever is behind the arch, so the
+    /// adapter in the table is stale however identical its manifest looks.
+    Replace,
+}
+
 /// An arch's refusal, as the kernel must report it.
 ///
 /// `I4Prime` is the kernel's own invariant raised by the adapter that knows
@@ -435,16 +465,34 @@ impl RealKernel {
         self.stops.stopped_scopes()
     }
 
-    /// Mount an adapter for its manifest's arch id, replacing the mock that
-    /// `load` built from the `arches` table.
+    /// Mount an adapter for its manifest's arch id (Ruling 13).
+    ///
+    /// Mounting the same arch twice is **idempotent**: the adapter already in
+    /// the table stays, nothing is written, nothing is appended, and the
+    /// outcome says `already_mounted`. That is not an optimisation. An adapter
+    /// can own something outside this process — the Ollama arch owns the
+    /// container it started — and dropping it is how that thing gets stopped,
+    /// so a plain `vk mount ollama` run twice used to stop the container out
+    /// from under the arch it had just re-mounted, under the kernel lock (SP1b
+    /// Task 1 re-review, Important). An arch that is already there and usable
+    /// is the answer to "mount this".
     ///
     /// The arch id hashes only `ArchIdentity`, so two manifests can agree on it
     /// and still disagree about clearance — the very field `i2_flow` consults.
     /// Letting the second silently win would relabel a mounted arch, so a
-    /// conflicting manifest is refused; re-mounting an identical one only swaps
-    /// the adapter (a real engine taking over from the mock) and is otherwise a
-    /// no-op.
-    pub fn mount(&mut self, adapter: Arc<dyn arch::ArchAdapter>) -> Result<String> {
+    /// conflicting manifest is refused.
+    pub fn mount(&mut self, adapter: Arc<dyn arch::ArchAdapter>) -> Result<MountOutcome> {
+        self.mount_with(adapter, Remount::Keep)
+    }
+
+    /// The same, for a caller that knows the thing behind the arch has been
+    /// re-made and that the adapter in the table is therefore stale — `vk
+    /// mount ollama --recreate`, which replaces the container itself.
+    pub fn mount_with(
+        &mut self,
+        adapter: Arc<dyn arch::ArchAdapter>,
+        remount: Remount,
+    ) -> Result<MountOutcome> {
         let m = adapter.manifest().clone();
         m.validate()?;
         let id = m.arch_id();
@@ -453,15 +501,46 @@ impl RealKernel {
                 *mounted.manifest() == m,
                 "arch {id} is already mounted with a different manifest; unmount first"
             );
+            // Keep what is there unless the caller says it is stale, or the
+            // entry itself is no longer usable.
+            if remount == Remount::Keep && self.mounted_arch_is_ready(&id) {
+                return Ok(MountOutcome {
+                    arch_id: id,
+                    replaced: None,
+                    already_mounted: true,
+                });
+            }
             self.budgets.insert(id.clone(), adapter.context_budget());
-            self.adapters.insert(id.clone(), adapter);
-            return Ok(id);
+            // The replaced adapter leaves by the return value, never by a
+            // dropped temporary: dropping it here would run its `Drop` — a
+            // `docker stop` for the Ollama arch — with the kernel mutex held.
+            let replaced = self.adapters.insert(id.clone(), adapter);
+            return Ok(MountOutcome {
+                arch_id: id,
+                replaced,
+                already_mounted: true,
+            });
         }
         self.store.db.put_json("arches", &id, &m)?;
         self.budgets.insert(id.clone(), adapter.context_budget());
         self.adapters.insert(id.clone(), adapter);
         self.log("arch.mounted", now_ms(), &id)?;
-        Ok(id)
+        Ok(MountOutcome {
+            arch_id: id,
+            replaced: None,
+            already_mounted: false,
+        })
+    }
+
+    /// Is the adapter already mounted under `arch_id` still usable?
+    ///
+    /// The hook Task 1b's arch state machine lands on: an arch whose engine
+    /// has gone away becomes `Unavailable`, and a re-mount of one of those
+    /// *must* replace the adapter rather than keep it. Until that state
+    /// exists, an adapter in the table is Ready by construction — it was put
+    /// there by a mount that had just talked to its engine.
+    fn mounted_arch_is_ready(&self, arch_id: &str) -> bool {
+        self.adapters.contains_key(arch_id)
     }
 
     /// Unmount an arch, and hand the caller the adapter that was removed.
@@ -1066,6 +1145,7 @@ impl KernelTestHooks for RealKernel {
             budget,
         }))
         .expect("mount")
+        .arch_id
     }
 
     fn enroll_device(&mut self, device_id: &str, vk: [u8; 32]) {
@@ -1242,7 +1322,8 @@ mod tests {
                 manifest: local(personal()),
                 budget: 100,
             }))
-            .unwrap();
+            .unwrap()
+            .arch_id;
         k.enroll_device_persisted("phone-1", [7u8; 32]).unwrap();
         let stop = k.stop(&human(1), "business:acme").unwrap();
 
@@ -1441,6 +1522,117 @@ mod tests {
         }
     }
 
+    /// An adapter that says which instance it is and counts its own drops, so
+    /// a re-mount can be shown to have *kept* the one already there rather
+    /// than swapped it — and so that a swap can be shown to hand the old one
+    /// back instead of dropping it in place (Ruling 13).
+    struct Counted {
+        manifest: ArchManifest,
+        tag: u32,
+        dropped: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl arch::ArchAdapter for Counted {
+        fn manifest(&self) -> &ArchManifest {
+            &self.manifest
+        }
+        fn context_budget(&self) -> u32 {
+            self.manifest.context_ceiling
+        }
+        fn count_tokens(&self, text: &str) -> u32 {
+            (text.len() / 4) as u32 + 1
+        }
+        fn complete(&self, _: &str, _: u32) -> Result<arch::Completion, arch::AdapterError> {
+            Ok(arch::Completion::text(format!("adapter {}", self.tag)))
+        }
+    }
+
+    /// Ruling 13: mounting an arch that is already there keeps what is there.
+    ///
+    /// The adapter in the table can own something outside this process — the
+    /// Ollama arch owns the container it started — so silently swapping it and
+    /// dropping the old one is how a plain repeat `vk mount ollama` stopped
+    /// the container it had just re-mounted, with the kernel lock held. A
+    /// deliberate replacement is still possible, and hands the old adapter
+    /// back for the caller to drop after it has let the lock go.
+    #[test]
+    fn an_identical_re_mount_keeps_the_adapter_that_is_already_there() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = |tag: u32| {
+            Arc::new(Counted {
+                manifest: local_named("counted", personal()),
+                tag,
+                dropped: dropped.clone(),
+            })
+        };
+        let fallen = || dropped.load(std::sync::atomic::Ordering::SeqCst);
+
+        let first = k.mount(counted(1)).expect("the first mount");
+        assert!(!first.already_mounted);
+        assert!(first.replaced.is_none());
+        let events = k.ledger().events().len();
+
+        let again = k.mount(counted(2)).expect("the same arch again");
+        assert_eq!(again.arch_id, first.arch_id, "the same arch is the same id");
+        assert!(again.already_mounted);
+        assert!(
+            again.replaced.is_none(),
+            "an idempotent re-mount replaces nothing"
+        );
+        assert_eq!(
+            k.ledger().events().len(),
+            events,
+            "and appends nothing to the record"
+        );
+        assert_eq!(fallen(), 1, "the newcomer was dropped, not the incumbent");
+
+        // Which one is actually mounted: the answer comes out of the arch.
+        let reg = k
+            .submit_task(&machine(1), "a goal", Label::bottom())
+            .unwrap();
+        k.infer(&machine(2), &again.arch_id, Capability::Plan, &reg)
+            .unwrap();
+        let after = k.read_register(&machine(3), &reg).unwrap();
+        assert!(
+            after.decisions.iter().any(|d| d.contains("adapter 1")),
+            "the first adapter is still the one mounted: {:?}",
+            after.decisions
+        );
+
+        // The deliberate replacement: it swaps, and the old adapter leaves by
+        // the return value rather than being dropped here.
+        let swapped = k
+            .mount_with(counted(3), Remount::Replace)
+            .expect("a replacement");
+        assert_eq!(swapped.arch_id, first.arch_id);
+        assert!(swapped.already_mounted);
+        let old = swapped.replaced.expect("the adapter it took the place of");
+        assert_eq!(
+            fallen(),
+            1,
+            "the replaced adapter is still alive, in the caller's hand"
+        );
+        drop(old);
+        assert_eq!(fallen(), 2, "and dies when the caller drops it");
+        k.infer(&machine(4), &first.arch_id, Capability::Plan, &reg)
+            .unwrap();
+        let after = k.read_register(&machine(5), &reg).unwrap();
+        assert!(
+            after.decisions.iter().any(|d| d.contains("adapter 3")),
+            "the replacement is the one mounted now: {:?}",
+            after.decisions
+        );
+    }
+
     fn scripted(
         k: &mut RealKernel,
         name: &str,
@@ -1451,6 +1643,7 @@ mod tests {
             answer: Box::new(answer),
         }))
         .expect("mount")
+        .arch_id
     }
 
     /// Ruling 7: an arch that counted the prompt itself has the number, and the
@@ -1931,6 +2124,7 @@ mod tests {
                 manifest: widened,
                 budget,
             }))
+            .map(|o| o.arch_id)
             .unwrap_err();
         assert!(
             err.to_string().contains("already mounted with a different"),

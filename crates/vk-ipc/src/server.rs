@@ -22,7 +22,7 @@ use vk_contracts::principal::{Approval, ApprovalKind, Principal};
 use vk_contracts::syscalls::{Ctx, Kernel, KernelError};
 use vk_kernel::arch::{ArchAdapter, MockAdapter};
 use vk_kernel::tasks::StepKind;
-use vk_kernel::{now_ms, RealKernel};
+use vk_kernel::{now_ms, RealKernel, Remount};
 
 type Shared = Arc<Mutex<RealKernel>>;
 
@@ -415,8 +415,29 @@ fn dispatch(
             // arch needs to know, and it is the difference between the two
             // kinds this node can mount.
             let governed = adapter.manifest().governed;
-            let id = k.mount(adapter).map_err(|e| bad(&e.to_string()))?;
-            Ok(json!({ "arch_id": id, "name": name, "governed": governed }))
+            // A repeat mount keeps the arch that is there (Ruling 13). The
+            // exception is a caller who has just re-made what is behind it:
+            // `--recreate` replaced the container, so the adapter holding the
+            // old one is stale however identical its manifest looks.
+            let remount = if kind == "ollama" && p["config"]["recreate"] == Value::Bool(true) {
+                Remount::Replace
+            } else {
+                Remount::Keep
+            };
+            let outcome = k
+                .mount_with(adapter, remount)
+                .map_err(|e| bad(&e.to_string()))?;
+            let answer = json!({
+                "arch_id": outcome.arch_id,
+                "name": name,
+                "governed": governed,
+                "already_mounted": outcome.already_mounted,
+            });
+            // Out from under the kernel mutex before anything it replaced is
+            // dropped: an Ollama adapter's `Drop` is a `docker stop`.
+            drop(k);
+            drop(outcome.replaced);
+            Ok(answer)
         }
         "arch.mount_mock" => {
             let name = p["name"].as_str().unwrap_or("mock");
@@ -428,10 +449,13 @@ fn dispatch(
                 manifest: mock_manifest(name, ceiling),
                 budget: ceiling,
             };
-            let id = k
+            let outcome = k
                 .mount(Arc::new(adapter))
                 .map_err(|e| bad(&e.to_string()))?;
-            Ok(json!({ "arch_id": id }))
+            Ok(json!({
+                "arch_id": outcome.arch_id,
+                "already_mounted": outcome.already_mounted,
+            }))
         }
         "arch.unmount" => {
             let id = p["arch_id"].as_str().ok_or_else(|| bad("arch_id"))?;

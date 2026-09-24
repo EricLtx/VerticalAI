@@ -11,11 +11,18 @@
 //! One test, not three: it puts a directory on this process's `PATH`, which is
 //! process-wide state, and a binary with one test in it cannot race itself.
 //! The phases run in order and each rewrites what the stand-in answers.
+mod fake;
+
 use std::path::{Path, PathBuf};
-use vk_arch_ollama::{container, ContainerSpec};
+use std::sync::Arc;
+use vk_arch_ollama::{container, ContainerSpec, OllamaAdapter, OllamaConfig};
+use vk_kernel::arch::ArchAdapter;
+use vk_kernel::RealKernel;
 
 /// The image id the stand-in says everything is built from.
 const IMAGE: &str = "sha256:32931b46719f673c05fdbaa81ccb26da18ea4a1c57590a754874ab28ba269eb2";
+/// Docker's id for the container the stand-in describes.
+const CONTAINER_ID: &str = "c0ffee0000000000000000000000000000000000000000000000000000000000";
 /// 12 GiB and 6 CPUs — what `ContainerSpec::default()` asks for.
 const ASKED_MEMORY: u64 = 12_884_901_888;
 const ASKED_NANO_CPUS: u64 = 6_000_000_000;
@@ -57,6 +64,10 @@ impl FakeDocker {
             display(&self.at("container.json")),
             display(&self.at("image.json")),
         );
+        let (running, stopped) = (
+            display(&self.at("running.json")),
+            display(&self.at("stopped.json")),
+        );
         let (name, body) = if cfg!(windows) {
             (
                 "docker.cmd",
@@ -69,6 +80,12 @@ impl FakeDocker {
                      if \"%1 %2\"==\"image inspect\" (\r\n\
                        if exist \"{image}\" ( type \"{image}\" & exit /b 0 )\r\n\
                        echo Error: No such image: %3 1>&2\r\n  exit /b 1\r\n)\r\n\
+                     if \"%1\"==\"start\" (\r\n\
+                       if exist \"{running}\" copy /y \"{running}\" \"{container}\" >nul\r\n\
+                       exit /b 0\r\n)\r\n\
+                     if \"%1\"==\"stop\" (\r\n\
+                       if exist \"{stopped}\" copy /y \"{stopped}\" \"{container}\" >nul\r\n\
+                       exit /b 0\r\n)\r\n\
                      exit /b 0\r\n"
                 ),
             )
@@ -85,6 +102,14 @@ impl FakeDocker {
                      if [ \"$1 $2\" = 'image inspect' ]; then\n\
                        if [ -f '{image}' ]; then cat '{image}'; exit 0; fi\n\
                        echo \"Error: No such image: $3\" >&2; exit 1\n\
+                     fi\n\
+                     if [ \"$1\" = start ]; then\n\
+                       if [ -f '{running}' ]; then cp '{running}' '{container}'; fi\n\
+                       exit 0\n\
+                     fi\n\
+                     if [ \"$1\" = stop ]; then\n\
+                       if [ -f '{stopped}' ]; then cp '{stopped}' '{container}'; fi\n\
+                       exit 0\n\
                      fi\n\
                      exit 0\n"
                 ),
@@ -108,7 +133,8 @@ impl FakeDocker {
         std::fs::write(
             self.at("container.json"),
             format!(
-                "[{{\"State\": {{\"Running\": {running}}}, \"Image\": \"{image}\",
+                "[{{\"Id\": \"{CONTAINER_ID}\", \"State\": {{\"Running\": {running}}},
+                   \"Image\": \"{image}\",
                    \"Config\": {{\"Image\": \"ollama/ollama:0.33.3\"}},
                    \"HostConfig\": {{\"Memory\": {memory}, \"NanoCpus\": {nano_cpus},
                      \"Binds\": null, \"NetworkMode\": \"default\"}}}}]"
@@ -120,6 +146,16 @@ impl FakeDocker {
     /// Make `container inspect` answer "no such container".
     fn no_container(&self) {
         let _ = std::fs::remove_file(self.at("container.json"));
+    }
+
+    /// Give the stand-in the two states `docker start` and `docker stop`
+    /// switch between, so a mount that starts the container then reads it back
+    /// sees it running — as it would against the real Docker.
+    fn arm_start_stop(&self) {
+        for (name, running) in [("running.json", true), ("stopped.json", false)] {
+            self.container_is(running, ASKED_MEMORY, ASKED_NANO_CPUS, IMAGE);
+            std::fs::rename(self.at("container.json"), self.at(name)).expect("arm the state");
+        }
     }
 
     /// Every `docker` invocation since the last [`Self::forget`], in order.
@@ -250,27 +286,94 @@ fn a_container_is_adopted_only_when_it_is_the_one_this_mount_asks_for() {
     // The port is free while `vk-ollama` is stopped, which the test above has
     // just arranged; if something on this machine already holds it, the
     // condition under test is true anyway and the listener is not needed.
-    let _squatter = std::net::TcpListener::bind(container::PUBLISHED_ENDPOINT).ok();
+    {
+        let _squatter = std::net::TcpListener::bind(container::PUBLISHED_ENDPOINT).ok();
+        docker.forget();
+        let refused = container::check_port_free(&spec)
+            .expect_err("a foreign process on the port is a refusal, not a race");
+        let said = format!("{refused:#}");
+        assert!(
+            said.contains(&format!(
+                "port {} is taken by another process",
+                container::PUBLISHED_ENDPOINT
+            )),
+            "{said}"
+        );
+        assert!(said.contains("--external"), "the way out is named: {said}");
+        assert!(
+            docker.log().iter().all(|l| l.contains("inspect")),
+            "the port check must not start anything: {:?}",
+            docker.log()
+        );
+
+        // And the container's own listener is not a conflict: when it is running,
+        // there is nothing to check.
+        docker.container_is(true, ASKED_MEMORY, ASKED_NANO_CPUS, IMAGE);
+        container::check_port_free(&spec)
+            .expect("a running vk-ollama is what should be on that port");
+    }
+
+    // Phase F — the whole of Ruling 13, with a real kernel in the loop: a
+    // repeat `vk mount ollama` with the same flags must not issue a
+    // `docker stop`. It used to — `RealKernel::mount`'s replace branch swapped
+    // the adapter and dropped the old one in place, and the old one owned the
+    // container the new one had just adopted.
+    docker.arm_start_stop();
+    docker.container_is(false, ASKED_MEMORY, ASKED_NANO_CPUS, IMAGE);
+    let ollama = fake::Fake::start(fake::Canned::default());
+    let cfg = || OllamaConfig {
+        base_url: ollama.base_url.clone(),
+        model: "gemma3:1b".into(),
+        container: Some(spec.clone()),
+        ..Default::default()
+    };
     docker.forget();
-    let refused = container::check_port_free(&spec)
-        .expect_err("a foreign process on the port is a refusal, not a race");
-    let said = format!("{refused:#}");
+
+    // The first mount finds it stopped and starts it: this one owns it.
+    let first = OllamaAdapter::mount(cfg()).expect("the first mount");
     assert!(
-        said.contains(&format!(
-            "port {} is taken by another process",
-            container::PUBLISHED_ENDPOINT
-        )),
-        "{said}"
+        first.started_here(),
+        "the container was stopped, so this mount is what started it"
     );
-    assert!(said.contains("--external"), "the way out is named: {said}");
-    assert!(
-        docker.log().iter().all(|l| l.contains("inspect")),
-        "the port check must not start anything: {:?}",
-        docker.log()
+    assert!(first.manifest().governed);
+    // The second finds it running and adopts it: this one does not own it.
+    let second = OllamaAdapter::mount(cfg()).expect("the second mount");
+    assert!(!second.started_here(), "the second mount adopted it");
+    assert_eq!(
+        first.manifest().arch_id(),
+        second.manifest().arch_id(),
+        "same flags, same container, same weights: one arch"
     );
 
-    // And the container's own listener is not a conflict: when it is running,
-    // there is nothing to check.
-    docker.container_is(true, ASKED_MEMORY, ASKED_NANO_CPUS, IMAGE);
-    container::check_port_free(&spec).expect("a running vk-ollama is what should be on that port");
+    let state = tempfile::tempdir().expect("state dir");
+    let mut kernel = RealKernel::open(
+        state.path(),
+        vk_store::keys::KeySource::File(state.path().join("master.key")),
+        "n1",
+    )
+    .expect("open a kernel");
+    let mounted = kernel.mount(Arc::new(first)).expect("mount the arch");
+    assert!(!mounted.already_mounted);
+    let again = kernel.mount(Arc::new(second)).expect("mount it again");
+    assert_eq!(again.arch_id, mounted.arch_id);
+    assert!(again.already_mounted, "the same arch, said so");
+    assert!(
+        again.replaced.is_none(),
+        "an idempotent re-mount replaces nothing, so nothing is dropped"
+    );
+    let log = docker.log();
+    assert!(
+        !log.iter().any(|l| l.starts_with("stop ")),
+        "a repeat mount must not stop the container it just re-mounted: {log:?}"
+    );
+
+    // And the arch the kernel kept is the one that owns the container: when
+    // the kernel goes, the container is stopped.
+    docker.forget();
+    drop(kernel);
+    let log = docker.log();
+    assert!(
+        log.iter().any(|l| l.starts_with("stop ")),
+        "the adapter that started the container stops it when the kernel drops it: {log:?}"
+    );
 }

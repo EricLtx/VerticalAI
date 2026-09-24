@@ -553,6 +553,29 @@ fn vk_mounts_an_external_ollama_as_ungoverned_and_a_task_runs_through_it() {
         mounted["governed"], false,
         "a server this node did not start is not one it governs: {mounted}"
     );
+    assert_eq!(
+        mounted["already_mounted"], false,
+        "the first mount mounts it: {mounted}"
+    );
+
+    // Mounting it again is the same arch, said so, and nothing swapped
+    // underneath it (Ruling 13).
+    let again = sh.json(&[
+        "mount",
+        "ollama",
+        "--model",
+        "gemma3:1b",
+        "--external",
+        &ollama.url,
+        "--ctx",
+        "8192",
+        "--json",
+    ]);
+    assert_eq!(str_of(&again, "arch_id"), arch, "{again}");
+    assert_eq!(
+        again["already_mounted"], true,
+        "the second mount is the arch that is already there: {again}"
+    );
     assert!(
         sh.ok(&["ls", "/arches"]).contains(arch.as_str()),
         "the mounted arch belongs in the namespace"
@@ -573,6 +596,11 @@ fn vk_mounts_an_external_ollama_as_ungoverned_and_a_task_runs_through_it() {
         "{plain}"
     );
     assert!(plain.contains("ollama/gemma3:1b"), "{plain}");
+    assert!(
+        plain.contains("already mounted"),
+        "a person mounting it again is told so, and the verb still exits 0:
+{plain}"
+    );
 
     // And the adapter really drives the server: a task runs through it, and
     // what `vk top` reports is the server's own count of the prompt.

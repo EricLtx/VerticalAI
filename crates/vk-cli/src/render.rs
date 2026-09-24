@@ -402,14 +402,21 @@ pub fn mounted_arch(v: &Value) -> String {
         Some(false) => "no",
         None => "-",
     };
-    table(
+    let mut out = table(
         &["ARCH", "ID", "GOVERNED"],
         &[vec![
             text(&v["name"]),
             text(&v["arch_id"]),
             governed.to_string(),
         ]],
-    )
+    );
+    // Mounting an arch that is already there is a success, not a surprise —
+    // and saying so is what keeps a person from re-running it harder
+    // (Ruling 13).
+    if v["already_mounted"] == Value::Bool(true) {
+        out.push_str("\nalready mounted; this arch was left exactly as it was");
+    }
+    out
 }
 
 /// One arch per role, as `vk mount claude-code` mounts them: the role it is

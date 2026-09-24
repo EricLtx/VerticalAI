@@ -116,6 +116,10 @@ impl Governor {
 /// The container as it is now: `None` when there is no such container.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inspected {
+    /// Docker's own id for *this* container. Not the name: a `--recreate`
+    /// puts a different container behind the same name, and an adapter that
+    /// stops "vk-ollama" without checking would stop the one that replaced it.
+    pub id: String,
     pub running: bool,
     pub governor: Governor,
 }
@@ -288,6 +292,7 @@ pub fn inspected(spec: &ContainerSpec) -> Result<Option<Inspected>> {
         return Ok(None);
     };
     Ok(Some(Inspected {
+        id: v["Id"].as_str().unwrap_or_default().to_string(),
         running: v["State"]["Running"].as_bool().unwrap_or(false),
         governor: Governor {
             image: v["Image"].as_str().unwrap_or_default().to_string(),
