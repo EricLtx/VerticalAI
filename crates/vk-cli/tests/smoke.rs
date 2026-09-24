@@ -98,6 +98,15 @@ fn str_of<'a>(v: &'a Value, field: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no string field {field} in {v}"))
 }
 
+/// The `kind` of every event a `vk dmesg --json` tail carries, in order.
+fn dmesg_kinds(tail: &Value) -> Vec<&str> {
+    tail.as_array()
+        .unwrap_or_else(|| panic!("dmesg --json is not an array: {tail}"))
+        .iter()
+        .map(|e| str_of(e, "kind"))
+        .collect()
+}
+
 /// One `vk status --json`: the answer when a daemon is serving this shell's
 /// endpoint, nothing when none is.
 fn serving(sh: &Shell) -> Option<Value> {
@@ -460,10 +469,19 @@ fn vkd_refuses_to_serve_a_damaged_ledger_unless_forced(damage: fn(&std::path::Pa
     );
     let status = wait_until(&sh, true, "--force did not start a daemon").expect("status");
     assert_eq!(status["ledger_ok"], false, "{status}");
+    assert_eq!(status["forced"], true, "{status}");
     assert_eq!(
         status["stopped_scopes"],
         serde_json::json!(["node"]),
         "{status}"
+    );
+
+    // The override is itself on the record: an auditor reading the tail must
+    // find exactly why this daemon is serving a chain it says is broken.
+    let tail = sh.json(&["dmesg", "-n", "3", "--json"]);
+    assert!(
+        dmesg_kinds(&tail).contains(&"boot.forced"),
+        "a forced boot must be on the record: {tail}"
     );
 }
 
@@ -611,6 +629,13 @@ fn vk_boot_reports_the_daemons_refusal_and_serves_only_when_forced() {
 
     // A node with a record of its own, stopped again by the pid it gave back.
     let booted = sh.json(&boot);
+    let status = wait_until(&sh, true, "vk boot did not start a daemon").expect("status");
+    assert_eq!(status["forced"], false, "a healthy boot is not forced");
+    let healthy_tail = sh.json(&["dmesg", "-n", "3", "--json"]);
+    assert!(
+        !dmesg_kinds(&healthy_tail).contains(&"boot.forced"),
+        "a healthy boot must never emit boot.forced: {healthy_tail}"
+    );
     Detached(booted["pid"].as_u64().expect("a pid to stop it with")).kill();
     wait_until(&sh, false, "the daemon outlived the pid vk boot reported");
 
@@ -642,7 +667,14 @@ fn vk_boot_reports_the_daemons_refusal_and_serves_only_when_forced() {
     let _daemon = Detached(forced["pid"].as_u64().expect("a pid to stop it with"));
     let status = wait_until(&sh, true, "--force did not start a daemon").expect("status");
     assert_eq!(status["ledger_ok"], false, "{status}");
+    assert_eq!(status["forced"], true, "{status}");
     assert_eq!(status["policies_version"], "0", "{status}");
+
+    let tail = sh.json(&["dmesg", "-n", "3", "--json"]);
+    assert!(
+        dmesg_kinds(&tail).contains(&"boot.forced"),
+        "vk boot --force must land a boot.forced event: {tail}"
+    );
 }
 
 /// `vk man` is the one verb that needs no daemon: the contracts are in the

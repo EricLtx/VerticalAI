@@ -337,6 +337,11 @@ fn dispatch(
             // alone: a chain shortened since the store last wrote it still
             // links, and only the kernel knows where its head was.
             "ledger_ok": k.ledger_holds(),
+            // Set for this run only, by `record_forced_boot`: this daemon
+            // decided to serve `--force` on a chain it just said does not
+            // verify. The event naming why is on the record; this is the
+            // live marker so `vk status` need not go read it.
+            "forced": k.forced_boot(),
             // Fixed when this daemon opened its store: one event short of its
             // record is a thing every caller is told, not only the log line
             // nobody read.

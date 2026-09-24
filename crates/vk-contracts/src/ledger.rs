@@ -216,6 +216,41 @@ impl Ledger {
     }
 }
 
+/// Ledger event kinds this system emits. Previously tracked only in prose
+/// (the SP1a plan's list of every kind a task may append); `boot.forced`
+/// (founder decision 2026-09-24) is the first kind added here instead.
+/// `LedgerEvent::kind` stays a plain string on the wire — a node must be able
+/// to read a kind appended by a newer version it does not otherwise
+/// understand, so `append` never rejects one — but a caller that is about to
+/// mint a new kind of event, or a test guarding against a typo, checks it
+/// against this list first.
+pub const ALLOWED_KINDS: &[&str] = &[
+    "boot",
+    "boot.forced",
+    "task.submitted",
+    "task.step",
+    "artefact.released",
+    "register.written",
+    "infer",
+    "infer.projected",
+    "lease.granted",
+    "approval.recorded",
+    "stop",
+    "resume",
+    "automation.ran",
+    "module.promoted",
+    "module.exported",
+    "arch.mounted",
+    "arch.unmounted",
+    "device.enrolled",
+    "shred",
+];
+
+/// Is `kind` one this node knows how to append?
+pub fn is_allowed_kind(kind: &str) -> bool {
+    ALLOWED_KINDS.contains(&kind)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +308,18 @@ mod tests {
         assert!(l.verify_chain());
         l.tamper_for_test(0, "sha256:evil");
         assert!(!l.verify_chain());
+    }
+
+    /// Founder decision 2026-09-24: the daemon's `--force` override is itself
+    /// on the record, so `boot.forced` must be a kind this node knows how to
+    /// append.
+    #[test]
+    fn boot_forced_is_an_allowed_kind() {
+        assert!(is_allowed_kind("boot.forced"));
+    }
+
+    #[test]
+    fn an_unlisted_kind_is_not_allowed() {
+        assert!(!is_allowed_kind("not.a.real.kind"));
     }
 }

@@ -118,6 +118,10 @@ async fn main() -> anyhow::Result<()> {
     }
     if !report.ledger_ok {
         tracing::warn!("--force: serving on a ledger chain that does not verify");
+        // The override is itself on the record: a `boot.forced` event naming
+        // exactly the verdict just logged above, so `vk dmesg` and `vk
+        // status` — not only this log line — say when and why.
+        kernel.record_forced_boot(&report)?;
     }
     tracing::info!(endpoint = %endpoint.0, "vkd listening");
     vk_ipc::server::serve_on(Arc::new(Mutex::new(kernel)), listener).await

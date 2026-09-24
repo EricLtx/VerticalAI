@@ -95,6 +95,25 @@ pub struct ArchStats {
     pub projected: u64,
 }
 
+/// The `boot.forced` event's payload (founder decision 2026-09-24): the
+/// verdict `boot` found, named rather than recomputed, so this event and the
+/// `boot` event it follows can never disagree about what was overridden.
+#[derive(serde::Serialize)]
+struct BootForcedRecord<'a> {
+    /// `BootReport::ledger_ok` — the chain and the recorded head combined.
+    ledger_ok: bool,
+    /// The recorded-head half of that verdict on its own: a chain that fails
+    /// to verify but still reaches the head this store last wrote is a
+    /// different failure from a tail that was cut or rewritten, and an
+    /// auditor reading `boot.forced` should not have to guess which.
+    head_ok: bool,
+    ledger_len: usize,
+    /// `hash_canonical` of the `BootReport` this event is about — the same
+    /// value already committed to as that report's own `boot` event's
+    /// `payload_hash`, so the two events verifiably name the same boot.
+    report_hash: &'a str,
+}
+
 pub struct RealKernel {
     pub node_id: String,
     store: Store,
@@ -107,6 +126,11 @@ pub struct RealKernel {
     stops: StopSet,
     infer_log: Vec<(String, Label)>,
     counter: u64,
+    /// Set by `record_forced_boot`. In memory only, for as long as this
+    /// process runs — the same lifetime `ledger_holds`'s doc comment already
+    /// promises for a `--force` verdict — never persisted, so it says
+    /// nothing about a previous or a future run.
+    forced_boot: bool,
 }
 
 impl RealKernel {
@@ -122,6 +146,7 @@ impl RealKernel {
             home: LockHome::default(),
             devices: DeviceRegistry::default(),
             stops: StopSet::default(),
+            forced_boot: false,
             infer_log: vec![],
             counter: 0,
         };
@@ -262,6 +287,44 @@ impl RealKernel {
     pub fn ledger_holds(&self) -> bool {
         self.store.ledger.verify()
             && !matches!(self.store.ledger_head, HeadVerdict::Diverged { .. })
+    }
+
+    /// Ledger event for a daemon that decided to serve `report` anyway
+    /// (founder decision 2026-09-24). Kept separate from `boot` so `vk
+    /// dmesg` and an auditor can find, without replaying the whole chain,
+    /// every time this node's operator overrode a verdict that said not to
+    /// serve. `report` must be the value `boot` just returned — its own
+    /// `boot` event already committed to `report`'s hash, so naming that
+    /// same hash here lets the two events be tied together without either
+    /// trusting the other.
+    ///
+    /// Ledger before the in-memory flag, as `boot` itself: an append that
+    /// fails must leave nothing for `boot.info` or `vk status` to show.
+    ///
+    /// Callers: `vkd`, exactly on the path where it has already decided to
+    /// serve under `--force`; never when `report.ledger_ok` is true.
+    pub fn record_forced_boot(&mut self, report: &BootReport) -> Result<(), KernelError> {
+        let head_ok = !matches!(self.store.ledger_head, HeadVerdict::Diverged { .. });
+        let report_hash = hash_canonical(report);
+        self.log(
+            "boot.forced",
+            now_ms(),
+            &BootForcedRecord {
+                ledger_ok: report.ledger_ok,
+                head_ok,
+                ledger_len: report.ledger_len,
+                report_hash: &report_hash,
+            },
+        )?;
+        self.forced_boot = true;
+        Ok(())
+    }
+
+    /// Did this run serve under `--force`? Set only by `record_forced_boot`,
+    /// and only for as long as this process runs: `boot.info` and `vk
+    /// status` surface it as `forced`/`forced boot`.
+    pub fn forced_boot(&self) -> bool {
+        self.forced_boot
     }
 
     /// The policy set this node runs under, as the store has it — `None` on a
@@ -1143,6 +1206,64 @@ mod tests {
         // truncated away, not merely skipped.
         let mut k = open(d.path());
         assert!(!k.boot().unwrap().recovered_partial_line);
+    }
+
+    /// A healthy `boot` never marks the node forced: `record_forced_boot` is
+    /// the only thing that does, and only `vkd`'s `--force` path calls it.
+    #[test]
+    fn boot_alone_never_marks_the_node_forced() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        assert!(!k.forced_boot());
+        k.boot().unwrap();
+        assert!(!k.forced_boot(), "a healthy boot must not look forced");
+    }
+
+    /// `vkd` calls this on the serve-under-force path, with the very report
+    /// `boot` returned. The ledger gains a `boot.forced` event naming exactly
+    /// that verdict — not a fresh recomputation, which could disagree with
+    /// what `boot` already committed to — so `vk dmesg` shows an auditor
+    /// when and why an operator overrode a chain that said not to serve.
+    #[test]
+    fn record_forced_boot_appends_the_event_boot_reported() {
+        let d = tempfile::tempdir().unwrap();
+        {
+            let mut k = open(d.path());
+            k.boot().unwrap();
+            assert!(k.boot().unwrap().ledger_ok);
+        }
+        // Tamper the first of the two boot events: `verify_chain` fails, but
+        // the recorded head — the second boot's `{seq, hash}` — is untouched,
+        // so only the chain half of the verdict breaks.
+        let seg = d.path().join("ledger").join("seg-000000.jsonl");
+        let text = std::fs::read_to_string(&seg).unwrap();
+        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+        let mut first: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        first["payload_hash"] = serde_json::json!("sha256:tampered");
+        lines[0] = serde_json::to_string(&first).unwrap();
+        std::fs::write(&seg, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let mut k = open(d.path());
+        let report = k.boot().unwrap();
+        assert!(!report.ledger_ok, "the tampered chain must not verify");
+        assert!(!k.forced_boot());
+
+        k.record_forced_boot(&report).unwrap();
+        assert!(k.forced_boot());
+
+        let last = k.ledger().events().last().unwrap().clone();
+        assert_eq!(last.kind, "boot.forced");
+        let report_hash = hash_canonical(&report);
+        assert_eq!(
+            last.payload_hash,
+            hash_canonical(&BootForcedRecord {
+                ledger_ok: false,
+                head_ok: true,
+                ledger_len: report.ledger_len,
+                report_hash: &report_hash,
+            }),
+            "the payload must name the verdict `boot` found"
+        );
     }
 
     #[test]

@@ -88,6 +88,14 @@ pub fn status(v: &Value) -> String {
     } else {
         "BROKEN"
     };
+    // Set for this run only, by `record_forced_boot`: an operator overrode a
+    // refusal, and the chain line is where a reader already looks for the
+    // verdict it overrode.
+    let forced = if v["forced"] == Value::Bool(true) {
+        ", forced boot"
+    } else {
+        ""
+    };
     let stopped = array(v, "stopped_scopes");
     let mut rows = vec![
         ("node", text(&v["node_id"])),
@@ -97,7 +105,7 @@ pub fn status(v: &Value) -> String {
         ("devices", text(&v["devices"])),
         (
             "ledger",
-            format!("{} events, chain {chain}", text(&v["ledger_len"])),
+            format!("{} events, chain {chain}{forced}", text(&v["ledger_len"])),
         ),
         (
             "policies",
@@ -484,6 +492,45 @@ mod tests {
             value(&damaged, "recovered")
                 .is_some_and(|v| v.starts_with("an unterminated last ledger line")),
             "{damaged}"
+        );
+    }
+
+    /// `record_forced_boot`'s marker, read back on the same line a person
+    /// already checks for the chain's own verdict — not a separate row that
+    /// a reader stopping at "ledger" would miss.
+    #[test]
+    fn status_marks_a_forced_boot_next_to_the_chain_line() {
+        let value = |rendered: &str, label: &str| {
+            rendered
+                .lines()
+                .find_map(|l| l.split_once("  ").filter(|(k, _)| k.trim_end() == label))
+                .map(|(_, v)| v.trim_start().to_string())
+        };
+        let base = json!({
+            "node_id": "node-1", "state_dir": "S", "export_root": "E",
+            "arches": 0, "devices": 0, "ledger_len": 3,
+            "policies_version": "0", "ledger_ok": false,
+            "recovered_partial_line": false, "stopped_scopes": [],
+        });
+
+        let mut forced = base.clone();
+        forced["forced"] = json!(true);
+        assert_eq!(
+            value(&super::status(&forced), "ledger").as_deref(),
+            Some("3 events, chain BROKEN, forced boot"),
+        );
+
+        // Absent, exactly as every existing daemon's answer has it until it
+        // rebuilds, reads no differently from an explicit `false`.
+        assert_eq!(
+            value(&super::status(&base), "ledger").as_deref(),
+            Some("3 events, chain BROKEN"),
+        );
+        let mut not_forced = base.clone();
+        not_forced["forced"] = json!(false);
+        assert_eq!(
+            value(&super::status(&not_forced), "ledger").as_deref(),
+            Some("3 events, chain BROKEN"),
         );
     }
 

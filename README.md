@@ -83,6 +83,9 @@ where the ledger is; `vkd --force` (or `vk boot --force`) serves anyway, for
 recovering a node whose record was damaged — everything appended afterwards
 chains onto a record already known not to hold. A `vk boot` whose daemon
 refused comes back with the daemon's own last words, not with a timeout.
+Serving under `--force` is itself on the record: the daemon appends a
+`boot.forced` event naming the verdict it overrode, and `vk status` marks the
+node `forced boot`, next to the chain line, for as long as that process runs.
 
 ### Defaults
 
