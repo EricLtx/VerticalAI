@@ -652,12 +652,16 @@ fn ollama_adapter(config: &Value) -> Result<OllamaAdapter, RpcError> {
         base_url: external.unwrap_or(&defaults.base_url).to_string(),
         model: string_of("model", &defaults.model),
         num_ctx: u32_of("num_ctx", defaults.num_ctx)?,
+        max_tokens: u32_of("max_tokens", defaults.max_tokens)?,
         seed: match config.get("seed") {
             None | Some(Value::Null) => defaults.seed,
             Some(v) => v.as_u64().ok_or_else(|| bad("seed"))?,
         },
         temperature: defaults.temperature,
         container,
+        // Only ever what the client said, and only in container mode: this
+        // one destroys a container, so it is never a default (Ruling 10).
+        recreate: config.get("recreate") == Some(&Value::Bool(true)),
     };
     OllamaAdapter::mount(cfg).map_err(|e| bad(&format!("{e:#}")))
 }

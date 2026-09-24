@@ -53,12 +53,17 @@ pub struct Message {
     pub content: String,
 }
 
-/// The sampling options this adapter sets, and only those: every one of them
-/// is in the arch identity, so a call can never be sampled differently from
-/// the arch it was made on.
+/// The sampling options this adapter sets, and only those.
+///
+/// `num_ctx`, `seed` and `temperature` are in the arch identity, so a call can
+/// never be sampled differently from the arch it was made on. `num_predict` is
+/// not: it is the caller's bound on this one answer (Ruling 9a), and it is
+/// always sent — without it a local model generates until it decides to stop,
+/// which on a CPU at ten tokens a second is a wait nobody asked for.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Options {
     pub num_ctx: u32,
+    pub num_predict: u32,
     pub seed: u64,
     pub temperature: f32,
 }
@@ -148,8 +153,21 @@ pub struct TokenizeResponse {
 /// The blocking client every call here goes through. No global timeout: the
 /// calls set their own, and a pull and a version probe do not deserve the same
 /// one.
+///
+/// **`no_proxy` is the load-bearing line.** `reqwest`'s builder consults the
+/// machine's proxy configuration by default — `HTTP_PROXY`, `http_proxy`,
+/// `ALL_PROXY`, and on Windows the WinINET registry settings — and applies no
+/// loopback bypass to the environment ones. That would send the whole prompt
+/// of the only arch cleared to `Scope::Personal` to whatever host a corporate
+/// agent, a leftover mitmproxy or a stray variable names, while its manifest
+/// went on claiming `locality: Local`, `retention_days: 0` and `governed:
+/// true`, with no ledger record of the third party (SP1b Task 1 review,
+/// Critical 1). On a machine whose proxy is merely unreachable it is only a
+/// 60-second mount failure. A model on this machine's loopback has no business
+/// consulting a proxy for any reason, so it never does.
 pub fn client() -> Result<Client> {
     Client::builder()
+        .no_proxy()
         .user_agent("verticalai-vk-arch-ollama")
         .build()
         .context("build the HTTP client for Ollama")

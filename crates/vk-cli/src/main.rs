@@ -168,6 +168,15 @@ enum MountCmd {
         /// Context window asked of the server. Half of it is usable.
         #[arg(long, default_value_t = 8192)]
         ctx: u32,
+        /// The longest answer one call may produce. Always sent: a local model
+        /// with no bound runs until it decides to stop.
+        #[arg(long, default_value_t = 2048)]
+        max_tokens: u32,
+        /// Replace an existing container that is not the one asked for. Stops
+        /// it, removes it and makes it again under these caps; the volume, and
+        /// the models in it, are kept.
+        #[arg(long, conflicts_with = "external")]
+        recreate: bool,
         // The three container flags are refused beside `--external`, rather
         // than ignored: a cap named for a server this node does not start is
         // a cap that would never be applied, and silently dropping it is how
@@ -391,6 +400,8 @@ async fn call(cli: &Cli) -> Result<()> {
                     container: _,
                     external,
                     ctx,
+                    max_tokens,
+                    recreate,
                     memory,
                     cpus,
                     image,
@@ -404,6 +415,7 @@ async fn call(cli: &Cli) -> Result<()> {
             let mut config = json!({
                 "model": model,
                 "num_ctx": ctx,
+                "max_tokens": max_tokens,
                 "seed": seed,
             });
             match external {
@@ -412,6 +424,7 @@ async fn call(cli: &Cli) -> Result<()> {
                     config["image"] = json!(image);
                     config["memory"] = json!(memory);
                     config["cpus"] = json!(cpus);
+                    config["recreate"] = json!(recreate);
                 }
             }
             show(

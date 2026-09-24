@@ -264,7 +264,7 @@ pub fn top(v: &Value) -> String {
         })
         .unwrap_or_default();
     out.push(if arches.is_empty() {
-        "(no arch has been called)".into()
+        "(no arch is mounted)".into()
     } else {
         table(
             &[

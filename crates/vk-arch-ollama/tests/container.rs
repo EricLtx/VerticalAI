@@ -36,12 +36,21 @@ fn the_real_container_answers_under_the_caps_the_kernel_gave_it() {
     // From a known state: a container left running by an earlier run would
     // make `Started` unreachable and the first half of this test vacuous.
     let _ = container::stop(&spec);
+    // Adoption is the path this normally takes. A machine whose `vk-ollama`
+    // was built with other caps — or from an image it no longer has — is
+    // refused rather than adopted (Ruling 10), and the remedy is the one the
+    // refusal names; taking it here is what makes this test runnable anywhere
+    // rather than only where the container already happens to match.
+    let state = match container::ensure(&spec) {
+        Ok(state) => state,
+        Err(refused) => {
+            eprintln!("not the container this spec asks for, re-creating it: {refused:#}");
+            container::recreate(&spec).expect("re-create it")
+        }
+    };
     assert!(
-        matches!(
-            container::ensure(&spec).expect("start the container"),
-            container::State::Started
-        ),
-        "a stopped container is started, not left alone"
+        container::started_here(state),
+        "a stopped container is started, not left alone: {state:?}"
     );
     assert!(
         matches!(
@@ -83,6 +92,31 @@ fn the_real_container_answers_under_the_caps_the_kernel_gave_it() {
     );
     assert_eq!(manifest.name, format!("ollama/{model}"));
 
+    // The claim is spelled out, not asserted: the caps on the manifest are the
+    // ones the container was read to be running under, and they are the ones
+    // this mount asked for (Ruling 10).
+    let governor = adapter
+        .governor()
+        .expect("a container mount has a governor");
+    assert_eq!(
+        manifest.identity.sampling["container_memory_bytes"],
+        governor.memory_bytes.to_string()
+    );
+    assert_eq!(
+        manifest.identity.sampling["container_nano_cpus"],
+        governor.nano_cpus.to_string()
+    );
+    assert_eq!(
+        manifest.identity.sampling["container_image"],
+        governor.image
+    );
+    assert_eq!(governor.memory_bytes, 12_884_901_888, "--memory 12g");
+    assert_eq!(governor.nano_cpus, 6_000_000_000, "--cpus 6");
+    assert!(
+        !adapter.started_here(),
+        "this test started the container itself, above, so the mount adopted a running one"
+    );
+
     // The arch id names these weights, and the server agrees about which they
     // are: content-addressed identity, not a tag anyone can move.
     let digest = &adapter.identity().digest;
@@ -120,4 +154,46 @@ fn the_real_container_answers_under_the_caps_the_kernel_gave_it() {
         out.tokens_in_measured.unwrap_or(0) > 0,
         "the server counts the prompt; we do not have to guess it"
     );
+    // What was governing the call is in the record, not only in the manifest:
+    // the ledger stores the hash of these details (Ruling 10).
+    assert_eq!(details["container_image"], governor.image);
+    assert_eq!(details["container_memory_bytes"], governor.memory_bytes);
+    assert_eq!(details["container_nano_cpus"], governor.nano_cpus);
+    // Ruling 9a: an answer is bounded, and 64 tokens is what was asked for.
+    assert!(
+        eval <= 64,
+        "the answer ran past the {} tokens the caller allowed: {details}",
+        64
+    );
+
+    // Unmounting an arch that *adopted* a running container leaves it running:
+    // it belongs to whoever started it — here, to this test.
+    drop(adapter);
+    assert!(
+        running(&spec),
+        "an arch must not stop a container it only borrowed"
+    );
+
+    // And the other half: a mount that starts the container itself owns it,
+    // and stops it again when it goes. No model is loaded by a mount, so this
+    // second one costs a container start and four HTTP calls.
+    container::stop(&spec).expect("stop it, so the next mount is the one that starts it");
+    let owner = OllamaAdapter::mount(OllamaConfig::governed(&model)).expect("mount again");
+    assert!(
+        owner.started_here(),
+        "nothing was running, so this mount is what started it"
+    );
+    drop(owner);
+    assert!(
+        !running(&spec),
+        "the arch that started the container stops it again when it goes"
+    );
+}
+
+/// Is the container up right now?
+fn running(spec: &ContainerSpec) -> bool {
+    container::inspected(spec)
+        .expect("look at the container")
+        .expect("it is still there, running or not")
+        .running
 }

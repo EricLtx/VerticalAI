@@ -577,9 +577,13 @@ impl RealKernel {
                 v.arches.insert(arch.into(), stats);
             }
         }
-        // Governance comes off the mounted adapters, not off the counters: it
-        // is a fact about the arch, not about what it has spent.
+        // Every arch mounted right now, whether or not it has ever been
+        // called: an operator asking which arches this node has, and which of
+        // them it contains, must not have to run one first to find out
+        // (Ruling 9d). A row of zeros is an answer — and an arch with counters
+        // but no governance is one that has been unmounted since.
         for (id, m) in self.arches() {
+            v.arches.entry(id.clone()).or_default();
             v.governed.insert(id, m.governed);
         }
         for t in self.tasks(ctx) {

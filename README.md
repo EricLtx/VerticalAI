@@ -58,7 +58,7 @@ table or, with `--json`, as the daemon's own answer.
 | `vk status` | `uname`: what this node is, and what its boot sequence found |
 | `vk ls PATH` | the namespace: `/arches`, `/tasks`, `/artefacts`, `/devices`, `/ledger` as directories |
 | `vk ps`, `vk top` | the scheduler: what every task is doing, what each arch has cost |
-| `vk mount mock NAME`, `vk mount claude-code`, `vk umount ID` | drivers: an arch is a device this kernel drives |
+| `vk mount mock NAME`, `vk mount claude-code`, `vk mount ollama --model TAG`, `vk umount ID` | drivers: an arch is a device this kernel drives — and, for `ollama`, a process it starts and caps |
 | `vk task submit` / `step` / `show` | processes: a task is the unit of work, its register is its address space |
 | `vk stop [SCOPE]`, `vk resume ID` | signals: a STOP halts a scope until a human lifts it |
 | `vk approve ID` | the human ceremony: an approval signed by an enrolled device (invariant I1) |
@@ -91,9 +91,9 @@ Because this arch counts its own prompts, `vk top` shows what the calls
 actually cost rather than what this node guessed they would:
 
 ```
-ARCH            CALLS  TOKENS  MEASURED  COST (LIST USD)  PROJECTED
-sha256:2ee2...      2   28870     28870          0.02964          0
-sha256:fd4b...      1      74         -                -          0
+ARCH            GOVERNED  CALLS  TOKENS  MEASURED  COST (LIST USD)  PROJECTED
+sha256:2ee2...  no            2   28870     28870          0.02964          0
+sha256:fd4b...  yes           1      74        74                -          0
 ```
 
 `TOKENS` is the best number available per call, `MEASURED` how much of it the
@@ -104,6 +104,36 @@ Inference happens on Anthropic's servers, so the manifest is honest about it:
 `governed: false`, `locality: cloud`, `jurisdiction: US`, 30-day retention, and
 a clearance that stops at Business and refuses third-party data. I2 will not
 lower anything above that into it. `contracts/tcb.md` says the same in prose.
+
+### Arches: a model this kernel governs
+
+`vk mount ollama` is the other kind. It runs a Gemma-class model in an Ollama
+container **this kernel starts**, on loopback, under a memory cap and a CPU cap
+it sets — so the inference is a process the node contains, and nothing about
+the call leaves the machine.
+
+```
+vk mount ollama --model gemma4:e4b                      # the demo model, 12 GiB, 6 CPUs
+vk mount ollama --model gemma3:1b --ctx 8192 --memory 4g --cpus 2 --max-tokens 512
+vk mount ollama --model gemma4:e4b --recreate           # replace a container with other caps
+vk mount ollama --model gemma3:1b --external http://127.0.0.1:11434   # ungoverned
+```
+
+`GOVERNED` on the mount line and in `vk top` is not a promise, it is a reading:
+the caps are read back off the running container, and an existing `vk-ollama`
+is adopted only when its image and both caps are exactly the ones asked for —
+otherwise the mount is refused and names what differs, because a container
+started at 4 GiB is not a 12 GiB governor. `--recreate` replaces it and keeps
+the volume, so the models are not downloaded again. `--external` points at an
+Ollama somebody else is running: loopback only until SP4, never `governed`, and
+its clearance stops at Business.
+
+Its context ceiling is **half** the window asked for. Ollama 0.33.3 truncates
+an oversize prompt to `num_ctx / 2 + 3` tokens and answers `200 OK` with
+`done_reason: "stop"`, so this node refuses the prompt instead — before the
+call from its own estimate, and after it from the server's `prompt_eval_count`.
+Nothing is billed, so there is no `COST`; what `vk top` shows is the tokens the
+server itself counted.
 
 ### What boot does
 

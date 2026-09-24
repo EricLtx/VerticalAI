@@ -6,9 +6,13 @@
 //! memory cap and a CPU cap it imposed, on loopback, with the weights in a
 //! volume it owns — so the manifest says `governed: true`, `locality: Local`
 //! and `jurisdiction: "local"`, and nothing about the call leaves the machine.
-//! [`container::caps_applied`] reads the caps back off the running container
-//! before that claim is made: an uncapped container is not a governor, and
-//! `--external` (an Ollama someone else is running) is never governed at all.
+//! Three things keep that from being a slogan: the HTTP client never consults
+//! a proxy ([`api::client`]), an existing container is adopted only when it is
+//! exactly the one being asked for ([`container::ensure`]), and the caps that
+//! go in the manifest are the ones [`container::governor`] read back off the
+//! running container. An uncapped container is not a governor, and
+//! `--external` (an Ollama someone else is running, on this machine's loopback
+//! and nowhere else until SP4) is never governed at all.
 //!
 //! Identity is content-addressed. The arch id is built from the digest
 //! `/api/tags` reports for the tag, not from the tag — `gemma4:e4b` is a name
@@ -29,7 +33,7 @@
 //! * refuses, before the call, any prompt whose count is past nine tenths of
 //!   that (the tenth is the margin the estimate is allowed to be wrong by);
 //! * refuses, after the call, any answer whose `prompt_eval_count` reached
-//!   `num_ctx / 2` — the signature of a truncation that happened anyway.
+//!   that same ceiling — the signature of a truncation that happened anyway.
 //!
 //! There is no tokenizer to ask on 0.33.3 (`/api/tokenize` 404s), so the count
 //! before the call is the same three-bytes-a-token estimate the Claude Code
@@ -45,7 +49,7 @@ use vk_contracts::arch::{ArchIdentity, ArchManifest, Capability, Determinism, Lo
 use vk_contracts::labels::{Clearance, Scope};
 use vk_kernel::arch::{AdapterError, ArchAdapter, Completion};
 
-pub use container::{ContainerSpec, State};
+pub use container::{ContainerSpec, Governor, State};
 
 /// The model the demo runs on (spike 1a's `VK_DEMO_MODEL`): Gemma 4 E4B,
 /// measured at 10.1 tokens/s on this machine's CPU.
@@ -66,6 +70,12 @@ pub const DEFAULT_SEED: u64 = 7;
 /// Low, not zero: zero is not more deterministic than this on a model that is
 /// also given a seed, and it makes short answers repeat themselves.
 pub const DEFAULT_TEMPERATURE: f32 = 0.2;
+/// The longest answer this arch will produce unless the caller asks for less
+/// (Ruling 9a). Sent as `num_predict` on every call: without it a local model
+/// runs until it decides to stop, and at ten tokens a second on a CPU that is
+/// a wait with no end anybody chose. 2048 is roughly three minutes of the demo
+/// model, and half the usable context of the default mount.
+pub const DEFAULT_MAX_TOKENS: u32 = 2048;
 
 /// How much of the ceiling a prompt may take before the call is refused — the
 /// margin the estimate is allowed to be wrong by (I4′).
@@ -81,9 +91,19 @@ pub struct OllamaConfig {
     pub base_url: String,
     pub model: String,
     pub num_ctx: u32,
+    /// The cap on one answer, sent as `num_predict` (Ruling 9a). Not part of
+    /// the arch identity: how long an answer may run does not change what the
+    /// model is.
+    pub max_tokens: u32,
     pub seed: u64,
     pub temperature: f32,
     pub container: Option<ContainerSpec>,
+    /// Throw an existing container away and make it again from the pinned
+    /// line, keeping the volume (Ruling 10). The remedy the refusal names
+    /// when the container that is there is not the one being asked for; an
+    /// action, not a property of the container, which is why it sits here and
+    /// not on [`ContainerSpec`].
+    pub recreate: bool,
 }
 
 impl Default for OllamaConfig {
@@ -92,9 +112,11 @@ impl Default for OllamaConfig {
             base_url: DEFAULT_BASE_URL.into(),
             model: DEFAULT_MODEL.into(),
             num_ctx: DEFAULT_NUM_CTX,
+            max_tokens: DEFAULT_MAX_TOKENS,
             seed: DEFAULT_SEED,
             temperature: DEFAULT_TEMPERATURE,
             container: None,
+            recreate: false,
         }
     }
 }
@@ -132,8 +154,36 @@ pub struct OllamaAdapter {
     /// Does this server have `/api/tokenize`? Probed once, at mount: 0.33.3
     /// does not, and no call should pay for a 404 to find out again.
     tokenize_available: bool,
+    /// What the container was actually running under, read off it at mount —
+    /// `None` for an external server, which this node governs not at all.
+    governor: Option<Governor>,
+    /// Did this mount start the container? Only then is it this arch's to stop
+    /// when it is unmounted.
+    started_here: bool,
     governed: bool,
     manifest: ArchManifest,
+}
+
+/// Stop the container when the arch that started it goes away.
+///
+/// `vk umount` drops the adapter, and a governed arch that leaves a model
+/// resident in a container nobody is using is not a kernel that "can stop it"
+/// (SP1b Task 1 review, Minor 3). Only a container *this mount started* is
+/// stopped: one that was already running when we arrived belongs to whoever
+/// started it — another mount of another model, or a person — and stopping it
+/// would be this arch reaching outside itself.
+///
+/// Best effort, as every `Drop` must be: the error has nowhere to go but the
+/// log, and a failed stop must not panic a daemon that is unmounting.
+impl Drop for OllamaAdapter {
+    fn drop(&mut self) {
+        let Some(spec) = self.cfg.container.as_ref().filter(|_| self.started_here) else {
+            return;
+        };
+        if let Err(e) = container::stop(spec) {
+            tracing::warn!(container = %spec.name, "could not stop the container this arch started: {e:#}");
+        }
+    }
 }
 
 impl OllamaAdapter {
@@ -145,16 +195,32 @@ impl OllamaAdapter {
     /// the one who should wait for it. `vkd` calls this before it takes the
     /// kernel lock, so a pull does not wedge every other syscall on the node.
     pub fn mount(cfg: OllamaConfig) -> Result<OllamaAdapter> {
-        // Governed means: this node started the process *and* the caps it
-        // asked for are the caps it is running under. Both are read back, not
-        // assumed — an uncapped container would be a claim we cannot support.
-        let governed = match &cfg.container {
+        // An ungoverned arch may be somebody else's server, but it may not be
+        // somebody else's *machine*: a prompt crossing the network is a
+        // different product with a different contract (Ruling 9c).
+        if cfg.container.is_none() {
+            check_loopback(&cfg.base_url)?;
+        }
+        // Governed means: this node started the process, and the caps it is
+        // actually running under are the ones asked for. `ensure` refuses to
+        // adopt a container that is not the one asked for (Ruling 10), and
+        // what is claimed afterwards is read off the container — never taken
+        // from the request.
+        let (governor, started_here) = match &cfg.container {
             Some(spec) => {
-                container::ensure(spec)?;
-                container::caps_applied(spec).unwrap_or(false)
+                let state = if cfg.recreate {
+                    container::recreate(spec)?
+                } else {
+                    container::ensure(spec)?
+                };
+                (
+                    Some(container::governor(spec)?),
+                    container::started_here(state),
+                )
             }
-            None => false,
+            None => (None, false),
         };
+        let governed = governor.as_ref().is_some_and(Governor::capped);
         let client = api::client()?;
         let ollama_version = api::wait_for_version(&client, &cfg.base_url, START_TIMEOUT)?;
 
@@ -197,13 +263,15 @@ impl OllamaAdapter {
             );
         }
         let tokenize_available = api::tokenize_available(&client, &cfg.base_url, &cfg.model);
-        let manifest = Self::manifest_for(&cfg, &identity, &ollama_version, governed);
+        let manifest = Self::manifest_for(&cfg, &identity, &ollama_version, governor.as_ref());
         Ok(OllamaAdapter {
             cfg,
             client,
             identity,
             ollama_version,
             tokenize_available,
+            governor,
+            started_here,
             governed,
             manifest,
         })
@@ -219,13 +287,23 @@ impl OllamaAdapter {
     /// a throughput does not mint a new arch.
     ///
     /// `sampling` carries what has no field of its own — this manifest's only
-    /// free-form identity map, as `max_turns` is on the Claude Code arch.
+    /// free-form identity map, as `max_turns` is on the Claude Code arch. The
+    /// governor goes in there too (Ruling 10): the image the container
+    /// actually runs and the caps actually in force, so that `governed: true`
+    /// is a claim the manifest itself spells out rather than a bare boolean,
+    /// and so that the same weights under a 4 GiB cap and under a 12 GiB cap
+    /// are visibly not the same arch.
+    ///
+    /// `governor` is `None` for an external server and `Some` for a container
+    /// this node handled; `governed` is `capped()` on it and is never taken
+    /// from what the request asked for.
     pub fn manifest_for(
         cfg: &OllamaConfig,
         id: &ModelIdentity,
         ollama_version: &str,
-        governed: bool,
+        governor: Option<&Governor>,
     ) -> ArchManifest {
+        let governed = governor.is_some_and(Governor::capped);
         ArchManifest {
             name: format!("ollama/{}", cfg.model),
             capabilities: [Capability::Generate, Capability::Plan, Capability::Judge].into(),
@@ -260,10 +338,9 @@ impl OllamaAdapter {
                 // Not something the API reports; the default is f16 and this
                 // adapter never sets it.
                 kv_cache: "-".into(),
-                // Ollama picks both from what it finds in the container. The
-                // cap that bounds them is `ContainerSpec`, which is not an
-                // identity: the same model under a tighter cap is the same
-                // model, only slower.
+                // Ollama picks both from what it finds in the container; the
+                // cap that bounds what it finds is in `sampling` below, read
+                // off the container rather than asked for.
                 threads: 1,
                 batch: 1,
                 sampling: [
@@ -274,6 +351,16 @@ impl OllamaAdapter {
                     ("think".to_string(), "false".to_string()),
                 ]
                 .into_iter()
+                .chain(governor.into_iter().flat_map(|g| {
+                    [
+                        ("container_image".to_string(), g.image.clone()),
+                        (
+                            "container_memory_bytes".to_string(),
+                            g.memory_bytes.to_string(),
+                        ),
+                        ("container_nano_cpus".to_string(), g.nano_cpus.to_string()),
+                    ]
+                }))
                 .collect(),
                 seed: Some(cfg.seed),
             },
@@ -306,7 +393,12 @@ impl OllamaAdapter {
     }
 
     /// The request this adapter puts on the wire, and the only one it does.
-    pub fn chat_request(cfg: &OllamaConfig, prompt: &str) -> api::ChatRequest {
+    ///
+    /// `max_tokens` is the caller's bound on this one answer; `0` means "no
+    /// opinion", and the mount's own cap is used. Whichever is smaller wins,
+    /// so neither the kernel's per-call bound nor the `--max-tokens` the arch
+    /// was mounted with can be talked past (Ruling 9a).
+    pub fn chat_request(cfg: &OllamaConfig, prompt: &str, max_tokens: u32) -> api::ChatRequest {
         api::ChatRequest {
             model: cfg.model.clone(),
             messages: vec![api::Message {
@@ -321,6 +413,7 @@ impl OllamaAdapter {
             think: false,
             options: api::Options {
                 num_ctx: cfg.num_ctx,
+                num_predict: predict_tokens(cfg, max_tokens),
                 seed: cfg.seed,
                 temperature: cfg.temperature,
             },
@@ -330,6 +423,17 @@ impl OllamaAdapter {
     /// What the server said the weights are.
     pub fn identity(&self) -> &ModelIdentity {
         &self.identity
+    }
+
+    /// What the container is actually running under — the image it was made
+    /// from and the caps in force — or `None` for an external server.
+    pub fn governor(&self) -> Option<&Governor> {
+        self.governor.as_ref()
+    }
+
+    /// Did this mount start the container? Then it is this arch's to stop.
+    pub fn started_here(&self) -> bool {
+        self.started_here
     }
 
     /// The Ollama version this arch is pinned to.
@@ -356,6 +460,67 @@ impl OllamaAdapter {
 /// it starts cutting (spike 1a) — the advertised window is not a promise.
 fn ceiling_of(cfg: &OllamaConfig, id: &ModelIdentity) -> u32 {
     cfg.num_ctx.min(id.context_length) / 2
+}
+
+/// The bound on one answer: the smaller of what the caller asked for and what
+/// this arch was mounted with, and the mount's cap when the caller says `0`.
+fn predict_tokens(cfg: &OllamaConfig, max_tokens: u32) -> u32 {
+    if max_tokens == 0 {
+        cfg.max_tokens
+    } else {
+        max_tokens.min(cfg.max_tokens)
+    }
+}
+
+/// Is this base URL on this machine's own loopback?
+///
+/// `--external` exists so a person can point the kernel at an Ollama they are
+/// already running — on *this* machine. A prompt crossing the network to
+/// another host is a different product with a different contract: the arch
+/// would still be claiming `locality: Local` while the register left the node,
+/// and nothing here could say what the far end does with it. That arrives with
+/// SP4; until then it is refused at mount (Ruling 9c).
+fn check_loopback(base_url: &str) -> Result<()> {
+    let host = host_of(base_url)
+        .with_context(|| format!("--external {base_url} is not a URL with a host in it"))?;
+    if is_loopback(&host) {
+        return Ok(());
+    }
+    bail!(
+        "--external {base_url} names {host}, which is not this machine: a prompt sent there \
+         leaves the node, and the arch would still be claiming locality Local. LAN arches arrive \
+         with SP4; until then point --external at 127.0.0.1, ::1 or localhost, or mount the \
+         governed container instead"
+    )
+}
+
+/// The host out of `scheme://[user@]host[:port]/…`, lowercased, with the
+/// brackets of an IPv6 literal removed.
+fn host_of(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|a| !a.is_empty())?;
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match authority.strip_prefix('[') {
+        // `[::1]:11434` — the colons inside the brackets are the address.
+        Some(rest) => rest.split_once(']').map(|(h, _)| h)?,
+        None => authority.split(':').next()?,
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// 127.0.0.0/8, `::1` however it is spelled, and the name every platform
+/// resolves to one of them.
+fn is_loopback(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
 }
 
 /// `sha256:`-prefixed, whichever way the server spelled it, so two mounts of
@@ -404,7 +569,7 @@ impl ArchAdapter for OllamaAdapter {
             .unwrap_or_else(|_| Self::estimate_tokens(text))
     }
 
-    fn complete(&self, prompt: &str, _max_tokens: u32) -> Result<Completion, AdapterError> {
+    fn complete(&self, prompt: &str, max_tokens: u32) -> Result<Completion, AdapterError> {
         // I4′, before anything is sent. `count_tokens`, not the estimate
         // directly: it is the same ruler `context_budget` hands the kernel, so
         // a prompt the kernel fitted is never one this refuses (they are the
@@ -415,7 +580,7 @@ impl ArchAdapter for OllamaAdapter {
             return Err(AdapterError::I4Prime { needed, ceiling });
         }
 
-        let req = Self::chat_request(&self.cfg, prompt);
+        let req = Self::chat_request(&self.cfg, prompt, max_tokens);
         let answer =
             api::chat(&self.client, &self.cfg.base_url, &req).map_err(AdapterError::Other)?;
 
@@ -423,7 +588,14 @@ impl ArchAdapter for OllamaAdapter {
         // prompt to `num_ctx / 2 + 3` and reports success; reaching that line
         // means what came back is an answer to a prompt nobody wrote, and it
         // must not be raised into a register as though it were.
-        if answer.prompt_eval_count >= self.cfg.num_ctx / 2 {
+        //
+        // Against the manifest's ceiling, which is the same
+        // `min(num_ctx, context_length) / 2` the pre-check is measured
+        // against — not against `num_ctx / 2`, which is the wrong number
+        // whenever the model's own window is the binding half and would leave
+        // `--ctx 65536` on a 32768-token model with no post-check at all
+        // (SP1b Task 1 review, Minor 4).
+        if answer.prompt_eval_count >= self.manifest.context_ceiling {
             return Err(AdapterError::I4Prime {
                 needed: answer.prompt_eval_count,
                 ceiling,
@@ -458,6 +630,15 @@ impl ArchAdapter for OllamaAdapter {
                 "eval_duration_ns": answer.eval_duration,
                 "load_duration_ns": answer.load_duration,
                 "done_reason": answer.done_reason,
+                // What was governing this call, as it was read off the
+                // container at mount: the ledger stores the hash of this
+                // payload, so an auditor recomputing it can say not only which
+                // weights answered but under which image and which caps
+                // (Ruling 10). Null for an external server, which this node
+                // governs not at all.
+                "container_image": self.governor.as_ref().map(|g| g.image.clone()),
+                "container_memory_bytes": self.governor.as_ref().map(|g| g.memory_bytes),
+                "container_nano_cpus": self.governor.as_ref().map(|g| g.nano_cpus),
             })),
         })
     }
@@ -506,6 +687,15 @@ mod tests {
         assert_eq!(normalise_digest("sha256:abc"), "sha256:abc");
     }
 
+    /// The caps as a container would report them back: 12 GiB and 6 CPUs.
+    fn governor() -> Governor {
+        Governor {
+            image: PINNED_IMAGE_DIGEST.into(),
+            memory_bytes: 12_884_901_888,
+            nano_cpus: 6_000_000_000,
+        }
+    }
+
     #[test]
     fn a_governed_arch_and_an_external_one_are_not_the_same_arch() {
         let contained = OllamaConfig::governed(DEFAULT_MODEL);
@@ -513,8 +703,9 @@ mod tests {
             container: None,
             ..contained.clone()
         };
-        let a = OllamaAdapter::manifest_for(&contained, &identity(), "0.33.3", true);
-        let b = OllamaAdapter::manifest_for(&external, &identity(), "0.33.3", false);
+        let g = governor();
+        let a = OllamaAdapter::manifest_for(&contained, &identity(), "0.33.3", Some(&g));
+        let b = OllamaAdapter::manifest_for(&external, &identity(), "0.33.3", None);
         assert_ne!(
             a.arch_id(),
             b.arch_id(),
@@ -527,14 +718,118 @@ mod tests {
         assert_eq!(b.retention_days, None);
     }
 
+    /// Ruling 10: `governed` is what the container was read to be, not what
+    /// the mount asked for — and the caps that were in force are on the
+    /// manifest, so the claim can be checked rather than believed.
+    #[test]
+    fn the_manifest_carries_the_caps_that_were_actually_in_force() {
+        let cfg = OllamaConfig::governed(DEFAULT_MODEL);
+        let g = governor();
+        let capped = OllamaAdapter::manifest_for(&cfg, &identity(), "0.33.3", Some(&g));
+        assert!(capped.governed);
+        let s = &capped.identity.sampling;
+        assert_eq!(s["container_image"], PINNED_IMAGE_DIGEST);
+        assert_eq!(s["container_memory_bytes"], "12884901888");
+        assert_eq!(s["container_nano_cpus"], "6000000000");
+
+        // A container that lost its caps is not a governor, however it was
+        // asked for — and it is not the same arch as one that has them.
+        let uncapped = OllamaAdapter::manifest_for(
+            &cfg,
+            &identity(),
+            "0.33.3",
+            Some(&Governor {
+                memory_bytes: 0,
+                nano_cpus: 0,
+                ..g.clone()
+            }),
+        );
+        assert!(!uncapped.governed);
+        assert_eq!(uncapped.clearance.max_scope, Scope::Business);
+        assert_ne!(capped.arch_id(), uncapped.arch_id());
+
+        // Half the memory is a different governor, and so a different arch.
+        let smaller = OllamaAdapter::manifest_for(
+            &cfg,
+            &identity(),
+            "0.33.3",
+            Some(&Governor {
+                memory_bytes: 6_442_450_944,
+                ..g
+            }),
+        );
+        assert!(smaller.governed);
+        assert_ne!(capped.arch_id(), smaller.arch_id());
+    }
+
     #[test]
     fn the_smaller_model_is_the_faster_one_and_neither_changes_the_arch_id() {
         assert!(latency_p50_ms(TEST_MODEL) < latency_p50_ms(DEFAULT_MODEL));
         let cfg = OllamaConfig::default();
-        let a = OllamaAdapter::manifest_for(&cfg, &identity(), "0.33.3", true);
-        let mut b = OllamaAdapter::manifest_for(&cfg, &identity(), "0.33.3", true);
+        let a = OllamaAdapter::manifest_for(&cfg, &identity(), "0.33.3", None);
+        let mut b = OllamaAdapter::manifest_for(&cfg, &identity(), "0.33.3", None);
         b.latency_ms_p50 = 1;
         b.context_ceiling = 1;
         assert_eq!(a.arch_id(), b.arch_id());
+    }
+
+    /// Ruling 9a: an answer is always bounded, by the smaller of the two
+    /// bounds, and `max_tokens` is not part of what the arch *is*.
+    #[test]
+    fn an_answer_is_bounded_by_the_smaller_of_the_two_caps() {
+        let cfg = OllamaConfig::default();
+        assert_eq!(
+            predict_tokens(&cfg, 1024),
+            1024,
+            "the caller asked for less"
+        );
+        assert_eq!(
+            predict_tokens(&cfg, 99_999),
+            DEFAULT_MAX_TOKENS,
+            "the mount's cap is not something a call can talk past"
+        );
+        assert_eq!(
+            predict_tokens(&cfg, 0),
+            DEFAULT_MAX_TOKENS,
+            "no opinion from the caller means the mount's cap"
+        );
+        let tight = OllamaConfig {
+            max_tokens: 64,
+            ..cfg.clone()
+        };
+        assert_eq!(predict_tokens(&tight, 1024), 64);
+        assert_eq!(
+            OllamaAdapter::manifest_for(&cfg, &identity(), "0.33.3", None).arch_id(),
+            OllamaAdapter::manifest_for(&tight, &identity(), "0.33.3", None).arch_id(),
+            "how long an answer may run does not change which model answers"
+        );
+    }
+
+    /// Ruling 9c: `--external` is for an engine on this machine. Anything else
+    /// would put the register on the network under a manifest still claiming
+    /// `locality: Local`.
+    #[test]
+    fn external_is_loopback_only_until_sp4() {
+        for ok in [
+            "http://127.0.0.1:11434",
+            "http://127.0.0.1:11434/",
+            "http://localhost:11434",
+            "http://LOCALHOST:11434",
+            "http://127.9.9.9:11434",
+            "http://[::1]:11434",
+            "http://user:pass@127.0.0.1:11434",
+        ] {
+            check_loopback(ok).unwrap_or_else(|e| panic!("{ok} should be loopback: {e:#}"));
+        }
+        for refused in [
+            "http://192.168.1.10:11434",
+            "http://ollama.example.com:11434",
+            "http://[2001:db8::1]:11434",
+            "http://10.0.0.1",
+        ] {
+            let e = check_loopback(refused).unwrap_err().to_string();
+            assert!(e.contains("LAN arches arrive with SP4"), "{refused}: {e}");
+        }
+        assert!(check_loopback("not a url at all").is_err());
     }
 }

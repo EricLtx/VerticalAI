@@ -834,9 +834,15 @@ impl Kernel for RealKernel {
         let tokens_in = completion.tokens_in_measured.unwrap_or(estimated);
         // The call has come back: record it before doing anything that could
         // fail, so the answer is never acted on before it is written down.
+        //
+        // `now_ms()`, not `ctx.now_ms`: the call took as long as it took, and
+        // two records of one inference stamped with the same instant tell a
+        // ledger reader nothing about how long the arch was away (SP1b Task 1
+        // review, Minor 7). The HLC keeps the order whatever the wall clock
+        // does.
         self.log(
             "infer",
-            ctx.now_ms,
+            now_ms(),
             &InferRecord {
                 arch_id,
                 register: &reg_id.0,
@@ -1533,10 +1539,17 @@ mod tests {
             "{err:?}"
         );
 
-        // A refused call is not a call: nothing was counted for either arch.
+        // A refused call is not a call. Both arches are on the screen — they
+        // are mounted, and `top` says so (Ruling 9d) — with nothing counted
+        // against either of them.
+        let top = k.top(&machine(4));
+        assert_eq!(top.arches.len(), 2, "both mounted arches are listed");
         assert!(
-            k.top(&machine(4)).arches.is_empty(),
-            "a refusal must not bump the counters"
+            top.arches
+                .values()
+                .all(|s| s.calls == 0 && s.tokens_in == 0),
+            "a refusal must not bump the counters: {:?}",
+            top.arches
         );
     }
 
