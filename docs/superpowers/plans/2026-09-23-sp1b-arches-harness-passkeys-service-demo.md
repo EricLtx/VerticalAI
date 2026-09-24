@@ -366,7 +366,9 @@ From `docs/superpowers/reviews/2026-09-24-sp1a-final-review.md`. One commit per 
 **Group E — process and paths (M6, M7, M9):** `private_dir` checks ownership as well as mode; Unix detach uses `setsid` via `pre_exec`; sync-folder refusal canonicalises the deepest existing ancestor before matching.
 **Group F — docs and tests (M8, M14, M16, and the Windows temp-dir leak):** every test that opens a store closes it before its `TempDir` drops (the `vk-ipc` roundtrip server is joined/aborted and the kernel dropped first), so `cargo test` leaves no `.tmp*` directories in `%TEMP%` — asserted by a test-support guard that counts `%TEMP%` entries before and after a suite on Windows; README states the real default Windows state dir (`%LOCALAPPDATA%\VerticalAI\vk\data`), the SP1a trust model (every same-user process holding the node key counts as the human until passkeys) and the headless-Linux key path; the I1 property exercises one valid human approval per run.
 
-- Commit per group — `hardening(store): …`, `hardening(kernel): …`, `docs: …`.
+**Group G — restricted-token harness launch (founder decision 2026-09-24, after Task 6):** spike 4a(iii) showed `CreateRestrictedToken` + `CreateProcessAsUserW` on the daemon's own token works on this machine. Ship it: restricting SIDs that deny the harness access to the state directory, the keyring and the user's profile outside its workspace; validated under the Task 6 service account (`NT SERVICE\vkd`) and under the interactive user; `governed` semantics unchanged (Job Object stays); the TCB note moves restricted-token from "open" to "shipped" with the exact SIDs; the VM gate item 4 then also asserts a harness cannot read `%USERPROFILE%` outside its workspace. Tier: Fable 5.1 / xhigh.
+
+- Commit per group — `hardening(store): …`, `hardening(kernel): …`, `hardening(harness): …`, `docs: …`.
 
 ---
 
