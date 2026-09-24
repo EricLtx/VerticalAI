@@ -15,7 +15,7 @@ use vk_contracts::labels::{Label, Scope};
 use vk_contracts::ledger::{is_allowed_kind, ClockQuality, HlcClock, Ledger, RetentionClass};
 use vk_contracts::locks::{Lease, LockHome, LockTable};
 use vk_contracts::module::{GateKind, GateVerdict, ModuleManifest};
-use vk_contracts::principal::{Approval, ApprovalKind, DeviceRegistry, Principal};
+use vk_contracts::principal::{Approval, ApprovalKind, Challenge, DeviceRegistry, Principal};
 use vk_contracts::register::{ArtefactRef, Register, RegisterId};
 use vk_contracts::stop::{LivenessLease, ResumeEvent, StopError, StopEvent, StopSet};
 use vk_contracts::storage::{BlobEnvelope, StorageError};
@@ -57,10 +57,69 @@ fn validate_artefact_kind(kind: &str) -> Result<(), KernelError> {
 const POLICIES_VERSION: &str = "policies_version";
 
 /// An enrolled human device, as the `devices` table stores it.
+///
+/// Two kinds share the table (SP1b Task 5): a device *key* row carries the
+/// ed25519 verifying key that `DeviceRegistry` checks presence proofs and
+/// node-key approvals against; a *passkey* row (`trust_class: "passkey"`)
+/// carries the WebAuthn credential instead, opaque to the kernel — it is
+/// `vk-web`'s verifier that reads it — and an empty `vk_hex`, so `load`
+/// registers nothing for it. A row written before passkeys existed has
+/// neither new field and reads back exactly as it was.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DeviceRow {
     vk_hex: String,
     trust_class: String,
+    /// The serialised passkey of a `trust_class: "passkey"` row; absent on a
+    /// device-key row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    passkey: Option<serde_json::Value>,
+    #[serde(default)]
+    enrolled_ms: u64,
+}
+
+/// The trust class of a device row that holds a passkey rather than a key.
+pub const PASSKEY_TRUST_CLASS: &str = "passkey";
+/// Every passkey's device id starts with this; what follows is the
+/// credential id, base64url.
+pub const PASSKEY_DEVICE_PREFIX: &str = "passkey:";
+
+/// An enrolled passkey as `passkeys` hands it out: the device id, the
+/// credential as the enroller serialised it (the kernel never parses it),
+/// and when it was enrolled.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PasskeyRow {
+    pub device_id: String,
+    pub credential: serde_json::Value,
+    pub enrolled_ms: u64,
+}
+
+/// How long a minted approval challenge stays answerable (SP1b Task 5). Two
+/// minutes: a person has to get from the terminal to a browser and a Windows
+/// Hello prompt, and nothing more — the challenge is minted when the
+/// ceremony starts, not when the task starts waiting.
+pub const APPROVAL_CHALLENGE_TTL_MS: u64 = 120_000;
+/// Open approval challenges are bounded, as presence nonces are in the
+/// transport: past this many, the one closest to expiry is dropped. A caller
+/// that mints challenges it never spends cannot grow the map without limit.
+const MAX_APPROVAL_CHALLENGES: usize = 256;
+
+/// An approval challenge this kernel minted and no approval has spent yet
+/// (SP1b Task 5): the task it was minted for and the challenge itself. What
+/// [`RealKernel::pending_approvals`] lists.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PendingApproval {
+    pub task_id: String,
+    pub challenge: Challenge,
+}
+
+/// The `approval.recorded` payload (SP1b Task 5): the approval and which
+/// ceremony verified it — `device-key` for an ed25519 signature checked
+/// against the device registry, `webauthn` for a passkey assertion checked by
+/// `vk-web`'s verifier. Not a contract type; the ledger keeps its hash.
+#[derive(serde::Serialize)]
+struct ApprovalRecord<'a> {
+    approval: &'a Approval,
+    proof: &'a str,
 }
 
 /// What this node came up with: the verdict on its own record, what it had to
@@ -374,6 +433,12 @@ pub struct RealKernel {
     /// The token itself is never stored, logged or put in a payload; the
     /// ledger and every principal carry the lease id.
     harness_tokens: BTreeMap<String, HarnessTokenState>,
+    /// The approval challenges this kernel has minted and no approval has
+    /// spent yet, keyed by nonce (SP1b Task 5, invariant I1). In memory only:
+    /// a challenge is a moment's thing, bound to a task that is waiting *now*,
+    /// and one that was open when this process stopped is rightly unknown to
+    /// the next — the person mints another.
+    approval_challenges: BTreeMap<String, PendingApproval>,
 }
 
 /// One live harness run, as the token map holds it: which lease and task the
@@ -463,6 +528,7 @@ impl RealKernel {
             infer_log: vec![],
             counter: 0,
             harness_tokens: BTreeMap::new(),
+            approval_challenges: BTreeMap::new(),
         };
         k.load()?;
         Ok(k)
@@ -734,7 +800,7 @@ impl RealKernel {
             arches: self.arches().into_iter().map(|(id, _)| id).collect(),
             unavailable_arches: self.unavailable.keys().cloned().collect(),
             starting_arches: self.starting.keys().cloned().collect(),
-            devices: self.devices.ids(),
+            devices: self.device_ids(),
             stopped_scopes: self.stops.stopped_scopes(),
             policies_version: self.load_policies_version()?,
         };
@@ -1077,6 +1143,22 @@ impl RealKernel {
         &self.devices
     }
 
+    /// Every enrolled device, sorted: the device keys the registry holds and
+    /// the passkeys beside them. What the boot report and `boot.info` count —
+    /// a passkey is a device that speaks for a human, whatever verifies it.
+    pub fn device_ids(&self) -> Vec<String> {
+        let mut ids = self.devices.ids();
+        ids.extend(
+            self.passkeys()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.device_id),
+        );
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
     /// Enrol a human device. The `KernelTestHooks` hook of the same name cannot
     /// report a failed write, so production callers (the IPC admin syscall) use
     /// this one.
@@ -1093,12 +1175,293 @@ impl RealKernel {
                 &DeviceRow {
                     vk_hex: hex::encode(vk),
                     trust_class: "full".into(),
+                    passkey: None,
+                    enrolled_ms: now_ms(),
                 },
             )
             .map_err(store_failed)?;
         self.devices.register(device_id.into(), vk);
         self.log("device.enrolled", now_ms(), &device_id)?;
         Ok(())
+    }
+
+    /// Enrol a passkey as device `passkey:<credential id>` (SP1b Task 5).
+    ///
+    /// In-process only, never a syscall: the enrolment ceremony is `vk-web`'s
+    /// registration flow, whose `finish` verified the attestation with
+    /// `webauthn-rs` before it calls this. `credential` is that verifier's
+    /// `Passkey`, serialised, and the kernel never looks inside it — it holds
+    /// it for the verifier the way it holds a verifying key for the registry.
+    /// A second enrolment under an id already there is refused as an I1
+    /// matter, exactly as a different key for the node device is: a device id
+    /// names one credential for good.
+    pub fn enroll_passkey(
+        &mut self,
+        device_id: &str,
+        credential: serde_json::Value,
+        now_ms: u64,
+    ) -> Result<(), KernelError> {
+        if !device_id.starts_with(PASSKEY_DEVICE_PREFIX)
+            || device_id.len() == PASSKEY_DEVICE_PREFIX.len()
+        {
+            return Err(KernelError::I1(format!(
+                "a passkey's device id is `{PASSKEY_DEVICE_PREFIX}<credential id>`, not {device_id:?}"
+            )));
+        }
+        let existing: Option<DeviceRow> = self
+            .store
+            .db
+            .get_json("devices", device_id)
+            .map_err(store_failed)?;
+        if existing.is_some() {
+            return Err(KernelError::I1(format!(
+                "device {device_id} is already enrolled"
+            )));
+        }
+        self.store
+            .db
+            .put_json(
+                "devices",
+                device_id,
+                &DeviceRow {
+                    vk_hex: String::new(),
+                    trust_class: PASSKEY_TRUST_CLASS.into(),
+                    passkey: Some(credential),
+                    enrolled_ms: now_ms,
+                },
+            )
+            .map_err(store_failed)?;
+        self.log("device.enrolled", now_ms, &device_id)
+    }
+
+    /// Replace an enrolled passkey's credential with what the verifier holds
+    /// after an assertion — its signature counter moved. The device id, its
+    /// trust class and its enrolment time stay; nothing is appended, because
+    /// nothing was enrolled. An id that is not an enrolled passkey is refused.
+    pub fn update_passkey(
+        &mut self,
+        device_id: &str,
+        credential: serde_json::Value,
+    ) -> Result<(), KernelError> {
+        let row: DeviceRow = self
+            .store
+            .db
+            .get_json("devices", device_id)
+            .map_err(store_failed)?
+            .filter(|r: &DeviceRow| r.trust_class == PASSKEY_TRUST_CLASS)
+            .ok_or_else(|| KernelError::NotFound(format!("passkey {device_id}")))?;
+        self.store
+            .db
+            .put_json(
+                "devices",
+                device_id,
+                &DeviceRow {
+                    passkey: Some(credential),
+                    ..row
+                },
+            )
+            .map_err(store_failed)
+    }
+
+    /// Every enrolled passkey, sorted by device id: what `vk-web`'s verifier
+    /// loads before an authentication and what `vk passkey ls` prints.
+    pub fn passkeys(&self) -> Result<Vec<PasskeyRow>, KernelError> {
+        Ok(self
+            .store
+            .db
+            .list_json::<DeviceRow>("devices")
+            .map_err(store_failed)?
+            .into_iter()
+            .filter(|(_, row)| row.trust_class == PASSKEY_TRUST_CLASS)
+            .filter_map(|(device_id, row)| {
+                row.passkey.map(|credential| PasskeyRow {
+                    device_id,
+                    credential,
+                    enrolled_ms: row.enrolled_ms,
+                })
+            })
+            .collect())
+    }
+
+    /// Mint the challenge a human approval of `task_id` must answer (SP1b
+    /// Task 5, invariant I1): the task's current approval subject as the
+    /// action digest, `task:<id>` as the resource, a random nonce and a short
+    /// expiry. The only way a `Challenge` a human signs comes into being. A
+    /// task that is not waiting at its `Approve` step gets no challenge
+    /// (`approval_subject` refuses), so nothing can be signed for a subject
+    /// the scheduler would not ask about.
+    pub fn mint_approval_challenge(
+        &mut self,
+        ctx: &Ctx,
+        task_id: &str,
+    ) -> Result<Challenge, KernelError> {
+        self.mint_approval_challenge_with_ttl(ctx, task_id, APPROVAL_CHALLENGE_TTL_MS)
+    }
+
+    /// The same with an explicit lifetime — the default for every caller but a
+    /// test that needs a challenge to expire while it watches.
+    pub fn mint_approval_challenge_with_ttl(
+        &mut self,
+        ctx: &Ctx,
+        task_id: &str,
+        ttl_ms: u64,
+    ) -> Result<Challenge, KernelError> {
+        let subject = self.approval_subject(ctx, task_id)?;
+        let now = ctx.now_ms;
+        self.approval_challenges
+            .retain(|_, p| p.challenge.expires_at_ms > now);
+        if self.approval_challenges.len() >= MAX_APPROVAL_CHALLENGES {
+            if let Some(soonest) = self
+                .approval_challenges
+                .iter()
+                .min_by_key(|(_, p)| p.challenge.expires_at_ms)
+                .map(|(nonce, _)| nonce.clone())
+            {
+                self.approval_challenges.remove(&soonest);
+            }
+        }
+        let nonce = {
+            use base64::Engine;
+            let bytes: [u8; 32] = rand::random();
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        };
+        let challenge = Challenge {
+            resource: format!("task:{task_id}"),
+            action_digest: subject,
+            nonce: nonce.clone(),
+            expires_at_ms: now.saturating_add(ttl_ms),
+        };
+        self.approval_challenges.insert(
+            nonce,
+            PendingApproval {
+                task_id: task_id.into(),
+                challenge: challenge.clone(),
+            },
+        );
+        Ok(challenge)
+    }
+
+    /// The challenges minted and not yet spent or expired, oldest expiry
+    /// first. A read surface for a client that wants to know whether a
+    /// ceremony is under way; it hands out nothing a client could not have
+    /// asked to be minted.
+    pub fn pending_approvals(&self, now_ms: u64) -> Vec<PendingApproval> {
+        let mut open: Vec<PendingApproval> = self
+            .approval_challenges
+            .values()
+            .filter(|p| p.challenge.expires_at_ms > now_ms)
+            .cloned()
+            .collect();
+        open.sort_by_key(|p| p.challenge.expires_at_ms);
+        open
+    }
+
+    /// Spend a minted challenge: the one presented must be, field for field,
+    /// one this kernel minted, not yet spent and not yet expired. It leaves
+    /// the map here, before anything else about the approval is looked at,
+    /// whatever the verdict — a nonce presented is a nonce spent, as for
+    /// presence nonces in the transport, so a challenge that fails a check
+    /// cannot be shown again to a check it would pass. Both ceremonies go
+    /// through this: the node-key path from `approve`, the passkey path from
+    /// `record_verified_human_approval`. Returns the task the challenge was
+    /// minted for.
+    fn spend_approval_challenge(
+        &mut self,
+        presented: &Challenge,
+        now_ms: u64,
+    ) -> Result<String, KernelError> {
+        let minted = self
+            .approval_challenges
+            .remove(&presented.nonce)
+            .ok_or_else(|| {
+                KernelError::I1(
+                    "approval challenge was not minted by this node, or was already spent".into(),
+                )
+            })?;
+        if minted.challenge != *presented {
+            return Err(KernelError::I1(
+                "approval challenge is not the one this node minted for that nonce".into(),
+            ));
+        }
+        if now_ms >= presented.expires_at_ms {
+            return Err(KernelError::I1("approval challenge expired".into()));
+        }
+        Ok(minted.task_id)
+    }
+
+    /// Record a human approval whose ceremony has already been verified by
+    /// this process — the passkey path (SP1b Task 5).
+    ///
+    /// **I1 argument.** A human approval reaches the record by exactly two
+    /// doors. One is the `approve` syscall, where the approver must be the
+    /// human principal the transport derived from an enrolled ed25519 device
+    /// key's presence proof, and the signature must verify against that key.
+    /// The other is this method, which no syscall reaches: it is called only
+    /// in-process, by `vk-web`'s `POST /approve/<task>/finish`, after
+    /// `webauthn-rs` has verified the assertion against a passkey that was
+    /// enrolled through the admin flow — so the *approver* here is the passkey
+    /// the verifier identified, never a principal a client asserted, and the
+    /// *challenge* is checked here to be one this kernel minted, unspent and
+    /// unexpired, never one a client supplied. What a client sends over the
+    /// loopback page is an assertion; what becomes an approval is decided on
+    /// this side of it. `proof` names the ceremony on the ledger.
+    pub fn record_verified_human_approval(
+        &mut self,
+        now_ms: u64,
+        approval: Approval,
+        proof: &str,
+    ) -> Result<(), KernelError> {
+        if approval.kind != ApprovalKind::Human {
+            return Err(KernelError::I1(
+                "a verified human approval is of kind human".into(),
+            ));
+        }
+        if !approval.approver.is_human() {
+            return Err(KernelError::I1(
+                "a verified human approval names a human device".into(),
+            ));
+        }
+        let challenge = approval
+            .challenge
+            .as_ref()
+            .ok_or_else(|| KernelError::I1("a human approval answers a challenge".into()))?;
+        if approval
+            .signature_hex
+            .as_deref()
+            .is_none_or(|s| s.is_empty())
+        {
+            return Err(KernelError::I1(
+                "a human approval carries the assertion's signature".into(),
+            ));
+        }
+        if challenge.action_digest != approval.subject_hash {
+            return Err(KernelError::I1(
+                "approval subject does not match the challenge's action".into(),
+            ));
+        }
+        self.spend_approval_challenge(challenge, now_ms)?;
+        self.record_approval(now_ms, &approval, proof)
+    }
+
+    /// The approval onto the record, ledger first: an approval that is stored
+    /// but reported as failed would still satisfy a later promote's
+    /// human-approval gate and the scheduler's waiting step.
+    fn record_approval(
+        &mut self,
+        now_ms: u64,
+        approval: &Approval,
+        proof: &str,
+    ) -> Result<(), KernelError> {
+        let key = format!("{}:{}", approval.subject_hash, hash_canonical(approval));
+        self.log(
+            "approval.recorded",
+            now_ms,
+            &ApprovalRecord { approval, proof },
+        )?;
+        self.store
+            .db
+            .put_json("approvals", &key, approval)
+            .map_err(store_failed)
     }
 
     /// Enrol the node's own device key as `node:<node_id>`, trust class `full`.
@@ -1657,15 +2020,20 @@ impl Kernel for RealKernel {
     }
 
     fn approve(&mut self, ctx: &Ctx, approval: Approval) -> Result<(), KernelError> {
+        // The challenge first, before the principal or the signature is
+        // looked at (SP1b Task 5): a human approval answers a challenge this
+        // node minted for the task, unspent and unexpired, or it is nothing —
+        // a client that builds its own `Challenge`, however well it signs it,
+        // is signing a subject and an expiry of its own choosing. Spent here
+        // whatever follows, so a failed signature burns the nonce too.
+        if approval.kind == ApprovalKind::Human {
+            let challenge = approval.challenge.as_ref().ok_or_else(|| {
+                KernelError::I1("a human approval answers a minted challenge".into())
+            })?;
+            self.spend_approval_challenge(challenge, ctx.now_ms)?;
+        }
         interceptors::i1_approval(&ctx.principal, &approval, &self.devices, ctx.now_ms)?;
-        let key = format!("{}:{}", approval.subject_hash, hash_canonical(&approval));
-        // Ledger first: an approval that is stored but reported as failed would
-        // still satisfy a later promote's human-approval gate.
-        self.log("approval.recorded", ctx.now_ms, &approval)?;
-        self.store
-            .db
-            .put_json("approvals", &key, &approval)
-            .map_err(store_failed)
+        self.record_approval(ctx.now_ms, &approval, "device-key")
     }
 
     fn stop(&mut self, ctx: &Ctx, scope: &str) -> Result<String, KernelError> {
@@ -2831,17 +3199,16 @@ mod tests {
         let mut k = open(d.path());
         let key = SoftwareHumanKey::generate("phone-1");
         k.enroll_device("phone-1", key.verifying_key_bytes());
-        let ch = Challenge {
-            resource: "module:quote-drafter".into(),
-            action_digest: "sha256:c".into(),
-            nonce: "n".into(),
-            expires_at_ms: 10,
-        };
+        // A task waiting at its approve step, so a challenge can be minted
+        // for it (SP1b Task 5): the subject is the drafted artefact's hash.
+        let (task, subject) = waiting_task(&mut k);
+        let ch = k.mint_approval_challenge(&machine(2), &task).unwrap();
+        assert_eq!(ch.action_digest, subject);
         let sig = key.sign(&ch.digest());
         k.approve(
             &human(2),
             Approval {
-                subject_hash: "sha256:c".into(),
+                subject_hash: subject.clone(),
                 kind: ApprovalKind::Human,
                 approver: Principal::Human {
                     device_id: "phone-1".into(),
@@ -2852,7 +3219,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(k.approvals_for("sha256:c").len(), 1);
+        assert_eq!(k.approvals_for(&subject).len(), 1);
         // The row's key is "<subject>:<hash_canonical>" and hash_canonical is
         // itself "sha256:…", so a key-prefix match would let a module whose
         // content hash is the bare string "sha256" inherit this approval.
@@ -2888,6 +3255,378 @@ mod tests {
             Err(KernelError::I1(_))
         ));
         assert!(k.hot_modules().is_empty());
+    }
+
+    /// A task drafted through a mock arch and now waiting at its approve
+    /// step, with the subject a human approval of it must name.
+    fn waiting_task(k: &mut RealKernel) -> (String, String) {
+        use crate::tasks::{StepKind, TaskStatus};
+        let arch = k.register_arch(local(personal()));
+        let task = k
+            .create_task(
+                &machine(1),
+                "draft a proposal",
+                "proposal",
+                Label::bottom(),
+                vec![StepKind::Draft { arch_id: arch }, StepKind::Approve],
+            )
+            .unwrap()
+            .id;
+        k.run_task_step(&machine(1), &task).unwrap();
+        let t = k.run_task_step(&machine(1), &task).unwrap();
+        assert_eq!(t.status, TaskStatus::WaitingHuman);
+        let subject = k.approval_subject(&machine(1), &task).unwrap();
+        (task, subject)
+    }
+
+    /// `key`'s approval of exactly `ch`.
+    fn signed(key: &SoftwareHumanKey, ch: &Challenge) -> Approval {
+        Approval {
+            subject_hash: ch.action_digest.clone(),
+            kind: ApprovalKind::Human,
+            approver: Principal::Human {
+                device_id: key.device_id(),
+            },
+            challenge: Some(ch.clone()),
+            signature_hex: Some(hex::encode(key.sign(&ch.digest()))),
+        }
+    }
+
+    /// SP1b Task 5, invariant I1: the kernel mints every approval challenge,
+    /// bound to the task's subject and resource with a fresh nonce and a
+    /// short expiry; a task that is not waiting gets none; the map of open
+    /// challenges is bounded and drops the expired.
+    #[test]
+    fn mint_approval_challenge_binds_the_waiting_task_and_is_bounded() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let arch = k.register_arch(local(personal()));
+        let queued = k
+            .create_task(
+                &machine(1),
+                "later",
+                "note",
+                Label::bottom(),
+                vec![
+                    crate::tasks::StepKind::Draft { arch_id: arch },
+                    crate::tasks::StepKind::Approve,
+                ],
+            )
+            .unwrap()
+            .id;
+        // Not waiting yet: no challenge, and nothing left open.
+        let err = k.mint_approval_challenge(&machine(1), &queued).unwrap_err();
+        assert!(
+            matches!(&err, KernelError::Gate(m) if m.contains("not waiting")),
+            "{err}"
+        );
+        assert!(k.pending_approvals(1).is_empty());
+
+        let (task, subject) = waiting_task(&mut k);
+        let a = k.mint_approval_challenge(&machine(10), &task).unwrap();
+        let b = k.mint_approval_challenge(&machine(10), &task).unwrap();
+        assert_eq!(a.resource, format!("task:{task}"));
+        assert_eq!(a.action_digest, subject);
+        assert_eq!(a.expires_at_ms, 10 + APPROVAL_CHALLENGE_TTL_MS);
+        assert_ne!(a.nonce, b.nonce, "every mint is a fresh nonce");
+        assert!(
+            a.nonce.len() >= 40,
+            "32 random bytes, base64url: {}",
+            a.nonce
+        );
+        // Both open, both for this task; equal expiries, so the order between
+        // them is the nonces', which is random.
+        let mut open: Vec<(String, Challenge)> = k
+            .pending_approvals(10)
+            .into_iter()
+            .map(|p| (p.task_id, p.challenge))
+            .collect();
+        open.sort_by(|x, y| x.1.nonce.cmp(&y.1.nonce));
+        let mut expected = vec![(task.clone(), a.clone()), (task.clone(), b.clone())];
+        expected.sort_by(|x, y| x.1.nonce.cmp(&y.1.nonce));
+        assert_eq!(open, expected);
+        // Expired ones are not pending, and are swept by the next mint.
+        assert!(k.pending_approvals(a.expires_at_ms).is_empty());
+        let c = k
+            .mint_approval_challenge(&machine(a.expires_at_ms), &task)
+            .unwrap();
+        assert_eq!(k.approval_challenges.len(), 1);
+        assert_eq!(k.pending_approvals(a.expires_at_ms)[0].challenge, c);
+        // Bounded: past the cap the one closest to expiry goes.
+        for _ in 0..(MAX_APPROVAL_CHALLENGES + 5) {
+            k.mint_approval_challenge(&machine(a.expires_at_ms + 1), &task)
+                .unwrap();
+        }
+        assert_eq!(k.approval_challenges.len(), MAX_APPROVAL_CHALLENGES);
+        assert!(
+            !k.approval_challenges.contains_key(&c.nonce),
+            "the earliest expiry was the one dropped"
+        );
+    }
+
+    /// The node-key path through the shared verifier: a challenge nobody
+    /// minted is refused before the signature is looked at, an altered one is
+    /// refused and burns the nonce, an expired one is refused, and a minted
+    /// one is accepted exactly once — after which the waiting step completes.
+    #[test]
+    fn approve_spends_a_minted_challenge_once_and_refuses_every_other() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let key = SoftwareHumanKey::generate("phone-1");
+        k.enroll_device("phone-1", key.verifying_key_bytes());
+        let (task, subject) = waiting_task(&mut k);
+        let events = |k: &RealKernel| k.ledger().events().len();
+
+        // Unminted, well signed, right subject.
+        let forged = Challenge {
+            resource: format!("task:{task}"),
+            action_digest: subject.clone(),
+            nonce: "made-up".into(),
+            expires_at_ms: 1_000_000,
+        };
+        let before = events(&k);
+        let err = k.approve(&human(5), signed(&key, &forged)).unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("minted")),
+            "{err}"
+        );
+        assert_eq!(events(&k), before, "nothing appended");
+
+        // Minted, then altered: refused, and the nonce is gone with it.
+        let minted = k.mint_approval_challenge(&machine(5), &task).unwrap();
+        let altered = Challenge {
+            action_digest: "sha256:other".into(),
+            ..minted.clone()
+        };
+        let mut wrong_subject = signed(&key, &altered);
+        wrong_subject.subject_hash = "sha256:other".into();
+        let err = k.approve(&human(6), wrong_subject).unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("not the one")),
+            "{err}"
+        );
+        let err = k.approve(&human(6), signed(&key, &minted)).unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("minted")),
+            "{err}"
+        );
+
+        // Minted and expired.
+        let stale = k
+            .mint_approval_challenge_with_ttl(&machine(7), &task, 3)
+            .unwrap();
+        let err = k.approve(&human(10), signed(&key, &stale)).unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("expired")),
+            "{err}"
+        );
+
+        // Minted, and signed by a key that is not the device's: the nonce is
+        // spent by the failed signature, so the real key cannot use it after.
+        let minted = k.mint_approval_challenge(&machine(8), &task).unwrap();
+        let impostor = SoftwareHumanKey::generate("phone-1");
+        let err = k
+            .approve(&human(9), signed(&impostor, &minted))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::Principal(_)), "{err}");
+        let err = k.approve(&human(9), signed(&key, &minted)).unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("minted")),
+            "{err}"
+        );
+        assert!(k.approvals_for(&subject).is_empty());
+        assert_eq!(events(&k), before);
+
+        // Minted, signed, presented once: recorded, with the ceremony named.
+        let minted = k.mint_approval_challenge(&machine(11), &task).unwrap();
+        k.approve(&human(12), signed(&key, &minted)).unwrap();
+        assert_eq!(k.approvals_for(&subject).len(), 1);
+        let last = k.ledger().events().last().unwrap();
+        assert_eq!(last.kind, "approval.recorded");
+        assert_eq!(
+            last.payload_hash,
+            hash_canonical(&ApprovalRecord {
+                approval: &signed(&key, &minted),
+                proof: "device-key",
+            })
+        );
+        // Presented again: spent.
+        let err = k.approve(&human(13), signed(&key, &minted)).unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("minted")),
+            "{err}"
+        );
+        assert_eq!(k.approvals_for(&subject).len(), 1);
+        assert!(k.pending_approvals(13).is_empty());
+        let t = k.run_task_step(&machine(14), &task).unwrap();
+        assert_eq!(t.status, crate::tasks::TaskStatus::Done);
+    }
+
+    /// The passkey path (SP1b Task 5): an approval the web verifier already
+    /// checked is recorded in-process against a minted challenge, once, with
+    /// `proof: webauthn` on the ledger; one that names no minted challenge,
+    /// a machine approver, or a subject other than the challenge's is refused
+    /// with nothing recorded.
+    #[test]
+    fn record_verified_human_approval_takes_a_minted_challenge_once() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let (task, subject) = waiting_task(&mut k);
+        let passkey = || Principal::Human {
+            device_id: "passkey:abc".into(),
+        };
+        let approval = |ch: &Challenge| Approval {
+            subject_hash: ch.action_digest.clone(),
+            kind: ApprovalKind::Human,
+            approver: passkey(),
+            challenge: Some(ch.clone()),
+            signature_hex: Some("3045".into()),
+        };
+        let before = k.ledger().events().len();
+
+        // No minted challenge behind it.
+        let unminted = Challenge {
+            resource: format!("task:{task}"),
+            action_digest: subject.clone(),
+            nonce: "n".into(),
+            expires_at_ms: 1_000_000,
+        };
+        let err = k
+            .record_verified_human_approval(5, approval(&unminted), "webauthn")
+            .unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("minted")),
+            "{err}"
+        );
+
+        // A machine approver, a missing signature, a subject that is not the
+        // challenge's: each refused before the challenge is spent.
+        let minted = k.mint_approval_challenge(&machine(5), &task).unwrap();
+        let mut machine_made = approval(&minted);
+        machine_made.approver = Principal::Machine {
+            node_id: "n1".into(),
+            lease_id: "web".into(),
+        };
+        assert!(matches!(
+            k.record_verified_human_approval(6, machine_made, "webauthn"),
+            Err(KernelError::I1(_))
+        ));
+        let mut unsigned = approval(&minted);
+        unsigned.signature_hex = None;
+        assert!(matches!(
+            k.record_verified_human_approval(6, unsigned, "webauthn"),
+            Err(KernelError::I1(_))
+        ));
+        let mut other = approval(&minted);
+        other.subject_hash = "sha256:other".into();
+        assert!(matches!(
+            k.record_verified_human_approval(6, other, "webauthn"),
+            Err(KernelError::I1(_))
+        ));
+        assert_eq!(k.pending_approvals(6).len(), 1, "still unspent");
+        assert!(k.approvals_for(&subject).is_empty());
+        assert_eq!(k.ledger().events().len(), before);
+
+        // The genuine one: recorded, named, spent.
+        k.record_verified_human_approval(7, approval(&minted), "webauthn")
+            .unwrap();
+        assert_eq!(k.approvals_for(&subject), vec![approval(&minted)]);
+        let last = k.ledger().events().last().unwrap();
+        assert_eq!(last.kind, "approval.recorded");
+        assert_eq!(
+            last.payload_hash,
+            hash_canonical(&ApprovalRecord {
+                approval: &approval(&minted),
+                proof: "webauthn",
+            })
+        );
+        assert!(k.pending_approvals(7).is_empty());
+        let err = k
+            .record_verified_human_approval(8, approval(&minted), "webauthn")
+            .unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("minted")),
+            "{err}"
+        );
+        assert_eq!(k.approvals_for(&subject).len(), 1);
+        assert_eq!(
+            k.run_task_step(&machine(9), &task).unwrap().status,
+            crate::tasks::TaskStatus::Done
+        );
+    }
+
+    /// A passkey is a device row of its own class: listed with its credential
+    /// and enrolment time, counted among the devices, absent from the key
+    /// registry (it has no ed25519 key), refused a second time under the same
+    /// id, updatable in place without a second `device.enrolled`, and there
+    /// again after a reopen.
+    #[test]
+    fn a_passkey_is_enrolled_once_listed_counted_and_survives_reopen() {
+        let d = tempfile::tempdir().unwrap();
+        let cred = serde_json::json!({ "cred": { "id": "abc", "counter": 0 } });
+        {
+            let mut k = open(d.path());
+            let enrolled = |k: &RealKernel| {
+                k.ledger()
+                    .events()
+                    .iter()
+                    .filter(|e| e.kind == "device.enrolled")
+                    .count()
+            };
+            let err = k.enroll_passkey("laptop", cred.clone(), 1).unwrap_err();
+            assert!(matches!(err, KernelError::I1(_)), "{err}");
+            let err = k
+                .enroll_passkey(PASSKEY_DEVICE_PREFIX, cred.clone(), 1)
+                .unwrap_err();
+            assert!(matches!(err, KernelError::I1(_)), "{err}");
+            k.enroll_passkey("passkey:abc", cred.clone(), 1).unwrap();
+            assert_eq!(enrolled(&k), 1);
+            let err = k
+                .enroll_passkey("passkey:abc", cred.clone(), 2)
+                .unwrap_err();
+            assert!(
+                matches!(&err, KernelError::I1(m) if m.contains("already")),
+                "{err}"
+            );
+            assert_eq!(enrolled(&k), 1);
+
+            assert_eq!(
+                k.passkeys().unwrap(),
+                vec![PasskeyRow {
+                    device_id: "passkey:abc".into(),
+                    credential: cred.clone(),
+                    enrolled_ms: 1,
+                }]
+            );
+            assert!(k.devices().ids().is_empty(), "no key in the registry");
+            k.enroll_device_persisted("phone-1", [7u8; 32]).unwrap();
+            assert_eq!(
+                k.device_ids(),
+                vec!["passkey:abc".to_string(), "phone-1".to_string()]
+            );
+            assert_eq!(k.boot().unwrap().devices, k.device_ids());
+
+            // A counter moved: the row is replaced, nothing is appended.
+            let moved = serde_json::json!({ "cred": { "id": "abc", "counter": 3 } });
+            k.update_passkey("passkey:abc", moved.clone()).unwrap();
+            assert_eq!(k.passkeys().unwrap()[0].credential, moved);
+            assert_eq!(enrolled(&k), 2, "phone-1's, and nothing for the update");
+            assert!(matches!(
+                k.update_passkey("phone-1", moved.clone()),
+                Err(KernelError::NotFound(_))
+            ));
+            assert!(matches!(
+                k.update_passkey("passkey:nope", moved),
+                Err(KernelError::NotFound(_))
+            ));
+        }
+        let k = open(d.path());
+        let rows = k.passkeys().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].device_id, "passkey:abc");
+        assert_eq!(rows[0].credential["cred"]["counter"], 3);
+        assert_eq!(rows[0].enrolled_ms, 1);
+        assert_eq!(k.devices().ids(), vec!["phone-1".to_string()]);
     }
 
     #[test]

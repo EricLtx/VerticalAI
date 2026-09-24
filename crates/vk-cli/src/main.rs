@@ -25,8 +25,11 @@ use vk_ipc::transport::{default_endpoint, Endpoint};
 use vk_ipc::PresenceProof;
 use vk_kernel::presence::{KeySource, NodeDevice};
 
-/// How long an approval challenge stays answerable — the daemon's own window.
-const APPROVAL_TTL_MS: u64 = 60_000;
+/// `vkd --web-port`'s default, handed on by `vk boot`. A literal rather than
+/// `vk_web::DEFAULT_PORT` so this shell does not link the verifier.
+const DEFAULT_WEB_PORT: u16 = 7734;
+/// How often `vk approve --passkey` asks whether the approval has landed.
+const APPROVAL_POLL: Duration = Duration::from_millis(500);
 /// A `--all` run drives one step per call; this bounds it so a task that never
 /// settles is reported rather than looped on forever.
 const MAX_STEPS: usize = 256;
@@ -85,8 +88,26 @@ enum Cmd {
     },
     /// Lift a STOP by its id. Human.
     Resume { stop_id: String },
-    /// Approve a task's latest artefact. Human.
-    Approve { task_id: String },
+    /// Approve a task's latest artefact. Human: signed with this node's
+    /// device key, or — with --passkey — with a passkey in the browser.
+    Approve {
+        task_id: String,
+        /// Approve with an enrolled passkey (Windows Hello, a phone): prints
+        /// the approval page's link, then waits for the approval to land.
+        #[arg(long)]
+        passkey: bool,
+        /// Open the link in the default browser as well as printing it.
+        #[arg(long, requires = "passkey")]
+        open: bool,
+        /// How long to wait for the passkey approval, in seconds.
+        #[arg(long, default_value_t = 300, requires = "passkey")]
+        timeout: u64,
+    },
+    /// Passkeys: the human's own device, enrolled through the browser.
+    Passkey {
+        #[command(subcommand)]
+        what: PasskeyCmd,
+    },
     /// The ledger tail.
     Dmesg {
         #[arg(short = 'n', long = "lines", default_value_t = 20)]
@@ -123,6 +144,22 @@ struct BootArgs {
     /// Start the daemon even though the ledger chain does not verify.
     #[arg(long)]
     force: bool,
+    /// Loopback port for the passkey pages (`0`: one the OS picks).
+    #[arg(long, default_value_t = DEFAULT_WEB_PORT)]
+    web_port: u16,
+}
+
+#[derive(Subcommand)]
+enum PasskeyCmd {
+    /// Print the enrolment page's link (and open it with --open): the
+    /// browser asks Windows Hello, or a phone, to make the passkey.
+    Enroll {
+        /// Open the link in the default browser as well as printing it.
+        #[arg(long)]
+        open: bool,
+    },
+    /// The passkeys enrolled on this node.
+    Ls,
 }
 
 #[derive(Subcommand)]
@@ -500,7 +537,18 @@ async fn call(cli: &Cli) -> Result<()> {
                 render::ok,
             )
         }
-        Cmd::Approve { task_id } => approve(cli, &c, task_id).await,
+        Cmd::Approve {
+            task_id,
+            passkey: false,
+            ..
+        } => approve(cli, &c, task_id).await,
+        Cmd::Approve {
+            task_id,
+            passkey: true,
+            open,
+            timeout,
+        } => approve_with_passkey(cli, &c, task_id, *open, Duration::from_secs(*timeout)).await,
+        Cmd::Passkey { what } => passkey(cli, &c, what).await,
         Cmd::Dmesg { n } => show(
             cli,
             c.call("ledger.tail", json!({ "n": n }), None).await?,
@@ -671,28 +719,24 @@ async fn presence(c: &Client) -> Result<PresenceProof> {
     Ok(PresenceProof::sign(&device, &challenge(c).await?))
 }
 
-/// The approval ceremony: learn what the scheduler is waiting to have
-/// approved, then sign it.
+/// The approval ceremony with this node's device key: ask the kernel for the
+/// challenge it minted for the task — the subject, the resource, the nonce
+/// and the expiry are all the kernel's, never this shell's (SP1b Task 5,
+/// invariant I1) — sign its digest, and present it with a presence proof.
 ///
-/// One challenge carries both signatures. They are in different domains — a
-/// presence proof signs `sha256("presence|<nonce>")`, an approval signs
-/// `H(resource|action|nonce|expiry)` — so neither can be replayed as the
-/// other, and the approval is bound to a nonce this daemon issued a moment
-/// ago rather than to one the client made up.
+/// Two signatures, two domains: the presence proof signs
+/// `sha256("presence|<nonce>")` over a nonce of its own, the approval signs
+/// `H(resource|action|nonce|expiry)` over the minted challenge, so neither
+/// can be replayed as the other, and `approve` accepts the approval only
+/// while the minted challenge is unspent and unexpired.
 async fn approve(cli: &Cli, c: &Client, task_id: &str) -> Result<()> {
     let device = node_device(c).await?;
-    let subject = field(
-        &c.call("task.subject", json!({ "task_id": task_id }), None)
+    let challenge: Challenge = serde_json::from_value(
+        c.call("approval.challenge", json!({ "task_id": task_id }), None)
             .await?,
-        "subject_hash",
-    )?;
-    let nonce = challenge(c).await?;
-    let challenge = Challenge {
-        resource: format!("task:{task_id}"),
-        action_digest: subject.clone(),
-        nonce: nonce.clone(),
-        expires_at_ms: vk_kernel::now_ms() + APPROVAL_TTL_MS,
-    };
+    )
+    .context("the daemon's approval challenge")?;
+    let subject = challenge.action_digest.clone();
     let approval = Approval {
         subject_hash: subject.clone(),
         kind: ApprovalKind::Human,
@@ -702,7 +746,7 @@ async fn approve(cli: &Cli, c: &Client, task_id: &str) -> Result<()> {
         signature_hex: Some(hex::encode(device.sign(&challenge.digest()))),
         challenge: Some(challenge),
     };
-    let proof = PresenceProof::sign(&device, &nonce);
+    let proof = presence(c).await?;
     let mut answer = c
         .call("approve", json!({ "approval": approval }), Some(proof))
         .await?;
@@ -714,6 +758,126 @@ async fn approve(cli: &Cli, c: &Client, task_id: &str) -> Result<()> {
         o.insert("subject_hash".into(), json!(subject));
     }
     show(cli, answer, render::approved)
+}
+
+/// The approval ceremony with a passkey: the daemon mints a link to the
+/// task's approval page, this shell prints it (and opens it with `--open`),
+/// and waits — polling `task.show` — for the task to leave `waiting_human`,
+/// which is what the page's `finish` does once the passkey has signed and
+/// the kernel has recorded. Nothing is signed here: the browser, the
+/// authenticator and the daemon do the whole ceremony between them.
+async fn approve_with_passkey(
+    cli: &Cli,
+    c: &Client,
+    task_id: &str,
+    open: bool,
+    timeout: Duration,
+) -> Result<()> {
+    let linked = c
+        .call(
+            "web.link",
+            json!({ "page": "approve", "task_id": task_id }),
+            None,
+        )
+        .await?;
+    let url = field(&linked, "url")?;
+    let subject = field(&linked, "subject_hash")?;
+    // The link goes to the person at once, before the wait: to stdout as the
+    // answer of the moment, or — under `--json`, where stdout is the final
+    // answer — to stderr, so a script capturing the answer still shows it.
+    if cli.json {
+        eprintln!("{url}");
+    } else {
+        println!("{}", render::link(&json!({ "url": url, "waiting": true })));
+    }
+    if open {
+        open_browser(&url)?;
+    }
+    let start = Instant::now();
+    let status = loop {
+        let t = c
+            .call("task.show", json!({ "task_id": task_id }), None)
+            .await?;
+        match t["status"].as_str() {
+            Some("waiting_human") | None => {}
+            // The approve step ran on the approval: the task finished, or
+            // went on to its next step.
+            Some(status @ ("done" | "running")) => break status.to_string(),
+            // It left `waiting_human` some other way — a STOP, a failure —
+            // and nothing says a passkey approved anything.
+            Some(other) => {
+                return Err(anyhow!(
+                    "task {task_id} is {other}; no passkey approval landed on it"
+                ))
+            }
+        }
+        if start.elapsed() > timeout {
+            return Err(anyhow!(
+                "no passkey approval of {task_id} arrived within {}s; the link stays open for \
+                 a few minutes: {url}",
+                timeout.as_secs()
+            ));
+        }
+        tokio::time::sleep(APPROVAL_POLL).await;
+    };
+    show(
+        cli,
+        json!({
+            "ok": true,
+            "task_id": task_id,
+            "subject_hash": subject,
+            "status": status,
+            "url": url,
+        }),
+        render::approved,
+    )
+}
+
+/// `vk passkey enroll | ls`.
+async fn passkey(cli: &Cli, c: &Client, what: &PasskeyCmd) -> Result<()> {
+    match what {
+        PasskeyCmd::Enroll { open } => {
+            let linked = c
+                .call("web.link", json!({ "page": "enroll" }), None)
+                .await?;
+            let url = field(&linked, "url")?;
+            if *open {
+                open_browser(&url)?;
+            }
+            show(cli, json!({ "url": url, "opened": open }), render::link)
+        }
+        PasskeyCmd::Ls => show(
+            cli,
+            c.call("passkey.ls", json!({}), None).await?,
+            render::passkeys,
+        ),
+    }
+}
+
+/// Hand `url` to the default browser: `start` on Windows, `open` on macOS,
+/// `xdg-open` elsewhere. Detached, and only its launch is checked — what
+/// the browser then does with the page is the person's, not this shell's.
+fn open_browser(url: &str) -> Result<()> {
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        // `start` treats its first quoted argument as a window title.
+        c.args(["/C", "start", "", url]);
+        c
+    } else if cfg!(target_os = "macos") {
+        let mut c = Command::new("open");
+        c.arg(url);
+        c
+    } else {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("open {url} in a browser"))?;
+    Ok(())
 }
 
 /// The `boot.info` of the daemon serving this endpoint, if one is. It carries
@@ -882,6 +1046,7 @@ fn boot(cli: &Cli, rt: &tokio::runtime::Runtime, a: &BootArgs) -> Result<()> {
     if a.force {
         cmd.arg("--force");
     }
+    cmd.args(["--web-port", &a.web_port.to_string()]);
     if a.foreground {
         let status = cmd
             .status()

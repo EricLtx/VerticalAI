@@ -34,21 +34,51 @@ type Shared = Arc<Mutex<RealKernel>>;
 /// never a request's (Ruling 20: a pipe client that could name the binary the
 /// daemon executes would be code execution as the daemon's account once Task 6
 /// puts it under one).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServerConfig {
     pub endpoint: String,
     pub harness: HarnessSettings,
+    /// The loopback web pages this daemon serves (SP1b Task 5), if it serves
+    /// any: what `web.link` mints an addressed link into. `None` on a daemon
+    /// started without them, and in every transport test.
+    pub web: Option<Arc<dyn WebLinks>>,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("endpoint", &self.endpoint)
+            .field("harness", &self.harness)
+            .field("web", &self.web.as_ref().map(|w| w.origin()))
+            .finish()
+    }
 }
 
 impl ServerConfig {
-    /// A config with the default harness settings, for a caller (a test) that
-    /// has only an endpoint.
+    /// A config with the default harness settings and no web pages, for a
+    /// caller (a test) that has only an endpoint.
     pub fn new(endpoint: String) -> ServerConfig {
         ServerConfig {
             endpoint,
             harness: HarnessSettings::default(),
+            web: None,
         }
     }
+}
+
+/// The web pages' side of `web.link` (SP1b Task 5): mint a link a person can
+/// open, carrying a token the pages check. The pages live in `vk-web`, which
+/// this crate does not depend on; `vkd` wires the two together. A link is the
+/// pipe's ACL carried over to loopback HTTP: only a process that could open
+/// this endpoint can obtain one, so only such a process — the interactive
+/// user's, in SP1b — can reach the enrolment and approval pages.
+pub trait WebLinks: Send + Sync {
+    /// `http://localhost:<port>`.
+    fn origin(&self) -> String;
+    /// A link to the enrolment page, good for a few minutes.
+    fn enroll_link(&self, now_ms: u64) -> String;
+    /// A link to the approval page of `task_id`, good for a few minutes.
+    fn approve_link(&self, task_id: &str, now_ms: u64) -> String;
 }
 
 /// How this daemon launches a harness: `vkd --harness-bin`, `--harness-model`,
@@ -520,7 +550,44 @@ fn dispatch(
             // subpath and prints the resolved path, so "where did my artefact
             // go?" is answerable without the client guessing the layout.
             "export_root": k.export_root().display().to_string(),
+            // The loopback origin of the passkey pages (SP1b Task 5), `null`
+            // on a daemon that serves none. The origin only: a link into the
+            // pages is minted by `web.link`, per person, per purpose.
+            "web": config.web.as_ref().map(|w| w.origin()),
         })),
+        // The link a person opens to enrol a passkey or to approve a task with
+        // one (SP1b Task 5). Minted here, over the endpoint whose ACL already
+        // proved the peer is this user's process, so the pages inherit that
+        // ACL: nobody who could not open this pipe gets a link. The approve
+        // link is minted only for a task that is waiting at its approve step,
+        // for the same reason `task.subject` answers only then.
+        "web.link" => {
+            let web = config.web.as_ref().ok_or_else(|| RpcError {
+                code: E_STORE,
+                message: "this daemon serves no web pages: start vkd with --web-port".into(),
+            })?;
+            match p["page"].as_str().ok_or_else(|| bad("page"))? {
+                "enroll" => Ok(json!({ "url": web.enroll_link(now) })),
+                "approve" => {
+                    let ctx = ctx_for(&k, presence, now)?;
+                    let id = p["task_id"].as_str().ok_or_else(|| bad("task_id"))?;
+                    let subject = k.approval_subject(&ctx, id).map_err(kerr)?;
+                    Ok(json!({ "url": web.approve_link(id, now), "subject_hash": subject }))
+                }
+                other => Err(bad(&format!("no web page {other}"))),
+            }
+        }
+        // The enrolled passkeys, by id and enrolment time. Never the
+        // credential: a public key is a public value, but nothing outside the
+        // verifier needs it and a listing that carries one invites it into a
+        // log (SP1b Task 5).
+        "passkey.ls" => to_value(
+            k.passkeys()
+                .map_err(kerr)?
+                .into_iter()
+                .map(|p| json!({ "device_id": p.device_id, "enrolled_ms": p.enrolled_ms }))
+                .collect::<Vec<_>>(),
+        ),
         // The read surfaces carry a `Ctx` too: a task shows its register's
         // goal, and what a caller may see of it is the register's label
         // against the caller's clearance (I2), as for `read_register`.
@@ -715,6 +782,21 @@ fn dispatch(
             k.approval_subject(&ctx, id)
                 .map(|h| json!({ "subject_hash": h }))
                 .map_err(kerr)
+        }
+        // The challenge a human approval of this task must answer (SP1b Task
+        // 5, invariant I1): minted by the kernel — the subject, the resource,
+        // a fresh nonce and a short expiry are all its — and never by the
+        // client, which used to build its own. `approve` accepts only a
+        // challenge that came out of here (or out of the passkey page's own
+        // mint), unspent and unexpired. Minting is not a human act, so no
+        // proof is asked for; answering it is, and `approve` is where that is
+        // proved. Not a `harness.*` method: a harness cannot mint one.
+        "approval.challenge" => {
+            let ctx = ctx_for(&k, presence, now)?;
+            let id = p["task_id"].as_str().ok_or_else(|| bad("task_id"))?;
+            k.mint_approval_challenge(&ctx, id)
+                .map_err(kerr)
+                .and_then(to_value)
         }
         "task.show" => {
             let ctx = ctx_for(&k, presence, now)?;

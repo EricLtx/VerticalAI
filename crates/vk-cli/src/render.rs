@@ -113,6 +113,15 @@ pub fn status(v: &Value) -> String {
         ("export root", text(&v["export_root"])),
         ("arches", arch_count(v)),
         ("devices", text(&v["devices"])),
+        // Where the passkey pages are, or that there are none: the person
+        // who runs `vk passkey enroll` next should not have to guess.
+        (
+            "web",
+            match v["web"].as_str() {
+                Some(origin) => origin.to_string(),
+                None => "none (vkd --web-port)".into(),
+            },
+        ),
         (
             "ledger",
             format!("{} events, chain {chain}{forced}", text(&v["ledger_len"])),
@@ -536,11 +545,58 @@ pub fn booted(v: &Value) -> String {
 /// An approval is recorded, not applied: the step that was waiting for it only
 /// moves when the task is stepped again, so say so.
 pub fn approved(v: &Value) -> String {
-    format!(
-        "approved {}\nrun `vk task step {} --all` to continue",
-        text(&v["subject_hash"]),
-        text(&v["task_id"])
-    )
+    // The passkey page runs the step that was waiting, so the task has moved
+    // on by the time this prints; the device-key ceremony records only, and
+    // says what has to happen next.
+    match v["status"].as_str() {
+        Some(status) => format!(
+            "approved {}\ntask {} is {status}",
+            text(&v["subject_hash"]),
+            text(&v["task_id"])
+        ),
+        None => format!(
+            "approved {}\nrun `vk task step {} --all` to continue",
+            text(&v["subject_hash"]),
+            text(&v["task_id"])
+        ),
+    }
+}
+
+/// A link into the passkey pages, and what to do with it.
+pub fn link(v: &Value) -> String {
+    let url = text(&v["url"]);
+    if v["waiting"] == Value::Bool(true) {
+        format!("approve in the browser: {url}\nwaiting for the passkey…")
+    } else if v["opened"] == Value::Bool(true) {
+        format!("enrol in the browser (opened): {url}")
+    } else {
+        format!("enrol in the browser: {url}")
+    }
+}
+
+/// `vk passkey ls`: one line per enrolled passkey.
+pub fn passkeys(v: &Value) -> String {
+    let rows = v
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|p| {
+                    vec![
+                        text(&p["device_id"]),
+                        p["enrolled_ms"]
+                            .as_u64()
+                            .map(|ms| format!("{ms}"))
+                            .unwrap_or_else(|| "-".into()),
+                    ]
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if rows.is_empty() {
+        "no passkey enrolled; run `vk passkey enroll`".into()
+    } else {
+        table(&["DEVICE", "ENROLLED (ms)"], &rows)
+    }
 }
 
 /// For the calls whose whole answer is that they worked.

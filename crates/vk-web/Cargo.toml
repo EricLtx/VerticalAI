@@ -1,0 +1,38 @@
+[package]
+name = "vk-web"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "VerticalAI web: passkey enrolment and approval pages, served by vkd on loopback"
+
+[dependencies]
+vk-contracts = { path = "../vk-contracts" }
+vk-kernel = { path = "../vk-kernel" }
+axum = "0.8"
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+base64.workspace = true
+hex.workspace = true
+rand.workspace = true
+# The WebAuthn verifier (SP1b Task 5): registration and assertion checks are
+# its, never this crate's. `webauthn-rs` verifies with OpenSSL; `vendored`
+# builds that from source so the same build works on every OS and CI runner
+# without a system OpenSSL — the same choice `keyring` makes for dbus. On
+# Windows the vendored build needs a Windows-native Perl (Strawberry Perl on
+# PATH, or `OPENSSL_SRC_PERL=<path to perl.exe>`); see the README.
+webauthn-rs = "0.5"
+openssl = { version = "0.10", features = ["vendored"] }
+# The operator's user handle is derived from the node id (v5), not stored.
+uuid = { workspace = true, features = ["v5"] }
+url = "2"
+
+[dev-dependencies]
+# The software authenticator that stands in for Windows Hello in tests.
+webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
+vk-store = { path = "../vk-store" }
+reqwest.workspace = true
+tempfile = "3"

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Approve {{task_id}} — VerticalAI</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 3rem auto; max-width: 40rem; padding: 0 1rem; color: #222; background: #fff; }
+  h1 { font-size: 1.4rem; }
+  code { background: #f2f2f2; padding: 0 .3em; word-break: break-all; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: .3rem 1rem; }
+  dt { color: #555; }
+  button { font: inherit; padding: .6em 1.2em; border: 1px solid #333; background: #fff; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { margin-top: 1.5rem; min-height: 1.5em; }
+  #status.ok { color: #060; }
+  #status.err { color: #900; }
+  p.note { color: #555; font-size: .95rem; }
+</style>
+</head>
+<body>
+<h1>Approve task <code>{{task_id}}</code></h1>
+<dl>
+  <dt>Goal</dt><dd>{{goal}}</dd>
+  <dt>Artefact</dt><dd>{{artefact}}</dd>
+  <dt>Hash</dt><dd><code>{{subject}}</code></dd>
+</dl>
+<p class="note">Approving signs exactly this hash with your passkey: a later
+artefact is not covered by it. The challenge you sign was minted by the
+kernel a moment ago and is good for two minutes.</p>
+<p><button id="go" data-task="{{task_id}}">Approve with Windows Hello</button></p>
+<p id="status"></p>
+<script src="/vk.js"></script>
+</body>
+</html>

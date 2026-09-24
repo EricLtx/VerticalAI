@@ -43,6 +43,7 @@ cargo fmt --all -- --check
 Windows notes:
 - Install Visual Studio 2022 Build Tools with the "Desktop development with C++" workload before `rustup`. The GNU host toolchain does not work here: rustup's self-contained `dlltool` cannot build the import libraries that `raw-dylib` crates (`getrandom`, `windows-sys`) need.
 - Build outside OneDrive-synced folders: `set CARGO_TARGET_DIR=%USERPROFILE%\.cargo-target\verticalai`.
+- The passkey verifier (`vk-web`, SP1b) is `webauthn-rs`, which verifies with OpenSSL built from source (`openssl/vendored`). That build needs a **Windows-native Perl**: install [Strawberry Perl](https://strawberryperl.com/) (`winget install StrawberryPerl.StrawberryPerl`) or point `OPENSSL_SRC_PERL` at a portable one's `perl.exe`. Git for Windows' Perl does not do — OpenSSL's `Configure` cannot even load under it. The first build takes about fifteen minutes (no assembler: `nasm` is optional and speeds it up); every later build reuses it. GitHub's Windows runners have Strawberry Perl already; Linux and macOS need only `perl` and a C compiler.
 
 ## Running the kernel (SP1a)
 
@@ -61,7 +62,8 @@ table or, with `--json`, as the daemon's own answer.
 | `vk mount mock NAME`, `vk mount claude-code`, `vk mount ollama --model TAG`, `vk umount ID` | drivers: an arch is a device this kernel drives — and, for `ollama`, a process it starts and caps |
 | `vk task submit` / `step` / `show` | processes: a task is the unit of work, its register is its address space |
 | `vk stop [SCOPE]`, `vk resume ID` | signals: a STOP halts a scope until a human lifts it |
-| `vk approve ID` | the human ceremony: an approval signed by an enrolled device (invariant I1) |
+| `vk approve ID [--passkey]` | the human ceremony: an approval of a kernel-minted challenge, signed by this node's device key or by a passkey in the browser (invariant I1) |
+| `vk passkey enroll [--open]`, `vk passkey ls` | the human's own device: a passkey (Windows Hello, a phone) enrolled through the browser |
 | `vk dmesg -n N` | the kernel ring buffer: the tail of the hash-chained ledger |
 | `vk ledger verify` | `fsck` for the record |
 | `vk man [NAME]` | the contracts this kernel speaks — the syscall ABI, out of `contracts/schemas/` |
@@ -135,6 +137,56 @@ call from its own estimate, and after it from the server's `prompt_eval_count`.
 Nothing is billed, so there is no `COST`; what `vk top` shows is the tokens the
 server itself counted.
 
+### The human ceremony: passkeys and kernel-minted challenges
+
+Every human approval answers a **challenge the kernel minted** for the task:
+`vk approve` asks the daemon for it (`approval.challenge`), signs its digest
+with the node's device key and presents it; the daemon accepts a challenge it
+minted, once, while it is unexpired — and nothing a client built itself. That
+is invariant I1 made concrete: no client ever chooses the subject, the nonce or
+the expiry a human signs.
+
+The device key in the OS keyring is SP1a's stand-in for a human. The passkey
+is the human's own device: Windows Hello today, a phone's passkey later.
+
+```
+vk passkey enroll                       # prints http://localhost:7734/enroll?t=…; --open opens it
+vk passkey ls                           # DEVICE  ENROLLED (ms)
+vk approve $TASK --passkey              # prints the approval link, waits for Windows Hello
+vk approve $TASK --passkey --open --timeout 120
+```
+
+`vkd` serves the two pages on loopback (`--web-port`, default 7734; `0` lets
+the OS pick, and `vk status` shows the `web` origin). The pages open only from
+a link the daemon minted over its endpoint — the pipe's ACL carried over to
+HTTP — and a link is good for ten minutes, for one page and one task. On the
+approval page the daemon mints the task's challenge, keeps it beside the
+WebAuthn request state, verifies the assertion in-process with `webauthn-rs`
+against the enrolled passkey, records the approval with `proof: webauthn`, and
+runs the step that was waiting; `vk approve --passkey` sees the task leave
+`waiting_human` and prints the result. `contracts/tcb.md` says what is and is
+not claimed of it.
+
+**Windows Hello, by hand** (the check no test can make):
+
+1. `vk boot` (any state directory), `vk mount mock m1`, then a task with
+   `--approve` stepped to `waiting_human`, as in the walk-through below.
+2. `vk passkey enroll --open`. Edge or Chrome opens
+   `http://localhost:7734/enroll?t=…`; press *Enrol with Windows Hello*, choose
+   *This device* when the browser asks where to save the passkey, and confirm
+   with your PIN, fingerprint or face. The page prints `Enrolled passkey:…`;
+   `vk passkey ls` lists it and `vk dmesg` shows `device.enrolled`.
+3. `vk approve $TASK --passkey --open`. The page shows the goal and the hash;
+   press *Approve with Windows Hello* and confirm. The page says the task is
+   `done` (or `running`, with more steps to go), the shell prints
+   `approved sha256:…`, and `vk dmesg` shows `approval.recorded`.
+4. Open the same link again: `404`. Run `vk approve $TASK --passkey` for a
+   task that is not waiting: refused, no link minted. Open
+   `http://localhost:7734/enroll` without a link: `404`.
+
+A phone's passkey works through the same pages once the browser can reach it
+(a QR code from Edge or Chrome); nothing on the daemon's side is different.
+
 ### What boot does
 
 `vkd` verifies the ledger chain before it serves anything and reports what it
@@ -164,6 +216,7 @@ node `forced boot`, next to the chain line, for as long as that process runs.
 | master key | OS keyring, service `vk`, user `master` | `--master-key-file FILE` (tests and CI) |
 | node device key | OS keyring | `--node-key-file FILE`, or `$VK_NODE_KEY_FILE` |
 | endpoint | `\\.\pipe\vk-<user>` (Windows); `$XDG_RUNTIME_DIR/vk.sock`, else `/tmp/vk-<user>/vk.sock` (Unix) | `--endpoint EP`, or `$VK_ENDPOINT` |
+| passkey pages | `http://localhost:7734`, on loopback only | `--web-port PORT` (`0`: one the OS picks) |
 
 `$VK_ENDPOINT` and `$VK_NODE_KEY_FILE` are read by `vk` only: a daemon on a
 non-default endpoint is always started with `--endpoint`, and `vk boot` passes

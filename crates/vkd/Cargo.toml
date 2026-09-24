@@ -14,6 +14,8 @@ path = "src/main.rs"
 vk-kernel = { path = "../vk-kernel" }
 vk-store = { path = "../vk-store" }
 vk-ipc = { path = "../vk-ipc" }
+# The passkey pages (SP1b Task 5), served on loopback beside the endpoint.
+vk-web = { path = "../vk-web" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

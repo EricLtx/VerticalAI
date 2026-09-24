@@ -48,6 +48,28 @@ struct Args {
     /// How long one harness run may take before its tree is killed.
     #[arg(long, default_value_t = 300)]
     harness_timeout_secs: u64,
+    /// Loopback port for the passkey pages (`vk passkey enroll`, `vk approve
+    /// --passkey`): `127.0.0.1:<port>`, never a routable address. `0` asks the
+    /// OS for a port, for tests; `vk status` says which one was taken.
+    #[arg(long, default_value_t = vk_web::DEFAULT_PORT)]
+    web_port: u16,
+}
+
+/// The transport's view of the pages: `web.link` mints into the pages' own
+/// link table. `vk-ipc` knows the trait, `vk-web` knows the pages, and this
+/// binary is where the two meet.
+struct LinkMinter(Arc<vk_web::Links>);
+
+impl vk_ipc::server::WebLinks for LinkMinter {
+    fn origin(&self) -> String {
+        self.0.origin().to_string()
+    }
+    fn enroll_link(&self, now_ms: u64) -> String {
+        self.0.enroll_link(now_ms)
+    }
+    fn approve_link(&self, task_id: &str, now_ms: u64) -> String {
+        self.0.approve_link(task_id, now_ms)
+    }
 }
 
 #[tokio::main]
@@ -105,6 +127,14 @@ async fn main() -> anyhow::Result<()> {
     let listener = vk_ipc::transport::os::bind(&endpoint)
         .await
         .with_context(|| format!("bind {}", endpoint.0))?;
+    // The pages' port too, before the record, for the same reason: a port
+    // another daemon holds is a start that is refused, not a node that
+    // serves half of its ceremony.
+    let web_listener = vk_web::bind(a.web_port).await?;
+    let web_port = web_listener
+        .local_addr()
+        .context("the web listener's address")?
+        .port();
     if a.auto_enroll_node {
         let source = match a.node_key_file {
             Some(p) => vk_kernel::presence::KeySource::File(p),
@@ -168,6 +198,17 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!(endpoint = %endpoint.0, "vkd listening");
     let kernel = Arc::new(Mutex::new(kernel));
+    // The passkey pages, on loopback beside the endpoint (SP1b Task 5). They
+    // share the kernel mutex with the transport and take it the same way —
+    // for a call, never across an await. A link into them is minted only
+    // over the endpoint (`web.link`), so the pages inherit its ACL.
+    let web = vk_web::build(kernel.clone(), &a.node_id, web_port)?;
+    tracing::info!(web = %web.links.origin(), "passkey pages listening");
+    tokio::spawn(async move {
+        if let Err(e) = vk_web::serve(web_listener, web.router).await {
+            tracing::error!(error = %format!("{e:#}"), "the passkey pages stopped serving");
+        }
+    });
     // Alongside the serving, never in front of it (Task 1b review, Important
     // 1). The endpoint is bound and `boot()` has run, so `vk status` and
     // `vk ls /arches` answer from this moment on, while the arches come up one
@@ -185,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
             model: Some(a.harness_model),
             timeout: std::time::Duration::from_secs(a.harness_timeout_secs),
         },
+        web: Some(Arc::new(LinkMinter(web.links))),
     };
     vk_ipc::server::serve_on(kernel, listener, config).await
 }

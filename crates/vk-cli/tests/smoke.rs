@@ -672,6 +672,8 @@ fn vk_boot_detaches_a_daemon_it_can_be_asked_to_stop_and_will_not_serve_two_stat
         &master,
         "--node-key-file",
         &key,
+        "--web-port",
+        "0",
         "--json",
     ];
     let boot_elsewhere = [
@@ -682,6 +684,8 @@ fn vk_boot_detaches_a_daemon_it_can_be_asked_to_stop_and_will_not_serve_two_stat
         &master,
         "--node-key-file",
         &key,
+        "--web-port",
+        "0",
         "--json",
     ];
     assert!(vkd.exists());
@@ -984,6 +988,9 @@ fn vkd_cmd(dir: &std::path::Path, endpoint: &str, extra: &[&str]) -> Command {
         .arg("--node-key-file")
         .arg(dir.join("node.key"))
         .arg("--auto-enroll-node")
+        // An OS-chosen port for the passkey pages: these daemons run in
+        // parallel, and beside whatever daemon the machine's owner has up.
+        .args(["--web-port", "0"])
         .args(extra);
     c
 }
@@ -1242,6 +1249,8 @@ fn vk_boot_reports_the_daemons_refusal_and_serves_only_when_forced() {
         &master,
         "--node-key-file",
         &key,
+        "--web-port",
+        "0",
         "--json",
     ];
 
@@ -1662,6 +1671,8 @@ fn a_node_with_slow_arches_serves_while_they_start_and_vk_boot_does_not_kill_it(
         &master,
         "--node-key-file",
         &key,
+        "--web-port",
+        "0",
         "--json",
     ];
     let started = Instant::now();
@@ -1748,4 +1759,179 @@ fn a_node_with_slow_arches_serves_while_they_start_and_vk_boot_does_not_kill_it(
     );
     assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
     drop(daemon);
+}
+
+/// One raw HTTP/1.1 GET against the daemon's loopback pages: the status line
+/// and the body, with no HTTP client in the way.
+fn http_get(port: u16, path_and_query: &str) -> (u16, String) {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect to the pages");
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    write!(
+        s,
+        "GET {path_and_query} HTTP/1.1\r\nHost: localhost:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or_else(|| panic!("no status line in {text}"));
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
+/// The passkey verbs, as far as a shell can drive them without a browser and
+/// an authenticator (SP1b Task 5): `vk status` names the pages' origin; `vk
+/// passkey ls` says none is enrolled; `vk passkey enroll` prints a link that
+/// opens the enrolment page, and only a link does; `vk approve --passkey`
+/// prints the approval page's link and waits, then times out when nobody
+/// approves; and `vk approve` with the node key still completes the task
+/// through the kernel-minted challenge. The Windows Hello half is the
+/// founder's manual check (README).
+#[test]
+fn vk_passkey_verbs_print_links_that_open_the_pages_and_approve_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    let status = wait_until(&sh, true, "vkd did not answer").expect("status");
+    let origin = str_of(&status, "web").to_string();
+    assert!(
+        origin.starts_with("http://localhost:"),
+        "the pages' origin: {status}"
+    );
+    let port: u16 = origin.rsplit(':').next().unwrap().parse().unwrap();
+    let rendered = sh.ok(&["status"]);
+    assert!(
+        rendered.contains("web") && rendered.contains(&origin),
+        "the rendered status names the origin: {rendered}"
+    );
+
+    // Nothing enrolled yet, in both renderings.
+    assert_eq!(sh.json(&["passkey", "ls", "--json"]), serde_json::json!([]));
+    assert!(sh.ok(&["passkey", "ls"]).contains("no passkey enrolled"));
+
+    // The enrolment link: printed, not opened (no `--open`), and it opens
+    // the page — where no link, or a made-up one, does.
+    let enroll = sh.json(&["passkey", "enroll", "--json"]);
+    let url = str_of(&enroll, "url").to_string();
+    assert!(
+        url.starts_with(&format!("{origin}/enroll?t=")),
+        "an enrol link on the pages' origin: {url}"
+    );
+    assert_eq!(enroll["opened"], false);
+    let printed = sh.ok(&["passkey", "enroll"]);
+    assert!(
+        printed.contains(&format!("{origin}/enroll?t=")),
+        "the plain rendering prints the link too: {printed}"
+    );
+    let path = url.strip_prefix(&origin).unwrap();
+    let (code, body) = http_get(port, path);
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        body.contains("Enrol") && body.contains("/vk.js"),
+        "the enrolment page: {body}"
+    );
+    assert_eq!(http_get(port, "/enroll").0, 404, "no link, no page");
+    assert_eq!(http_get(port, "/enroll?t=made-up").0, 404);
+
+    // A task waiting for a human.
+    let arch = str_of(&sh.json(&["mount", "mock", "m1", "--json"]), "arch_id").to_string();
+    let task = str_of(
+        &sh.json(&[
+            "task",
+            "submit",
+            "--goal",
+            "Draft a proposal",
+            "--artefact",
+            "proposal",
+            "--plan",
+            &arch,
+            "--draft",
+            &arch,
+            "--approve",
+            "--json",
+        ]),
+        "id",
+    )
+    .to_string();
+    let waiting = sh.json(&["task", "step", &task, "--all", "--json"]);
+    assert_eq!(waiting["status"], "waiting_human", "{waiting}");
+
+    // `vk approve --passkey`: the link is printed at once, the approval page
+    // opens from it, and with nobody there to approve, the wait times out —
+    // non-zero, naming the task and the link, the task still waiting.
+    let started = Instant::now();
+    let out = sh.run(&["approve", &task, "--passkey", "--timeout", "1"]);
+    assert!(!out.status.success(), "nobody approved: the wait must fail");
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let prefix = format!("{origin}/approve/{task}?t=");
+    let link = stdout
+        .split_whitespace()
+        .find(|w| w.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("the approval link must be printed before the wait: {stdout}"))
+        .to_string();
+    assert!(
+        stderr.contains("no passkey approval") && stderr.contains(&task),
+        "{stderr}"
+    );
+    let (code, body) = http_get(port, link.strip_prefix(&origin).unwrap());
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        body.contains("Draft a proposal") && body.contains("Approve with Windows Hello"),
+        "the approval page shows the goal and the button: {body}"
+    );
+    assert_eq!(
+        http_get(port, &format!("/approve/{task}")).0,
+        404,
+        "no link, no page"
+    );
+    assert_eq!(
+        sh.json(&["task", "show", &task, "--json"])["status"],
+        "waiting_human"
+    );
+    // A task that is not waiting gets no link at all.
+    let refused = sh.run(&["approve", "task-none", "--passkey", "--timeout", "1"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("not found"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    // The node-key ceremony, through the kernel-minted challenge: still the
+    // way a shell approves without a browser, and it completes the task.
+    let approved = sh.json(&["approve", &task, "--json"]);
+    assert_eq!(approved["ok"], true, "{approved}");
+    let done = sh.json(&["task", "step", &task, "--all", "--json"]);
+    assert_eq!(done["status"], "done", "{done}");
+    // Once done, nothing is waiting: no challenge and no link can be minted.
+    let late = sh.run(&["approve", &task]);
+    assert!(!late.status.success());
+    assert!(
+        String::from_utf8_lossy(&late.stderr).contains("not waiting"),
+        "{}",
+        String::from_utf8_lossy(&late.stderr)
+    );
+    let tail = sh.json(&["dmesg", "-n", "8", "--json"]);
+    assert!(
+        dmesg_kinds(&tail).contains(&"approval.recorded"),
+        "the approval is on the record: {tail}"
+    );
 }

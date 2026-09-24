@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Enrol a passkey — VerticalAI</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 3rem auto; max-width: 40rem; padding: 0 1rem; color: #222; background: #fff; }
+  h1 { font-size: 1.4rem; }
+  code { background: #f2f2f2; padding: 0 .3em; }
+  button { font: inherit; padding: .6em 1.2em; border: 1px solid #333; background: #fff; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { margin-top: 1.5rem; min-height: 1.5em; }
+  #status.ok { color: #060; }
+  #status.err { color: #900; }
+  p.note { color: #555; font-size: .95rem; }
+</style>
+</head>
+<body>
+<h1>Enrol a passkey for node <code>{{node_id}}</code></h1>
+<p>This makes Windows Hello (or the passkey on your phone) the device that
+speaks for you on this node: every approval of a task's artefact will ask
+it to sign, and nothing else will be accepted as a human decision.</p>
+<p class="note">Your browser will ask which authenticator to use and then
+for your PIN, fingerprint or face. The kernel keeps only the public key,
+under a device id it will show you.</p>
+<p><button id="go">Enrol with Windows Hello</button></p>
+<p id="status"></p>
+<script src="/vk.js"></script>
+</body>
+</html>
