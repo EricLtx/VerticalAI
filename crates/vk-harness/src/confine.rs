@@ -22,16 +22,18 @@ use anyhow::Result;
 use std::process::Child;
 
 /// What the kernel does with a process it launched: hands it over to be
-/// contained, and asks whether that containment is real.
+/// contained, and asks whether that containment was verified.
 pub trait Governor: Send + Sync {
     /// Puts a running child under this governor. An error means the child is
     /// *not* contained — the caller decides whether to kill it or run it
     /// ungoverned, and says `governed: false` if it does.
     fn contain(&self, child: &Child) -> Result<()>;
 
-    /// Whether what this governor contains is actually governed: the answer
-    /// the manifest's `governed` field carries. [`JobGovernor`] says yes;
-    /// [`NoopGovernor`] says no.
+    /// Whether containment was verified: true only when a
+    /// [`contain`](Governor::contain) has succeeded with the OS confirming
+    /// the process is under this governor — the answer the manifest's
+    /// `governed` field carries. False before any `contain`, false after one
+    /// that failed, and always false for [`NoopGovernor`].
     fn governed(&self) -> bool;
 }
 
@@ -88,12 +90,16 @@ pub fn for_this_platform(
     }
     #[cfg(not(windows))]
     {
+        // One warning per governor made: this is the Noop's own, carrying the
+        // caps that nothing will enforce, so `new()` is not called on top.
         tracing::warn!(
             max_memory_bytes,
             ?cpu_rate_percent,
-            "no process governor on this platform until SP4; the caps asked for are not enforced"
+            "ungoverned: no process governor on this platform until SP4 — the caps asked for \
+             are not enforced, the process runs with no memory or CPU cap and does not die \
+             with the kernel"
         );
-        Ok(Box::new(NoopGovernor::new()))
+        Ok(Box::new(NoopGovernor { _private: () }))
     }
 }
 
@@ -108,6 +114,7 @@ mod job {
     use std::mem::size_of;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::process::Child;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use windows::core::BOOL;
     use windows::Win32::Foundation::{HANDLE, STILL_ACTIVE};
     use windows::Win32::System::JobObjects::{
@@ -120,7 +127,7 @@ mod job {
         JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
     };
-    use windows::Win32::System::Threading::GetExitCodeProcess;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetExitCodeProcess};
 
     /// A Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, a
     /// memory cap and, when asked, a hard CPU cap. Its one handle is owned
@@ -140,10 +147,20 @@ mod job {
     /// already in a job — this kernel's own children are, when the kernel runs
     /// under one — is assigned to a fresh job by nesting, so no breakaway is
     /// asked of the parent job.
+    ///
+    /// `governed()` is not a property of the job but of what was put in it
+    /// (Ruling 18): it is true only once a [`contain`](Governor::contain) has
+    /// read back from the OS that the process is in the job, and it is false
+    /// for good once a `contain` has failed — a governor that was refused one
+    /// process cannot claim the tree it governs is whole.
     pub struct JobGovernor {
         job: OwnedHandle,
         max_memory_bytes: u64,
         cpu_rate_percent: Option<u32>,
+        /// Set only where `IsProcessInJob` answered yes for a contained child.
+        verified: AtomicBool,
+        /// Set where a `contain` returned an error; never cleared.
+        refused: AtomicBool,
     }
 
     impl JobGovernor {
@@ -174,6 +191,8 @@ mod job {
                 job,
                 max_memory_bytes,
                 cpu_rate_percent,
+                verified: AtomicBool::new(false),
+                refused: AtomicBool::new(false),
             };
 
             let limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
@@ -250,15 +269,13 @@ mod job {
             unsafe { IsProcessInJob(process, Some(self.handle()), &mut inside) }?;
             Ok(inside.as_bool())
         }
-    }
 
-    impl Governor for JobGovernor {
-        /// Assigns the child to the job, then asks the OS whether it is in it.
-        /// A child that is in it already is left there: a second call is not
-        /// a second job. A refusal is returned with its cause looked up: the
-        /// process gone already, or a job it is already in that would not
-        /// nest this one.
-        fn contain(&self, child: &Child) -> Result<()> {
+        /// Assigns the child to the job and answers `Ok` only once the OS has
+        /// read back that it is in it. A child that is in it already is left
+        /// there: a second call is not a second job. A refusal carries its
+        /// cause, looked up: the process gone already, or a job it is already
+        /// in that would not nest this one.
+        fn assign(&self, child: &Child) -> Result<()> {
             let pid = child.id();
             let process = HANDLE(child.as_raw_handle());
             if self
@@ -289,9 +306,23 @@ mod job {
             }
             Ok(())
         }
+    }
+
+    impl Governor for JobGovernor {
+        /// [`JobGovernor::assign`], remembered: a positive read-back is what
+        /// makes [`governed`](Governor::governed) true, and a failure is what
+        /// makes it false from then on.
+        fn contain(&self, child: &Child) -> Result<()> {
+            let outcome = self.assign(child);
+            match &outcome {
+                Ok(()) => self.verified.store(true, Ordering::SeqCst),
+                Err(_) => self.refused.store(true, Ordering::SeqCst),
+            }
+            outcome
+        }
 
         fn governed(&self) -> bool {
-            true
+            self.verified.load(Ordering::SeqCst) && !self.refused.load(Ordering::SeqCst)
         }
     }
 
@@ -312,57 +343,92 @@ mod job {
     /// Why `AssignProcessToJobObject` said no. It answers `ERROR_ACCESS_DENIED`
     /// both for a process that has exited and for one whose current job
     /// refuses to nest a new one under it, so the difference is looked up
-    /// here, for the caller to log the true reason.
+    /// here, for the caller to log the true reason. A look-up that fails is
+    /// reported as exactly that — the query and its error — never as a guess.
     fn refusal_cause(process: HANDLE) -> String {
         let mut code = 0u32;
         // SAFETY: `process` is an open process handle (its `Child` is borrowed
         // by the caller) and `code` outlives the call.
-        let exited = unsafe { GetExitCodeProcess(process, &mut code) }.is_ok()
-            && code != STILL_ACTIVE.0 as u32;
-        if exited {
-            return format!("the process had already exited with code {code}");
+        match unsafe { GetExitCodeProcess(process, &mut code) } {
+            Err(e) => {
+                return format!(
+                    "whether the process is still running could not be determined \
+                     (GetExitCodeProcess: {e})"
+                );
+            }
+            Ok(()) if code != STILL_ACTIVE.0 as u32 => {
+                return format!("the process had already exited with code {code}");
+            }
+            Ok(()) => {}
         }
 
         let mut in_job = BOOL(0);
         // SAFETY: as above; a `None` job asks about any job at all.
-        let in_job =
-            unsafe { IsProcessInJob(process, None, &mut in_job) }.is_ok() && in_job.as_bool();
-        if !in_job {
-            return "the process is running and in no job object; the process handle may lack \
-                    PROCESS_SET_QUOTA | PROCESS_TERMINATE"
-                .to_owned();
+        match unsafe { IsProcessInJob(process, None, &mut in_job) } {
+            Err(e) => {
+                return format!(
+                    "whether the process is in a job object could not be determined \
+                     (IsProcessInJob: {e})"
+                );
+            }
+            Ok(()) if !in_job.as_bool() => {
+                return "the process is running and in no job object; the process handle may \
+                        lack PROCESS_SET_QUOTA | PROCESS_TERMINATE"
+                    .to_owned();
+            }
+            Ok(()) => {}
         }
 
-        // It is in a job already — inherited from this process's own, or set
-        // by someone else — whose hierarchy would not nest this job under it.
-        // Would a launch that breaks away from our own job have been allowed?
-        let mut parent = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        // SAFETY: a `None` job handle queries the calling process's own job;
-        // the pointer and the length describe `parent`, alive for the call.
-        let parent_flags = unsafe {
-            QueryInformationJobObject(
-                None,
-                JobObjectExtendedLimitInformation,
-                &mut parent as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION as *mut c_void,
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                None,
-            )
-        }
-        .ok()
-        .map(|()| parent.BasicLimitInformation.LimitFlags);
-        let breakaway = match parent_flags {
-            Some(flags)
-                if flags.contains(JOB_OBJECT_LIMIT_BREAKAWAY_OK)
-                    || flags.contains(JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK) =>
-            {
-                "permitted"
+        // It is in a job already whose hierarchy would not nest this job under
+        // it. If that job is this process's own — inherited by the child when
+        // it was spawned — the question is whether a launch that breaks away
+        // from it would have been allowed.
+        let mut own = BOOL(0);
+        // SAFETY: `GetCurrentProcess` is the calling process's pseudo-handle,
+        // valid for the life of the process; `own` outlives the call.
+        let breakaway = match unsafe { IsProcessInJob(GetCurrentProcess(), None, &mut own) } {
+            Err(e) => format!("unknown (IsProcessInJob on this process: {e})"),
+            Ok(()) if !own.as_bool() => {
+                "moot: this process is in no job of its own, so the child's job was set by \
+                 something else"
+                    .to_owned()
             }
-            Some(_) => "not permitted",
-            None => "moot: this process is in no job of its own",
+            Ok(()) => own_job_breakaway(),
         };
         format!(
             "the process is already in a job object that refused to nest this one; \
              breakaway from this process's own job is {breakaway} (JOB_OBJECT_LIMIT_BREAKAWAY_OK)"
         )
+    }
+
+    /// Whether the calling process's own job permits breakaway, by its limit
+    /// flags — or why that could not be read.
+    fn own_job_breakaway() -> String {
+        let mut own_job = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        // SAFETY: a `None` job handle queries the calling process's own job;
+        // the pointer and the length describe `own_job`, alive for the call.
+        match unsafe {
+            QueryInformationJobObject(
+                None,
+                JobObjectExtendedLimitInformation,
+                &mut own_job as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION as *mut c_void,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                None,
+            )
+        } {
+            Err(e) => {
+                format!("unknown (QueryInformationJobObject on this process's own job: {e})")
+            }
+            Ok(()) => {
+                let flags = own_job.BasicLimitInformation.LimitFlags;
+                if flags.contains(JOB_OBJECT_LIMIT_BREAKAWAY_OK)
+                    || flags.contains(JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)
+                {
+                    "permitted".to_owned()
+                } else {
+                    "not permitted".to_owned()
+                }
+            }
+        }
     }
 }

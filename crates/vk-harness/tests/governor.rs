@@ -1,6 +1,7 @@
 //! The governor against real children: a `cmd /c ping` that outlives its
 //! governor by nothing, a PowerShell that cannot allocate past the cap, an
-//! assignment refused for a process that is already gone — and, on every
+//! assignment refused for a process that is already gone, a `governed()`
+//! that answers yes only for a containment the OS read back — and, on every
 //! platform, the no-op governor, which contains nothing and says so.
 //!
 //! Every child is spawned behind [`Reaper`], so a failed assertion kills what
@@ -56,6 +57,23 @@ fn quick_child() -> Child {
         .expect("spawn a quick child")
 }
 
+/// A child that would live about thirty seconds on its own, on any platform.
+fn long_lived_child() -> Child {
+    let mut cmd = if cfg!(windows) {
+        let mut cmd = Command::new("ping");
+        cmd.args(["-n", "30", "127.0.0.1"]);
+        cmd
+    } else {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        cmd
+    };
+    cmd.stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn a long-lived child")
+}
+
 #[test]
 fn the_noop_governor_contains_nothing_and_says_so() {
     let governor = NoopGovernor::new();
@@ -74,10 +92,18 @@ fn the_noop_governor_contains_nothing_and_says_so() {
 #[test]
 fn the_platform_governor_claims_only_what_it_enforces() {
     let governor = for_this_platform(256 << 20, None).expect("every platform has a governor");
+    assert!(
+        !governor.governed(),
+        "nothing is governed before a containment, on any platform"
+    );
+    let child = Reaper(long_lived_child());
+    governor
+        .contain(&child.0)
+        .expect("a running child is contained, or the no-op governor refuses nothing");
     assert_eq!(
         governor.governed(),
         cfg!(windows),
-        "only the Job Object governs in SP1b"
+        "only the Job Object governs in SP1b, and only once the OS read the containment back"
     );
 }
 
@@ -110,11 +136,18 @@ mod job_object {
     #[test]
     fn dropping_the_governor_kills_the_child_within_two_seconds() {
         let governor = JobGovernor::new(512 << 20, None).expect("a job object with a 512 MiB cap");
-        assert!(governor.governed(), "a job object governs");
+        assert!(
+            !governor.governed(),
+            "nothing is governed before a containment"
+        );
         let mut child = Reaper(ping_tree());
         governor
             .contain(&child.0)
             .expect("a running child is contained");
+        assert!(
+            governor.governed(),
+            "a containment the OS read back is governed"
+        );
         assert!(
             child.0.try_wait().expect("try_wait").is_none(),
             "the child lives while its governor does"
@@ -138,6 +171,46 @@ mod job_object {
         assert!(
             wait_exit(&mut child.0, Duration::from_secs(2)).is_some(),
             "the child was still running 2 s after its governor was dropped"
+        );
+    }
+
+    /// Ruling 18: `governed()` is the OS's read-back, remembered — false
+    /// before any containment, true after one the OS confirmed, false for a
+    /// governor whose containment failed, and false again for a governor
+    /// that was refused a process after containing another.
+    #[test]
+    fn governed_is_true_only_after_a_verified_containment() {
+        let governor = JobGovernor::new(512 << 20, None).expect("a job object");
+        assert!(
+            !governor.governed(),
+            "a fresh governor has verified nothing"
+        );
+        let child = Reaper(ping_tree());
+        governor
+            .contain(&child.0)
+            .expect("a running child is contained");
+        assert!(
+            governor.governed(),
+            "a containment the OS read back is governed"
+        );
+
+        let mut gone = quick_child();
+        gone.wait().expect("wait");
+        let refused = JobGovernor::new(512 << 20, None).expect("a job object");
+        refused
+            .contain(&gone)
+            .expect_err("a process that is gone cannot be contained");
+        assert!(
+            !refused.governed(),
+            "a governor whose containment failed governs nothing"
+        );
+
+        governor
+            .contain(&gone)
+            .expect_err("a process that is gone cannot be contained");
+        assert!(
+            !governor.governed(),
+            "a governor refused one process cannot claim its tree is whole"
         );
     }
 
@@ -180,8 +253,16 @@ mod job_object {
             .expect_err("a process that is gone cannot be contained");
         let text = format!("{err:#}");
         assert!(
-            text.contains("already exited") && text.contains('3'),
-            "the error names the cause: {text}"
+            text.contains("had already exited with code 3"),
+            "the error names the exit code it found: {text}"
+        );
+        assert!(
+            text.contains("0x80070005"),
+            "the OS refusal, ERROR_ACCESS_DENIED, stays in the chain: {text}"
+        );
+        assert!(
+            !governor.governed(),
+            "a refused containment governs nothing"
         );
     }
 
