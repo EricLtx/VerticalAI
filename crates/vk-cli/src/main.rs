@@ -147,6 +147,48 @@ enum MountCmd {
         #[arg(long, default_value_t = 180)]
         timeout: u32,
     },
+    /// A Gemma-class model on this machine, served by Ollama in a container
+    /// this kernel starts, caps and can stop.
+    ///
+    /// The governed arch: the inference is a process the kernel contains, on
+    /// loopback, under a memory and CPU cap, so nothing about the call leaves
+    /// this node. Its context ceiling is half the window asked for — Ollama
+    /// silently truncates past that (spike 1a) and this node refuses instead.
+    Ollama {
+        /// The model tag, as Ollama names it (`gemma4:e4b`, `gemma3:1b`).
+        #[arg(long)]
+        model: String,
+        /// Run it in a container this kernel starts and caps. The default.
+        #[arg(long, conflicts_with = "external")]
+        container: bool,
+        /// Use an Ollama already serving at this URL instead. Not governed:
+        /// this node did not start that process and cannot cap it.
+        #[arg(long, value_name = "URL")]
+        external: Option<String>,
+        /// Context window asked of the server. Half of it is usable.
+        #[arg(long, default_value_t = 8192)]
+        ctx: u32,
+        // The three container flags are refused beside `--external`, rather
+        // than ignored: a cap named for a server this node does not start is
+        // a cap that would never be applied, and silently dropping it is how
+        // somebody ends up believing an ungoverned arch is capped.
+        /// Memory cap for the container, in Docker's syntax.
+        #[arg(long, default_value = "12g", conflicts_with = "external")]
+        memory: String,
+        /// CPU cap for the container, in Docker's syntax.
+        #[arg(long, default_value = "6", conflicts_with = "external")]
+        cpus: String,
+        /// The Ollama image. Pinned: the version is in the arch identity.
+        #[arg(
+            long,
+            default_value = "ollama/ollama:0.33.3",
+            conflicts_with = "external"
+        )]
+        image: String,
+        /// Sampling seed. Part of the arch identity.
+        #[arg(long, default_value_t = 7)]
+        seed: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -338,6 +380,49 @@ async fn call(cli: &Cli) -> Result<()> {
                 cli,
                 json!({ "draft": draft, "judge": judge }),
                 render::mounted_roles,
+            )
+        }
+        // One mount, one arch: a local model is one engine, and which role it
+        // is given is the task's to say.
+        Cmd::Mount {
+            what:
+                MountCmd::Ollama {
+                    model,
+                    container: _,
+                    external,
+                    ctx,
+                    memory,
+                    cpus,
+                    image,
+                    seed,
+                },
+        } => {
+            // `--container` is the default, so it needs no branch of its own;
+            // naming a server is what switches the mode, and the daemon reads
+            // exactly that: a `base_url` means external, its absence means the
+            // container this node governs.
+            let mut config = json!({
+                "model": model,
+                "num_ctx": ctx,
+                "seed": seed,
+            });
+            match external {
+                Some(url) => config["base_url"] = json!(url),
+                None => {
+                    config["image"] = json!(image);
+                    config["memory"] = json!(memory);
+                    config["cpus"] = json!(cpus);
+                }
+            }
+            show(
+                cli,
+                c.call(
+                    "arch.mount",
+                    json!({ "kind": "ollama", "config": config }),
+                    None,
+                )
+                .await?,
+                render::mounted_arch,
             )
         }
         Cmd::Umount { arch_id } => show(

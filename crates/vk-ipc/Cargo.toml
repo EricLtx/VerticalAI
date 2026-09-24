@@ -10,6 +10,7 @@ description = "VerticalAI IPC: local transport between vk CLI and vkd"
 vk-contracts = { path = "../vk-contracts" }
 vk-kernel = { path = "../vk-kernel" }
 vk-arch-claude-code = { path = "../vk-arch-claude-code" }
+vk-arch-ollama = { path = "../vk-arch-ollama" }
 vk-store = { path = "../vk-store" }
 tokio.workspace = true
 serde.workspace = true

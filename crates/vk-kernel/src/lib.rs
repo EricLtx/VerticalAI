@@ -144,6 +144,13 @@ struct BootForcedRecord<'a> {
 struct InferRecord<'a> {
     arch_id: &'a str,
     register: &'a str,
+    /// Which half of the call this record is: `requested` before the prompt is
+    /// handed to the adapter, `completed` once it has answered (SP1b review,
+    /// M2). Two events of one kind rather than two kinds, because they are one
+    /// thing — a call — and an auditor reading the chain wants them adjacent
+    /// and comparable. A `requested` with no `completed` after it is a call
+    /// that left this kernel and never came back.
+    phase: &'a str,
     /// Prompt tokens: the arch's own count when it reported one, this node's
     /// estimate otherwise. `measured` says which, so the record never leaves a
     /// reader guessing whether a number is a fact or a heuristic.
@@ -332,6 +339,10 @@ impl RealKernel {
             policies_version: self.load_policies_version()?,
         };
         self.log("boot", now_ms(), &report)?;
+        // After the `boot` event, so the record reads in the order things
+        // happened: this node came up, and then it found what the last one
+        // left half-done (SP1b review, M11).
+        self.recover_interrupted_steps(now_ms())?;
         Ok(report)
     }
 
@@ -796,20 +807,40 @@ impl Kernel for RealKernel {
         };
         // What the arch is actually handed, not a clamp of what we wished for.
         let estimated = count(&prompt);
-        let completion = adapter
-            .complete(&prompt, budget.min(1024))
-            .map_err(|e| adapter_failed(arch_id, e))?;
-        // An arch that counted the prompt itself has the number; the estimate
-        // was only ever a stand-in for it (ruling 7).
-        let tokens_in = completion.tokens_in_measured.unwrap_or(estimated);
-        // The call has left the kernel: record it before doing anything that
-        // could fail, or a real send to a real arch could leave no trace.
+        // The prompt is about to leave this kernel. Record the attempt before
+        // it does: an engine can hang, be killed, or take the machine down
+        // with it, and an inference that happened with nothing in the record
+        // saying so is the one gap an auditor cannot close afterwards (SP1b
+        // review, M2). This half knows only the estimate — the measurement is
+        // what comes back — so it says `measured: false` and claims nothing.
         self.log(
             "infer",
             ctx.now_ms,
             &InferRecord {
                 arch_id,
                 register: &reg_id.0,
+                phase: "requested",
+                tokens_in: estimated,
+                measured: false,
+                cost_list_usd: None,
+                details: None,
+            },
+        )?;
+        let completion = adapter
+            .complete(&prompt, budget.min(1024))
+            .map_err(|e| adapter_failed(arch_id, e))?;
+        // An arch that counted the prompt itself has the number; the estimate
+        // was only ever a stand-in for it (ruling 7).
+        let tokens_in = completion.tokens_in_measured.unwrap_or(estimated);
+        // The call has come back: record it before doing anything that could
+        // fail, so the answer is never acted on before it is written down.
+        self.log(
+            "infer",
+            ctx.now_ms,
+            &InferRecord {
+                arch_id,
+                register: &reg_id.0,
+                phase: "completed",
                 tokens_in,
                 measured: completion.tokens_in_measured.is_some(),
                 cost_list_usd: completion.cost_list_usd,
@@ -1654,6 +1685,65 @@ mod tests {
                 .iter()
                 .any(|e| e.kind == "infer" || e.kind == "infer.projected"),
             "a refused inference must not claim a projection it never made"
+        );
+    }
+
+    /// Review M2: a call that leaves the kernel has to be in the record
+    /// *before* it leaves. An adapter can hang, be killed, or take the machine
+    /// down with it, and an inference that happened with nothing saying so is
+    /// the one kind of gap an auditor cannot close afterwards. So `infer` is
+    /// appended twice — the same kind, with `phase` saying which half — and
+    /// the second one still carries everything the record carried before.
+    #[test]
+    fn a_send_is_recorded_before_it_leaves_and_again_when_it_comes_back() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let answers = scripted(&mut k, "answers", || {
+            Ok(arch::Completion {
+                text: "ok".into(),
+                tokens_in_measured: Some(12),
+                cost_list_usd: None,
+                details: None,
+            })
+        });
+        let dies = scripted(&mut k, "dies", || {
+            Err(arch::AdapterError::Other(anyhow::anyhow!(
+                "the engine went away"
+            )))
+        });
+        let r = k
+            .submit_task(&machine(1), "a goal", Label::bottom())
+            .unwrap();
+
+        k.infer(&machine(2), &answers, Capability::Plan, &r)
+            .unwrap();
+        let events = k.ledger().events().to_vec();
+        let infers: Vec<_> = events.iter().filter(|e| e.kind == "infer").collect();
+        assert_eq!(
+            infers.len(),
+            2,
+            "one record for the send, one for the answer"
+        );
+        assert_ne!(
+            infers[0].payload_hash, infers[1].payload_hash,
+            "the two halves must not hash alike, or `phase` is not in the payload"
+        );
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        let requested = kinds.iter().position(|x| *x == "infer").unwrap();
+        let written = kinds.iter().position(|x| *x == "register.written").unwrap();
+        assert!(requested < written, "{kinds:?}");
+
+        // A send that never comes back leaves the first record and no second.
+        let before = k.ledger().events().len();
+        assert!(k.infer(&machine(3), &dies, Capability::Plan, &r).is_err());
+        let after: Vec<&str> = k.ledger().events()[before..]
+            .iter()
+            .map(|e| e.kind.as_str())
+            .collect();
+        assert_eq!(
+            after,
+            ["infer"],
+            "the attempt belongs in the record even though no answer came: {after:?}"
         );
     }
 

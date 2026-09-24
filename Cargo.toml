@@ -22,6 +22,11 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+# The Ollama adapter's HTTP client. Blocking, because `ArchAdapter::complete`
+# is a synchronous call the kernel makes under its own lock; rustls rather than
+# the platform's TLS, so the same build works on all three CI runners; no
+# default features, so nothing else of reqwest's is pulled in behind it.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 directories = "5"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"

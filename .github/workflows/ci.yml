@@ -3,6 +3,7 @@ on:
   push:
     branches: ['**']
   pull_request:
+  workflow_dispatch:
 jobs:
   test:
     strategy:
@@ -18,6 +19,29 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+  arch-ollama:
+    # The Ollama adapter against a real container and a real model. Not on
+    # every branch push: it starts a container, pulls the 1B model and spends
+    # minutes of CPU, which is a cost worth paying on master and on request,
+    # not on every commit. The rest of the adapter's tests — the stand-in
+    # server, the refusals, the manifest — run in `test` above on all three
+    # operating systems, so a branch is still covered.
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/master') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Start Ollama under the caps the kernel imposes
+        run: docker run -d --name vk-ollama -p 127.0.0.1:11434:11434 -v vk-ollama:/root/.ollama --memory 12g --cpus 6 ollama/ollama:0.33.3
+      - name: Drive the real container
+        env:
+          VK_OLLAMA: '1'
+          # Never the demo model here: 9.6 GB a run.
+          VK_TEST_MODEL: gemma3:1b
+        run: cargo test -p vk-arch-ollama -- --ignored
+      - name: Stop the container
+        if: always()
+        run: docker rm -f vk-ollama
   sign:
     # Scaffold only: signs release binaries when a certificate secret exists (SP1 gate).
     if: ${{ github.event_name == 'push' }}

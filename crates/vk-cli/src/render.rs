@@ -241,6 +241,15 @@ pub fn top(v: &Value) -> String {
                 .map(|(id, s)| {
                     vec![
                         id.clone(),
+                        // Is the inference a process this kernel started and
+                        // capped? A dash for an arch that is no longer
+                        // mounted: its counters outlive it, its governance
+                        // does not (spec §3.3).
+                        match v["governed"][id].as_bool() {
+                            Some(true) => "yes".into(),
+                            Some(false) => "no".into(),
+                            None => "-".to_string(),
+                        },
                         text(&s["calls"]),
                         text(&s["tokens_in"]),
                         // How much of TOKENS the arch itself counted. A dash
@@ -260,6 +269,7 @@ pub fn top(v: &Value) -> String {
         table(
             &[
                 "ARCH",
+                "GOVERNED",
                 "CALLS",
                 "TOKENS",
                 "MEASURED",
@@ -380,6 +390,26 @@ pub fn release_paths(task: &Value, export_root: &str) -> Vec<String> {
 
 pub fn mounted(v: &Value) -> String {
     text(&v["arch_id"])
+}
+
+/// One arch, as `vk mount ollama` mounts it: what it is, the id every other
+/// verb takes, and whether the kernel contains the process behind it — which
+/// is the whole difference between a local model and a remote one, and the
+/// first thing the person who just mounted it should see.
+pub fn mounted_arch(v: &Value) -> String {
+    let governed = match v["governed"].as_bool() {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "-",
+    };
+    table(
+        &["ARCH", "ID", "GOVERNED"],
+        &[vec![
+            text(&v["name"]),
+            text(&v["arch_id"]),
+            governed.to_string(),
+        ]],
+    )
 }
 
 /// One arch per role, as `vk mount claude-code` mounts them: the role it is

@@ -1,0 +1,15 @@
+[package]
+name = "vk-arch-ollama"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "VerticalAI arch adapter: a Gemma-class model in an Ollama container this kernel starts and caps"
+
+[dependencies]
+vk-contracts = { path = "../vk-contracts" }
+vk-kernel = { path = "../vk-kernel" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true

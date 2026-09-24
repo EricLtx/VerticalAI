@@ -5,6 +5,8 @@
 use serde_json::Value;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// How long the daemon is given to answer its first request.
@@ -395,6 +397,216 @@ fn vk_mounts_two_claude_code_arches_and_a_task_runs_through_one() {
     assert!(
         screen.contains("0.00400"),
         "the cost belongs on the screen:\n{screen}"
+    );
+    assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
+}
+
+/// A stand-in Ollama on loopback: `/api/version`, `/api/tags`, `/api/show`, a
+/// 404 on `/api/tokenize` exactly as 0.33.3 gives, and one canned completion.
+/// Enough for `vk mount ollama --external` to mount a *real* adapter and for a
+/// task to run through it, without Docker, a model or nine gigabytes.
+///
+/// It serves from a thread of this test process, so the daemon — a separate
+/// process — reaches it over a loopback socket, which is the same path a real
+/// Ollama is reached by.
+struct FakeOllama {
+    url: String,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for FakeOllama {
+    fn drop(&mut self) {
+        // The thread is blocked in `accept`; one connection wakes it so it can
+        // see the flag. Nothing is joined: a failing test must not also hang.
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(self.url.trim_start_matches("http://"));
+    }
+}
+
+impl FakeOllama {
+    fn start(model: &str) -> FakeOllama {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (model, flag) = (model.to_string(), stop.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if flag.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Ok(mut stream) = stream else { continue };
+                let Some(path) = ollama_request_path(&stream) else {
+                    continue;
+                };
+                let (status, kind, body) = ollama_answer(&path, &model);
+                let head = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: {kind}\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n",
+                    body.len()
+                );
+                use std::io::Write;
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        FakeOllama { url, stop }
+    }
+}
+
+/// The five answers spike 1a measured, canned.
+fn ollama_answer(path: &str, model: &str) -> (&'static str, &'static str, String) {
+    const JSON: &str = "application/json";
+    match path {
+        "/api/version" => ("200 OK", JSON, r#"{"version":"0.33.3"}"#.into()),
+        "/api/tags" => (
+            "200 OK",
+            JSON,
+            format!(
+                r#"{{"models":[{{"name":"{model}","digest":"8648f39daa8fbf5b18c7b4e6a8fb4990c692751d49917417b8842ca5758e7ffc"}}]}}"#
+            ),
+        ),
+        "/api/show" => (
+            "200 OK",
+            JSON,
+            r#"{"details":{"family":"gemma3","parameter_size":"999.89M","quantization_level":"Q4_K_M"},
+                "model_info":{"gemma3.context_length":32768}}"#
+                .into(),
+        ),
+        // 0.33.3 has no tokenizer endpoint, and says so in plain text.
+        "/api/tokenize" => ("404 Not Found", "text/plain", "404 page not found".into()),
+        "/api/chat" => (
+            "200 OK",
+            JSON,
+            r#"{"message":{"role":"assistant","content":"a stand-in completion"},
+                "done":true,"done_reason":"stop","prompt_eval_count":42,"eval_count":5,
+                "eval_duration":900000000,"load_duration":250000000}"#
+                .into(),
+        ),
+        _ => ("404 Not Found", JSON, r#"{"error":"no such route"}"#.into()),
+    }
+}
+
+/// The path off the request line, with the body drained so the client is never
+/// left writing into a socket nobody is reading.
+fn ollama_request_path(stream: &std::net::TcpStream) -> Option<String> {
+    use std::io::{BufRead, Read};
+    let mut reader = std::io::BufReader::new(stream.try_clone().ok()?);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let path = line.split_whitespace().nth(1)?.to_string();
+    let mut length = 0usize;
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header).ok()? == 0 || header.trim_end().is_empty() {
+            break;
+        }
+        if let Some(v) = header
+            .to_ascii_lowercase()
+            .strip_prefix("content-length:")
+            .map(str::trim)
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            length = v;
+        }
+    }
+    let mut body = vec![0u8; length];
+    reader.read_exact(&mut body).ok()?;
+    Some(path)
+}
+
+/// `vk mount ollama` is the verb that mounts the *governed* kind of arch — and
+/// the one that has to be honest when it is not governed. Driven against the
+/// stand-in with `--external`, which is exactly the ungoverned case: the
+/// daemon did not start that server and cannot cap it, so the mount says so,
+/// and `vk top` keeps saying so for every call made on it.
+#[test]
+fn vk_mounts_an_external_ollama_as_ungoverned_and_a_task_runs_through_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+
+    let ollama = FakeOllama::start("gemma3:1b");
+    let mounted = sh.json(&[
+        "mount",
+        "ollama",
+        "--model",
+        "gemma3:1b",
+        "--external",
+        &ollama.url,
+        "--ctx",
+        "8192",
+        "--json",
+    ]);
+    let arch = str_of(&mounted, "arch_id").to_string();
+    assert_eq!(str_of(&mounted, "name"), "ollama/gemma3:1b");
+    assert_eq!(
+        mounted["governed"], false,
+        "a server this node did not start is not one it governs: {mounted}"
+    );
+    assert!(
+        sh.ok(&["ls", "/arches"]).contains(arch.as_str()),
+        "the mounted arch belongs in the namespace"
+    );
+
+    // The same mount, rendered for a person: the id, and the one thing about
+    // it that matters before a prompt is sent.
+    let plain = sh.ok(&[
+        "mount",
+        "ollama",
+        "--model",
+        "gemma3:1b",
+        "--external",
+        &ollama.url,
+    ]);
+    assert!(
+        plain.contains("GOVERNED") && plain.contains("no"),
+        "{plain}"
+    );
+    assert!(plain.contains("ollama/gemma3:1b"), "{plain}");
+
+    // And the adapter really drives the server: a task runs through it, and
+    // what `vk top` reports is the server's own count of the prompt.
+    let task = str_of(
+        &sh.json(&[
+            "task",
+            "submit",
+            "--goal",
+            "Say something",
+            "--plan",
+            &arch,
+            "--draft",
+            &arch,
+            "--json",
+        ]),
+        "id",
+    )
+    .to_string();
+    let done = sh.json(&["task", "step", &task, "--all", "--json"]);
+    assert_eq!(done["status"], "done", "{done}");
+
+    let top = sh.json(&["top", "--json"]);
+    let stats = &top["arches"][&arch];
+    assert_eq!(stats["calls"], 2, "{top}");
+    assert_eq!(
+        stats["tokens_in"], 84,
+        "the server counted the prompt twice over; we did not guess it: {top}"
+    );
+    assert_eq!(stats["tokens_in_measured"], stats["tokens_in"], "{top}");
+    assert_eq!(top["governed"][&arch], false, "{top}");
+    let screen = sh.ok(&["top"]);
+    assert!(
+        screen.contains("GOVERNED"),
+        "the operator's screen says which arches this kernel contains:\n{screen}"
     );
     assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
 }

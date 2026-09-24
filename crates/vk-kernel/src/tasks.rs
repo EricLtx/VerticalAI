@@ -68,6 +68,24 @@ pub struct Task {
     pub created_ms: u64,
 }
 
+/// What a step left `Running` by a process that died becomes at the next boot
+/// (SP1b review, M11). A reason, not a status of its own: to everything that
+/// reads a task this is a failed step, and the only special thing about it is
+/// that the failure was a restart.
+pub const INTERRUPTED: &str = "interrupted by restart";
+
+/// The `task.step` payload for one of those. The same event kind as a step
+/// that ran, because that is what this is — the end of a step — with the
+/// reason named, so an auditor can tell a step this node ended from one it
+/// finished.
+#[derive(Debug, Serialize)]
+struct InterruptedRecord<'a> {
+    task_id: &'a str,
+    step: usize,
+    status: &'a str,
+    reason: &'a str,
+}
+
 /// What a `Release` step put on the filesystem, as the `artefact.released`
 /// ledger event records it. Decrypted bytes leaving the kernel is the one thing
 /// an auditor must be able to reconstruct from the ledger alone, so the event
@@ -93,6 +111,14 @@ fn status_name(s: TaskStatus) -> String {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TopView {
     pub arches: BTreeMap<String, ArchStats>,
+    /// Which of the arches mounted right now are ones this kernel contains —
+    /// the process it started, under the caps it set (spec §3.3). Beside the
+    /// counters rather than in them: `ArchStats` is what an arch has spent and
+    /// is read back from disk, while this is what an arch *is* and is true
+    /// only of the arches mounted in this process. An arch with counters but
+    /// no entry here is one that has been unmounted since.
+    #[serde(default)]
+    pub governed: BTreeMap<String, bool>,
     pub tasks: BTreeMap<String, TaskStatus>,
     pub stopped_scopes: Vec<String>,
     pub liveness: BTreeMap<String, u64>,
@@ -276,6 +302,68 @@ impl RealKernel {
             .map(|(_, t)| t)
             .filter(|t| self.visible_to(ctx, t))
             .collect()
+    }
+
+    /// End every step a dead process left `Running`, and say so in the record
+    /// (SP1b review, M11).
+    ///
+    /// A `Running` step on disk at boot is a step whose process is gone: the
+    /// scheduler runs one step at a time in the call that asked for it, so
+    /// nothing is running when this node starts. It is *not* re-run. How far
+    /// it got is unknowable — the inference may already have left this node,
+    /// been paid for and been answered — and a scheduler that quietly repeats
+    /// it would spend twice and could release twice. So the step fails with
+    /// [`INTERRUPTED`], the task fails with it, and re-running is left to a
+    /// caller who says so.
+    ///
+    /// Called by `boot`, after the `boot` event, so the record reads in the
+    /// order things happened. Idempotent: a second boot finds nothing.
+    pub(crate) fn recover_interrupted_steps(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<Vec<String>, KernelError> {
+        let rows = self
+            .store
+            .db
+            .list_json::<Task>("tasks")
+            .map_err(store_failed)?;
+        let mut recovered = Vec::new();
+        for (_, mut t) in rows {
+            let interrupted: Vec<usize> = t
+                .steps
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| matches!(s.status, StepStatus::Running))
+                .map(|(i, _)| i)
+                .collect();
+            if interrupted.is_empty() {
+                continue;
+            }
+            for i in &interrupted {
+                t.steps[*i].status = StepStatus::Failed(INTERRUPTED.into());
+                t.steps[*i].ended_ms = Some(now_ms);
+                // Ledger before the row, as everywhere else in this kernel.
+                self.log(
+                    "task.step",
+                    now_ms,
+                    &InterruptedRecord {
+                        task_id: &t.id,
+                        step: *i,
+                        status: "failed",
+                        reason: INTERRUPTED,
+                    },
+                )?;
+            }
+            t.status = TaskStatus::Failed;
+            self.save_task(&t)?;
+            tracing::warn!(
+                task = %t.id,
+                steps = ?interrupted,
+                "a step was still running when this node last stopped; failed, not re-run"
+            );
+            recovered.push(t.id.clone());
+        }
+        Ok(recovered)
     }
 
     /// Run the next step that is not yet `Done`, and only that one: the
@@ -488,6 +576,11 @@ impl RealKernel {
             ) {
                 v.arches.insert(arch.into(), stats);
             }
+        }
+        // Governance comes off the mounted adapters, not off the counters: it
+        // is a fact about the arch, not about what it has spent.
+        for (id, m) in self.arches() {
+            v.governed.insert(id, m.governed);
         }
         for t in self.tasks(ctx) {
             v.tasks.insert(t.id, t.status);
@@ -1144,5 +1237,84 @@ mod tests {
             &env.hash.trim_start_matches("sha256:")[..12]
         );
         assert_eq!(mode(&out.join("deep").join(name)), 0o600, "released file");
+    }
+    /// Review M11: a step that was `Running` when the process died is not a
+    /// step to re-run. Nobody knows how far it got — an inference may already
+    /// have left this node and been paid for — so boot ends it, says so in the
+    /// record, and the scheduler never picks it up again. Re-running it is a
+    /// decision for a caller who says so, exactly as for any other failed step.
+    #[test]
+    fn a_step_left_running_by_a_crash_is_failed_at_boot_and_never_re_run() {
+        let d = tempfile::tempdir().unwrap();
+        let (arch, id);
+        {
+            let mut k = open(d.path());
+            arch = k.register_arch(crate::tests::local(personal()));
+            let t = k
+                .create_task(
+                    &machine(1),
+                    "Draft a proposal for Acme",
+                    "proposal",
+                    Label::bottom(),
+                    vec![
+                        StepKind::Plan {
+                            arch_id: arch.clone(),
+                        },
+                        StepKind::Draft {
+                            arch_id: arch.clone(),
+                        },
+                    ],
+                )
+                .unwrap();
+            id = t.id.clone();
+            // What a crash mid-step leaves on disk: the row says the step
+            // started, and nothing anywhere says how it ended.
+            let mut crashed = t;
+            crashed.steps[0].status = StepStatus::Running;
+            crashed.steps[0].started_ms = Some(1);
+            crashed.status = TaskStatus::Running;
+            k.save_task(&crashed).unwrap();
+        }
+
+        let mut k = open(d.path());
+        let before = k.ledger().events().len();
+        k.boot().unwrap();
+        let t = k.task(&machine(2), &id).expect("the task is still there");
+        assert_eq!(
+            t.steps[0].status,
+            StepStatus::Failed(INTERRUPTED.into()),
+            "the interrupted step says what happened to it"
+        );
+        assert!(matches!(t.status, TaskStatus::Failed));
+        assert!(
+            matches!(t.steps[1].status, StepStatus::Pending),
+            "only the step that was running is touched"
+        );
+        let kinds: Vec<&str> = k.ledger().events()[before..]
+            .iter()
+            .map(|e| e.kind.as_str())
+            .collect();
+        assert!(
+            kinds.contains(&"task.step"),
+            "the recovery belongs in the record: {kinds:?}"
+        );
+
+        // Never re-run: the arch is not called again, and the row does not move.
+        let calls = |k: &RealKernel| k.top(&machine(9)).arches.get(&arch).map_or(0, |s| s.calls);
+        let spent = calls(&k);
+        let again = k.run_task_step(&machine(3), &id).unwrap();
+        assert_eq!(again.steps[0].status, t.steps[0].status);
+        assert!(matches!(again.status, TaskStatus::Failed));
+        assert_eq!(calls(&k), spent, "a failed step is not retried by asking");
+
+        // And booting again changes nothing: there is no `Running` step left
+        // to recover, so the second boot appends no second recovery.
+        let before = k.ledger().events().len();
+        k.boot().unwrap();
+        let kinds: Vec<&str> = k.ledger().events()[before..]
+            .iter()
+            .map(|e| e.kind.as_str())
+            .collect();
+        assert_eq!(kinds, ["boot"], "a clean boot recovers nothing: {kinds:?}");
     }
 }

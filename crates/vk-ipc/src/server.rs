@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use vk_arch_claude_code::{ClaudeCodeAdapter, ClaudeCodeConfig};
+use vk_arch_ollama::{ContainerSpec, OllamaAdapter, OllamaConfig};
 use vk_contracts::arch::ArchManifest;
 use vk_contracts::labels::{Clearance, Label, Scope};
 use vk_contracts::principal::{Approval, ApprovalKind, Principal};
@@ -334,6 +335,12 @@ fn dispatch(
     let claude_version = (req.method == "arch.mount" && req.params["kind"] == "claude-code")
         .then(|| claude_code_version(&req.params["config"]))
         .transpose()?;
+    // The same, and more so, for an Ollama arch: mounting one starts a
+    // container, waits for the server and may pull gigabytes of weights. None
+    // of that may happen with the kernel lock held.
+    let ollama = (req.method == "arch.mount" && req.params["kind"] == "ollama")
+        .then(|| ollama_adapter(&req.params["config"]))
+        .transpose()?;
     let mut k = lock(kernel)?;
     let p = req.params;
     match req.method.as_str() {
@@ -397,11 +404,19 @@ fn dispatch(
                     let version = claude_version.ok_or_else(|| internal("no claude version"))?;
                     Arc::new(claude_code_adapter(&k, &p["config"], &version)?)
                 }
+                // Already mounted, above, before the lock: all that is left
+                // here is to hand the kernel the adapter it produced.
+                "ollama" => Arc::new(ollama.ok_or_else(|| internal("no ollama adapter"))?),
                 other => return Err(bad(&format!("no arch kind {other}"))),
             };
             let name = adapter.manifest().name.clone();
+            // Said here rather than looked up afterwards: whether the kernel
+            // contains the process is the first thing a person mounting an
+            // arch needs to know, and it is the difference between the two
+            // kinds this node can mount.
+            let governed = adapter.manifest().governed;
             let id = k.mount(adapter).map_err(|e| bad(&e.to_string()))?;
-            Ok(json!({ "arch_id": id, "name": name }))
+            Ok(json!({ "arch_id": id, "name": name, "governed": governed }))
         }
         "arch.mount_mock" => {
             let name = p["name"].as_str().unwrap_or("mock");
@@ -595,6 +610,56 @@ fn claude_code_adapter(
     };
     // `with_version`, not `new`: the binary was already asked, before the lock.
     Ok(ClaudeCodeAdapter::with_version(cfg, claude_version))
+}
+
+/// Build and mount the Ollama adapter `arch.mount { kind: "ollama" }` asks
+/// for. Called before the kernel lock is taken, because this is the call that
+/// starts a container, waits up to a minute for the server and pulls the model
+/// if it is not there yet (SP1b ruling 4).
+///
+/// A `base_url` in the config is what asks for the ungoverned mode: naming a
+/// server that is already running says this node did not start it. Saying
+/// nothing gets the container, on loopback, under this node's caps — the
+/// ungoverned arch is one a person has to ask for by name.
+fn ollama_adapter(config: &Value) -> Result<OllamaAdapter, RpcError> {
+    let defaults = OllamaConfig::default();
+    let u32_of = |name: &str, fallback: u32| -> Result<u32, RpcError> {
+        match config.get(name) {
+            None | Some(Value::Null) => Ok(fallback),
+            Some(v) => v
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| bad(name)),
+        }
+    };
+    let string_of = |name: &str, fallback: &str| -> String {
+        config
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or(fallback)
+            .to_string()
+    };
+    // Ungoverned only when the client names the server it wants: no `base_url`
+    // means the container, on loopback, under this node's caps.
+    let external = config.get("base_url").and_then(Value::as_str);
+    let container = external.is_none().then(|| ContainerSpec {
+        image: string_of("image", &ContainerSpec::default().image),
+        memory: string_of("memory", &ContainerSpec::default().memory),
+        cpus: string_of("cpus", &ContainerSpec::default().cpus),
+        ..ContainerSpec::default()
+    });
+    let cfg = OllamaConfig {
+        base_url: external.unwrap_or(&defaults.base_url).to_string(),
+        model: string_of("model", &defaults.model),
+        num_ctx: u32_of("num_ctx", defaults.num_ctx)?,
+        seed: match config.get("seed") {
+            None | Some(Value::Null) => defaults.seed,
+            Some(v) => v.as_u64().ok_or_else(|| bad("seed"))?,
+        },
+        temperature: defaults.temperature,
+        container,
+    };
+    OllamaAdapter::mount(cfg).map_err(|e| bad(&format!("{e:#}")))
 }
 
 fn mock_manifest(name: &str, ctx: u32) -> ArchManifest {
