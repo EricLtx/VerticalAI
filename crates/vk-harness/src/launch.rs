@@ -9,20 +9,28 @@
 //! what the run was: the exit, whether the process was contained, the endpoints
 //! it reached, and what Claude reported (cost, turns, permission denials).
 //!
-//! **The fence (Ruling 19).** Claude Code's own permission system is what keeps
-//! the harness inside its workspace: the session runs in `dontAsk` mode with
-//! `--permission-prompts none`, so anything not covered by an allow rule is
-//! denied and never retried; the allow rules are `Read(./**)` and `Edit(./**)`
-//! — the two rule kinds Claude Code consults for every file tool (a `Write`,
-//! `Glob` or `Grep` path rule is accepted and ignored, per the permissions
-//! documentation) — plus `mcp__vk__*`; the deny rules remove the shell, the web
-//! and the subagent tools outright, keep the harness's own inputs read-only,
-//! and name the state directory, the run's configuration directory and the
-//! usual sensitive trees explicitly. `--setting-sources ""` keeps the user's own
-//! settings out of the session, `--strict-mcp-config` keeps every MCP server but
-//! `vk` out. What this is not: OS-level isolation — a helper process the model
-//! cannot launch would not be bound by it. That arrives with the restricted
-//! token (plan, Task 10 group G); `contracts/tcb.md` says so.
+//! **The fence (Rulings 19 and 22).** Claude Code's own permission system is
+//! what keeps the harness inside its workspace: the session runs in `dontAsk`
+//! mode with `--permission-prompts none`, so anything not covered by an allow
+//! rule is denied and never retried; the allow rules are `Read(./**)` and
+//! `Edit(./**)` — the two rule kinds Claude Code consults for every file tool
+//! (a `Write`, `Glob` or `Grep` path rule is accepted and ignored, per the
+//! permissions documentation) — plus `mcp__vk__*`; the deny rules remove every
+//! other built-in tool by name ([`DENIED_TOOLS`], which a test diffs against
+//! the documented list [`BUILTIN_TOOLS`]), keep the harness's own inputs
+//! read-only, and name the state directory, the run's configuration directory
+//! and the usual sensitive trees explicitly. Two controls of the CLI itself
+//! back the rules without depending on the mode: `--restricted` (the command-
+//! and code-running tools and `WebFetch` removed, the file tools confined to
+//! the working directories, only managed settings and `--settings` loaded,
+//! `bypassPermissions` and cloud sessions refused) and
+//! `permissions.blockReadsOutsideWorkingDirectories` (`Read`, `Grep`, `Glob`
+//! and `LSP` refuse a path outside the working directories in every mode).
+//! `--setting-sources ""` keeps the user's own settings out of the session,
+//! `--strict-mcp-config` keeps every MCP server but `vk` out. What this is
+//! not: OS-level isolation — a helper process the model cannot launch would
+//! not be bound by it. That arrives with the restricted token (plan, Task 10
+//! group G); `contracts/tcb.md` says so.
 //!
 //! **The kernel drives this with its lock released.** The launched harness calls
 //! back over MCP (`harness.read_register`, `harness.attach_artefact`, …) while
@@ -57,31 +65,162 @@ pub const REDACTED_TOKEN: &str = "<redacted>";
 /// denies — `dontAsk` says so explicitly.)
 pub const PERMISSION_MODE: &str = "dontAsk";
 
-/// The tools the fence removes outright, whatever any allow rule says: no shell,
-/// no web, no subagent, no notebook, nothing that reaches outside the workspace
-/// by a path the file rules do not see. Unknown names are harmless — a bare
-/// tool-name deny matches at the tool level and warns about nothing.
-pub const DENIED_TOOLS: &[&str] = &[
+/// Every built-in tool of the Claude Code this fence is written against: the 46
+/// names of the tools reference (`code.claude.com/docs/en/tools-reference`,
+/// read 2026-09-24 against the installed 2.1.281) and the two `claude --help`
+/// names that table lacks — `REPL`, a code-running tool `--restricted` removes,
+/// and `SendUserMessage`, behind `--brief`. This is the list the fence is
+/// diffed against: `the_fence_partitions_every_documented_built_in` fails until
+/// every name here is either kept ([`KEPT_TOOLS`]) or denied
+/// ([`DENIED_TOOLS`]), so a tool the CLI grows is a failing test the moment it
+/// is added here, not a hole in the fence. Keep it in step with the reference.
+pub const BUILTIN_TOOLS: &[&str] = &[
+    "Agent",
+    "Artifact",
+    "AskUserQuestion",
     "Bash",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "Edit",
+    "EndConversation",
+    "EnterPlanMode",
+    "EnterWorktree",
+    "ExitPlanMode",
+    "ExitWorktree",
+    "Glob",
+    "Grep",
+    "ListAgents",
+    "ListMcpResourcesTool",
+    "LSP",
+    "Monitor",
+    "NotebookEdit",
     "PowerShell",
+    "PushNotification",
+    "Read",
+    "ReadMcpResourceTool",
+    "RemoteTrigger",
+    "ReportFindings",
+    "ScheduleWakeup",
+    "SendFeedback",
+    "SendMessage",
+    "SendUserFile",
+    "ShareOnboardingGuide",
+    "Skill",
+    "SubagentHandback",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskOutput",
+    "TaskStop",
+    "TaskUpdate",
+    "TodoWrite",
+    "ToolSearch",
+    "WaitForMcpServers",
     "WebFetch",
     "WebSearch",
-    "Task",
-    "Agent",
+    "Workflow",
+    "Write",
+    // `claude --help` on 2.1.281, not in the table.
+    "REPL",
+    "SendUserMessage",
+];
+
+/// The built-ins the fence keeps, by name: the five file tools the `Read(./**)`
+/// and `Edit(./**)` rules govern — `Edit` rules cover `Write`, `Read` rules
+/// cover `Glob` and `Grep`, and all five are confined to the working directory
+/// by `--restricted` and `blockReadsOutsideWorkingDirectories` — and the two
+/// that reach only the session's MCP servers, of which `--strict-mcp-config`
+/// leaves exactly `vk`: `ToolSearch`, which loads the kernel's tools when the
+/// CLI defers them (the real runs did that), and `WaitForMcpServers`.
+/// Everything else a built-in can reach — a shell, the web, another agent, the
+/// user's claude.ai account, device or inbox, a language server — is outside
+/// the workspace, and is denied.
+pub const KEPT_TOOLS: &[&str] = &[
+    "Read",
+    "Edit",
+    "Write",
+    "Glob",
+    "Grep",
+    "ToolSearch",
+    "WaitForMcpServers",
+];
+
+/// Older spellings the CLI still accepts and the fence still denies: `Task`
+/// (the subagent tool before `Agent`), `KillShell` and `BashOutput` (before
+/// `TaskStop` and `TaskOutput`), `Cd`. Not in the documented list, so the
+/// partition test accounts for them separately.
+pub const LEGACY_TOOL_NAMES: &[&str] = &["Task", "KillShell", "BashOutput", "Cd"];
+
+/// The tools the fence removes outright, whatever any allow rule says: every
+/// built-in but [`KEPT_TOOLS`] (Ruling 22, I9), by bare name, which removes the
+/// tool from the model's context. Grouped by what each reaches. Unknown names
+/// are harmless — a bare tool-name deny matches at the tool level and warns
+/// about nothing — so the older spellings stay.
+pub const DENIED_TOOLS: &[&str] = &[
+    // Commands and code.
+    "Bash",
+    "PowerShell",
+    "REPL",
+    "Monitor",
     "NotebookEdit",
+    // The web.
+    "WebFetch",
+    "WebSearch",
+    // Other agents, sessions and workflows.
+    "Agent",
+    "Workflow",
+    "SendMessage",
+    "ListAgents",
+    "SubagentHandback",
+    "Skill",
+    // The user's claude.ai account, device and inbox — past every fence on
+    // this machine, and past netwatch, with no prompt (I9).
+    "RemoteTrigger",
+    "SendUserFile",
+    "SendUserMessage",
+    "PushNotification",
+    "Artifact",
+    "ShareOnboardingGuide",
+    "SendFeedback",
+    "AskUserQuestion",
+    // Code intelligence: a file reader the `Read` rules do not see.
+    "LSP",
+    // MCP resources: the kernel exposes none.
+    "ListMcpResourcesTool",
+    "ReadMcpResourceTool",
+    // Scheduling and session control.
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "ScheduleWakeup",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "EnterWorktree",
+    "ExitWorktree",
+    // Documented as not removable while any other tool remains; denied so
+    // the list says what it means.
+    "EndConversation",
+    // The session's own task list and checklist: nothing the run needs.
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskOutput",
+    "TaskStop",
+    "TaskUpdate",
+    "TodoWrite",
+    "ReportFindings",
+    // Older spellings (`LEGACY_TOOL_NAMES`).
+    "Task",
     "KillShell",
     "BashOutput",
-    "Skill",
-    "Monitor",
-    "SendUserMessage",
-    "EnterWorktree",
     "Cd",
 ];
 
 /// Everything a launch needs. The kernel builds it; a `--dry-run` builds it with
 /// [`REDACTED_TOKEN`] to print the launch line and the configuration without
 /// running anything.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HarnessConfig {
     /// The Claude Code binary — daemon configuration (`vkd --harness-bin`),
     /// never a request field. The real one is `claude.exe`, launched directly
@@ -118,6 +257,27 @@ pub struct HarnessConfig {
     /// it said so, twice — so a proof of the fence has to come from the one
     /// channel it holds as the operator's. `None` in every ordinary run.
     pub system_suffix: Option<String>,
+}
+
+/// Hand-written, so the token never rides a `{cfg:?}` into a log line or an
+/// error context: it prints as [`REDACTED_TOKEN`], as it does in a `--dry-run`
+/// (Ruling 22, M15).
+impl std::fmt::Debug for HarnessConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HarnessConfig")
+            .field("binary", &self.binary)
+            .field("workspace", &self.workspace)
+            .field("config_dir", &self.config_dir)
+            .field("state_dir", &self.state_dir)
+            .field("lease_token", &REDACTED_TOKEN)
+            .field("endpoint", &self.endpoint)
+            .field("mcp_server", &self.mcp_server)
+            .field("prompt", &self.prompt)
+            .field("model", &self.model)
+            .field("timeout", &self.timeout)
+            .field("system_suffix", &self.system_suffix)
+            .finish()
+    }
 }
 
 /// Why a run ended, told rather than guessed. A Job Object kill leaves the
@@ -255,19 +415,23 @@ fn posix_abs(path: &Path) -> String {
 /// may not whatever else says so.
 ///
 /// Allow: the workspace, for reading and for editing, and the kernel's tools.
-/// Deny (deny beats allow, in every scope): the tools that reach past the file
-/// rules; the run's configuration directory (the token lives there); the
-/// daemon's store, keys, ledger and exports by their real paths; the usual
-/// sensitive trees under the home directory and the OS directories; the
-/// harness's own inputs (`TASK.md`, `PLAN.md`, `BRIEF/`) for editing, so the
-/// projection stays what the kernel wrote; and any settings, MCP or `CLAUDE.md`
-/// file, so a run cannot widen its own fence or plant one for the next.
+/// Deny (deny beats allow, in every scope): every built-in tool but the file
+/// tools and the MCP loaders ([`DENIED_TOOLS`]); the run's configuration
+/// directory (the token lives there); the daemon's store, keys, ledger and
+/// exports by their real paths; the usual sensitive trees under the home
+/// directory and the OS directories; the harness's own inputs (`TASK.md`,
+/// `PLAN.md`, `BRIEF/`) for editing, so the projection stays what the kernel
+/// wrote; and any settings, MCP or `CLAUDE.md` file, so a run cannot widen its
+/// own fence or plant one for the next.
 ///
 /// Not denied by pattern: the home directory as a whole. The workspace lives
 /// under it (`%LOCALAPPDATA%`), and Claude Code's `!` carve-outs cannot reach
 /// past a `~/` anchor; the fence against everything else outside the workspace
 /// is the default deny of `dontAsk` — a read or edit outside the working
-/// directory needs a prompt, and nothing answers one.
+/// directory needs a prompt, and nothing answers one — backed, since Ruling
+/// 22, by `permissions.blockReadsOutsideWorkingDirectories` (a read outside is
+/// refused in every mode) and by `--restricted` (the file tools are confined
+/// to the working directories), neither of which depends on the mode.
 pub fn permission_rules(cfg: &HarnessConfig) -> (Vec<String>, Vec<String>) {
     let allow = vec![
         "Read(./**)".to_string(),
@@ -367,13 +531,18 @@ pub fn permission_rules(cfg: &HarnessConfig) -> (Vec<String>, Vec<String>) {
 }
 
 /// The `settings.json` a launch writes: the fence as Claude Code's
-/// `permissions` block.
+/// `permissions` block — the rules, and `blockReadsOutsideWorkingDirectories`
+/// (v2.1.257+; Ruling 22), under which `Read`, `Grep`, `Glob` and `LSP` refuse
+/// a path outside the working directories in every permission mode, so a read
+/// the fence does not name is refused by the CLI and not only by the mode's
+/// unanswered prompt.
 pub fn settings_json(cfg: &HarnessConfig) -> String {
     let (allow, deny) = permission_rules(cfg);
     let value = json!({
         "permissions": {
             "allow": allow,
             "deny": deny,
+            "blockReadsOutsideWorkingDirectories": true,
         }
     });
     serde_json::to_string_pretty(&value).unwrap_or_default()
@@ -381,11 +550,16 @@ pub fn settings_json(cfg: &HarnessConfig) -> String {
 
 /// The launch line, argv[0] first.
 ///
-/// `-p <prompt>`, the run's `mcp.json` with `--strict-mcp-config` (no other MCP
-/// server, hook or skill reaches the session), the run's `settings.json` with
-/// `--setting-sources ""` (the user's own settings do not), `dontAsk` with
-/// `--permission-prompts none` (anything the fence does not allow is denied and
-/// not retried), JSON output, and the model the daemon pins.
+/// `-p <prompt>`; `--restricted` (v2.1.248+; Ruling 22: the command- and
+/// code-running tools and `WebFetch` removed, the file tools confined to the
+/// working directories, only managed settings and `--settings` loaded,
+/// `bypassPermissions` and cloud sessions refused — the documented form of
+/// what `--setting-sources ""` is relied on for); the run's `mcp.json` with
+/// `--strict-mcp-config` (no other MCP server, hook or skill reaches the
+/// session); the run's `settings.json` with `--setting-sources ""` (the user's
+/// own settings do not); `dontAsk` with `--permission-prompts none` (anything
+/// the fence does not allow is denied and not retried); JSON output; and the
+/// model the daemon pins.
 ///
 /// The prompt is an argument, not stdin: it is a fixed instruction, not data,
 /// and the data the harness may read is in the workspace, projected under the
@@ -395,6 +569,7 @@ pub fn launch_line(cfg: &HarnessConfig) -> Vec<String> {
         cfg.binary.display().to_string(),
         "-p".into(),
         cfg.prompt.clone(),
+        "--restricted".into(),
         "--mcp-config".into(),
         mcp_config_path(cfg).display().to_string(),
         "--strict-mcp-config".into(),
@@ -569,6 +744,15 @@ pub fn launch_claude_code(
         std::thread::sleep(SAMPLE_EVERY);
     };
 
+    // The child is gone; what it left running in its process group is not
+    // (Unix — on Windows the Job Object does this when the governor drops):
+    // TERM the group, give it a moment, then KILL what remains, so no helper
+    // outlives the settle and the removal of the workspace (Ruling 22, M16).
+    #[cfg(unix)]
+    if matches!(exit_reason, ExitReason::Exited(_) | ExitReason::Signal) {
+        settle_group(pid);
+    }
+
     let stdout_json = String::from_utf8_lossy(&out_t.join().unwrap_or_default()).into_owned();
     let stderr = String::from_utf8_lossy(&err_t.join().unwrap_or_default()).into_owned();
     if !exit_reason.is_success() {
@@ -677,6 +861,48 @@ fn kill_tree(child: &mut Child) {
     let _ = child.kill();
 }
 
+/// How long what the child left behind gets between `SIGTERM` and `SIGKILL`
+/// once the child itself has exited.
+#[cfg(unix)]
+const GROUP_GRACE: Duration = Duration::from_secs(2);
+
+/// Signal what is left of the child's process group after the child has exited
+/// on its own: `SIGTERM`, up to [`GROUP_GRACE`] for it to go, then `SIGKILL`.
+/// The group is the child's own (`spawn` made it lead one), so nothing else is
+/// in it; a group with no member left answers `ESRCH`, and there is nothing to
+/// do.
+#[cfg(unix)]
+fn settle_group(pid: u32) {
+    let Ok(pgid) = i32::try_from(pid) else {
+        return;
+    };
+    // SAFETY: `kill(2)` with a negative pid addresses the process group, which
+    // is the child's own; signal 0 delivers nothing and only asks whether any
+    // member is left.
+    let alive = || unsafe { libc::kill(-pgid, 0) == 0 };
+    if !alive() {
+        return;
+    }
+    // SAFETY: as above; SIGTERM to the child's own group.
+    unsafe {
+        libc::kill(-pgid, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + GROUP_GRACE;
+    while alive() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if alive() {
+        tracing::warn!(
+            pgid,
+            "a process the harness left running ignored SIGTERM; killing it"
+        );
+        // SAFETY: as above; SIGKILL to the child's own group.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+}
+
 fn drain<R: Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut buf = Vec::new();
@@ -738,10 +964,123 @@ mod tests {
     }
 
     #[test]
+    fn the_config_debug_redacts_the_token() {
+        let s = format!("{:?}", cfg());
+        assert!(!s.contains("secret"), "the token leaked into Debug: {s}");
+        assert!(
+            s.contains("lease_token") && s.contains(REDACTED_TOKEN),
+            "{s}"
+        );
+    }
+
+    /// Ruling 22 (I9): the deny list is every documented built-in but the kept
+    /// ones. `BUILTIN_TOOLS` is the documented list; a tool added there without
+    /// a deny entry, a kept tool that is also denied, or a denied name that is
+    /// neither documented nor a known older spelling, fails here.
+    #[test]
+    fn the_fence_partitions_every_documented_built_in() {
+        use std::collections::BTreeSet;
+        let builtin: BTreeSet<&str> = BUILTIN_TOOLS.iter().copied().collect();
+        let kept: BTreeSet<&str> = KEPT_TOOLS.iter().copied().collect();
+        let denied: BTreeSet<&str> = DENIED_TOOLS.iter().copied().collect();
+        let legacy: BTreeSet<&str> = LEGACY_TOOL_NAMES.iter().copied().collect();
+        assert_eq!(
+            builtin.len(),
+            BUILTIN_TOOLS.len(),
+            "a duplicate in BUILTIN_TOOLS"
+        );
+        assert_eq!(
+            denied.len(),
+            DENIED_TOOLS.len(),
+            "a duplicate in DENIED_TOOLS"
+        );
+        assert!(
+            kept.is_subset(&builtin),
+            "a kept tool must be a documented one"
+        );
+        assert!(
+            kept.is_disjoint(&denied),
+            "a tool cannot be both kept and denied"
+        );
+        assert!(
+            legacy.is_disjoint(&builtin),
+            "a legacy name is one the documented list lacks"
+        );
+        let expected: BTreeSet<&str> = builtin
+            .difference(&kept)
+            .copied()
+            .chain(legacy.iter().copied())
+            .collect();
+        let missing: Vec<&str> = expected.difference(&denied).copied().collect();
+        assert!(
+            missing.is_empty(),
+            "documented built-ins the fence neither keeps nor denies: {missing:?}"
+        );
+        let stray: Vec<&str> = denied.difference(&expected).copied().collect();
+        assert!(
+            stray.is_empty(),
+            "denied names that are neither documented nor legacy: {stray:?}"
+        );
+        // The kept set is exactly the file tools the two rule families govern
+        // and the two MCP loaders — nothing with reach past the workspace.
+        assert_eq!(
+            KEPT_TOOLS,
+            &[
+                "Read",
+                "Edit",
+                "Write",
+                "Glob",
+                "Grep",
+                "ToolSearch",
+                "WaitForMcpServers"
+            ]
+        );
+        // The names the re-review named are denied, by name.
+        for tool in [
+            "RemoteTrigger",
+            "SendUserFile",
+            "LSP",
+            "Artifact",
+            "Workflow",
+            "CronCreate",
+            "REPL",
+        ] {
+            assert!(denied.contains(tool), "{tool} must be denied");
+        }
+        // And every denied name is in the rendered fence.
+        let (_, deny) = permission_rules(&cfg());
+        for tool in DENIED_TOOLS {
+            assert!(deny.iter().any(|d| d == tool), "{tool} not in the fence");
+        }
+    }
+
+    #[test]
+    fn the_settings_block_reads_outside_the_working_directories_in_every_mode() {
+        let v: Value = serde_json::from_str(&settings_json(&cfg())).unwrap();
+        assert_eq!(
+            v["permissions"]["blockReadsOutsideWorkingDirectories"],
+            json!(true)
+        );
+        assert_eq!(v["permissions"]["allow"].as_array().unwrap().len(), 3);
+        // Only the permissions block: no hook, no MCP server, no env.
+        assert_eq!(v.as_object().unwrap().len(), 1, "{v}");
+    }
+
+    #[test]
     fn the_fence_allows_only_the_workspace_and_the_kernel_tools() {
         let (allow, deny) = permission_rules(&cfg());
         assert_eq!(allow, vec!["Read(./**)", "Edit(./**)", "mcp__vk__*"]);
-        for tool in ["Bash", "WebFetch", "WebSearch", "Task", "NotebookEdit"] {
+        for tool in [
+            "Bash",
+            "WebFetch",
+            "WebSearch",
+            "Task",
+            "NotebookEdit",
+            "RemoteTrigger",
+            "SendUserFile",
+            "LSP",
+            "REPL",
+        ] {
             assert!(deny.iter().any(|d| d == tool), "{tool} must be denied");
         }
         // The token's directory, the store and the keys are denied by real path.
@@ -873,6 +1212,7 @@ mod tests {
     fn the_launch_line_pins_the_locked_down_flags_and_no_bare_tool_allows() {
         let line = launch_line(&cfg());
         for flag in [
+            "--restricted",
             "--strict-mcp-config",
             "--settings",
             "--setting-sources",

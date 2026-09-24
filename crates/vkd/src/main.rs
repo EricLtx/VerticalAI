@@ -61,6 +61,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let a = Args::parse();
+    // Settled before the store is opened: a `--harness-bin` path is made
+    // absolute against this process's working directory and must be a file
+    // (Ruling 22, M14); a bare name is pinned to what PATH holds now, or left
+    // to refuse each run with a warning.
+    let harness_bin = vk_ipc::server::harness_binary_at_start(&a.harness_bin)?;
     let state_dir = vk_store::paths::state_dir(a.state_dir)?;
     let key_source = match a.master_key_file {
         Some(p) => vk_store::keys::KeySource::File(p),
@@ -176,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
     let config = vk_ipc::server::ServerConfig {
         endpoint: endpoint.0,
         harness: vk_ipc::server::HarnessSettings {
-            binary: a.harness_bin,
+            binary: harness_bin,
             model: Some(a.harness_model),
             timeout: std::time::Duration::from_secs(a.harness_timeout_secs),
         },

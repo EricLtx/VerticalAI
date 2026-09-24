@@ -814,6 +814,7 @@ fn vk_harness_run_dry_run_prints_the_launch_line_the_fence_and_a_redacted_mcp_co
     // allow-everything flags of the first cut are not.
     for flag in [
         "-p",
+        "--restricted",
         "--mcp-config",
         "--strict-mcp-config",
         "--settings",
@@ -855,8 +856,10 @@ fn vk_harness_run_dry_run_prints_the_launch_line_the_fence_and_a_redacted_mcp_co
         "the token must be redacted: {mcp}"
     );
     assert!(!mcp.contains("lease-"), "{mcp}");
-    // The fence: the workspace and the kernel tools allowed, the shell and the
-    // web denied, the config dir denied by its real path.
+    // The fence: the workspace and the kernel tools allowed, the shell, the
+    // web and the claude.ai-reaching tools denied, reads outside the working
+    // directories blocked in every mode, the config dir denied by its real
+    // path.
     let fence = dry["settings_json"].as_str().expect("settings_json");
     for rule in [
         "Read(./**)",
@@ -864,6 +867,10 @@ fn vk_harness_run_dry_run_prints_the_launch_line_the_fence_and_a_redacted_mcp_co
         "mcp__vk__*",
         "\"Bash\"",
         "\"WebFetch\"",
+        "\"RemoteTrigger\"",
+        "\"SendUserFile\"",
+        "\"LSP\"",
+        "\"blockReadsOutsideWorkingDirectories\": true",
     ] {
         assert!(
             fence.contains(rule),

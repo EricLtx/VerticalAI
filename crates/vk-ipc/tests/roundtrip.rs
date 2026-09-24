@@ -781,9 +781,10 @@ async fn arch_ls_says_whether_each_arch_is_ready() {
 
 /// Ruling 20: the harness binary, model and budget are the daemon's
 /// configuration. A `harness.run` that names any of them is refused as a bad
-/// request — before anything is looked up, leased or launched.
+/// request — before anything is looked up, leased or launched. Ruling 22
+/// (M13): so is one that carries any key the method does not take.
 #[tokio::test]
-async fn harness_run_refuses_a_request_that_names_the_binary_model_or_timeout() {
+async fn harness_run_refuses_a_request_that_names_the_binary_model_timeout_or_any_unknown_key() {
     let d = tempfile::tempdir().unwrap();
     let k = kernel(d.path());
     let endpoint = vk_ipc::transport::test_endpoint();
@@ -804,6 +805,17 @@ async fn harness_run_refuses_a_request_that_names_the_binary_model_or_timeout() 
         assert!(
             err.to_string().contains(field) && err.to_string().contains("--harness-bin"),
             "{field}: the refusal names the field and the daemon flag: {err}"
+        );
+    }
+    // Any other key: the params are an allow-list of four, not a bag.
+    for (field, value) in [("foo", json!(1)), ("proof", json!({"x": 1}))] {
+        let mut params = json!({ "task_id": "task-x", "name": "claude-code" });
+        params[field] = value;
+        let err = c.call("harness.run", params, None).await.unwrap_err();
+        assert_eq!(code_of(&err), vk_ipc::E_BAD_PARAMS, "{field}: {err}");
+        assert!(
+            err.to_string().contains(field),
+            "{field}: the refusal names the key: {err}"
         );
     }
     // Nothing was created or leased on the way.

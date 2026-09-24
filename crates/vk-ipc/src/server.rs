@@ -1063,14 +1063,52 @@ fn failed_run() -> HarnessRun {
     }
 }
 
+/// `--harness-bin` as `vkd` settles it at start (Ruling 22, M14). A path is
+/// made absolute against the daemon's own working directory and must exist and
+/// be a file — refused at start, not at the first run, and never resolved
+/// against the workspace the child runs in. (Absolute, not canonical: the OS
+/// follows a symlink at exec, and Windows' canonical form carries a `\\?\`
+/// prefix the launch line should not print.) A bare name is looked up on the
+/// daemon's `PATH` now and pinned to what was found; one that is not there is a
+/// warning here and a refusal of each run until the daemon is restarted with a
+/// path — a node serves without its harness, it does not refuse to start.
+pub fn harness_binary_at_start(binary: &std::path::Path) -> Result<PathBuf> {
+    if binary.components().count() > 1 || binary.is_absolute() {
+        let abs = std::path::absolute(binary)
+            .with_context(|| format!("resolve --harness-bin {}", binary.display()))?;
+        anyhow::ensure!(
+            abs.is_file(),
+            "--harness-bin {} is not a file (resolved from {})",
+            abs.display(),
+            binary.display()
+        );
+        return resolve_harness_binary(&abs);
+    }
+    match resolve_harness_binary(binary) {
+        // Absolute even when found through a relative `PATH` entry.
+        Ok(found) => Ok(std::path::absolute(&found).unwrap_or(found)),
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "no harness binary at start: every harness run will be refused until vkd is started with --harness-bin <path>");
+            Ok(binary.to_path_buf())
+        }
+    }
+}
+
 /// The harness binary as the daemon will execute it (Ruling 20).
 ///
-/// An explicit path is taken as given and must exist. A bare name is looked up
-/// on the daemon's own `PATH`: on Windows as `<name>.exe` — never `<name>.cmd`
-/// or `<name>.bat`, a shim that would spawn the real binary as a grandchild
-/// before the governor can contain the tree — and elsewhere as `<name>`.
-fn resolve_harness_binary(binary: &std::path::Path) -> Result<PathBuf> {
+/// An explicit path must be absolute — `vkd` makes it so at start
+/// ([`harness_binary_at_start`]), so a relative one here is a configuration no
+/// daemon produced — and must be a file. A bare name is looked up on the
+/// daemon's own `PATH`: on Windows as `<name>.exe` — never `<name>.cmd` or
+/// `<name>.bat`, a shim that would spawn the real binary as a grandchild before
+/// the governor can contain the tree — and elsewhere as `<name>`.
+pub fn resolve_harness_binary(binary: &std::path::Path) -> Result<PathBuf> {
     if binary.components().count() > 1 || binary.is_absolute() {
+        anyhow::ensure!(
+            binary.is_absolute(),
+            "harness binary {} is a relative path: vkd resolves --harness-bin at start, so give an absolute path or a bare name",
+            binary.display()
+        );
         anyhow::ensure!(
             binary.is_file(),
             "harness binary {} does not exist (vkd --harness-bin)",
@@ -1110,13 +1148,28 @@ fn resolve_harness_binary(binary: &std::path::Path) -> Result<PathBuf> {
     )
 }
 
+/// What `harness.run` takes, and nothing else (Rulings 20 and 22): an unknown
+/// key is a bad request, not a silently ignored one.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessRunParams {
+    task_id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    keep: bool,
+}
+
 /// `harness.run`: the confined Claude Code harness, driven in three phases so the
 /// kernel lock is never held across the wait (SP1b Task 4).
 ///
 /// The request carries `task_id`, `name`, `dry_run` and `keep` — nothing that
 /// chooses what executes: the binary, the model and the budget are the daemon's
-/// (Ruling 20), and a request that names them is refused. Everything that can
-/// be refused is refused *before* phase one, so a refusal leases nothing.
+/// (Ruling 20), and a request that names them, or anything else, is refused
+/// (−32602). Everything that can be refused is refused *before* phase one, so a
+/// refusal leases nothing.
 ///
 /// Phase one leases, mints the token and materialises under the lock; phase two
 /// launches and waits with the lock released, so the harness's own `harness.*`
@@ -1133,13 +1186,15 @@ fn harness_run(kernel: &Shared, config: &ServerConfig, p: Value) -> Result<Value
             )));
         }
     }
-    let task_id = p["task_id"]
-        .as_str()
-        .ok_or_else(|| bad("task_id"))?
-        .to_string();
-    let name = p["name"].as_str().unwrap_or("claude-code").to_string();
-    let dry_run = p["dry_run"].as_bool().unwrap_or(false);
-    let keep = p["keep"].as_bool().unwrap_or(false);
+    let params: HarnessRunParams = serde_json::from_value(p).map_err(|e| {
+        bad(&format!(
+            "harness.run takes task_id, name, dry_run and keep, nothing else: {e}"
+        ))
+    })?;
+    let task_id = params.task_id;
+    let name = params.name.unwrap_or_else(|| "claude-code".to_string());
+    let dry_run = params.dry_run;
+    let keep = params.keep;
     let settings = &config.harness;
     let timeout = settings.timeout;
 
