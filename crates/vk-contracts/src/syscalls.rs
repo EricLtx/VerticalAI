@@ -46,6 +46,14 @@ pub enum KernelError {
     Gate(String),
     #[error("not found: {0}")]
     NotFound(String),
+    /// The arch is mounted and listed, and it cannot run: the factory could
+    /// not re-create it at boot, or the runtime behind it has changed (SP1b
+    /// ruling 14). Distinct from `NotFound`, which is an id this node has
+    /// never heard of — the difference is the difference between "no such
+    /// arch" and "that arch is not usable, here is why", and only the second
+    /// tells an operator what to go and fix.
+    #[error("arch unavailable: {0}")]
+    ArchUnavailable(String),
     /// A durable write or read failed. A syscall that cannot persist its effect
     /// must fail loudly: a swallowed write is an invariant that survives only
     /// until the next restart.

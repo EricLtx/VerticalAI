@@ -723,3 +723,58 @@ async fn mounting_the_same_arch_twice_is_idempotent_and_says_so() {
     assert_eq!(mounted, 1, "an idempotent re-mount appends nothing");
     server.abort();
 }
+
+/// An arch is either usable or it is not, and every list of them says which
+/// (Ruling 14). `arch.ls` carries the state beside the manifest, so a client
+/// never has to run a task to discover that the engine behind an arch is gone.
+#[tokio::test]
+async fn arch_ls_says_whether_each_arch_is_ready() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = vk_ipc::client::Client::connect(&endpoint).await.unwrap();
+    let arch = c
+        .call(
+            "arch.mount_mock",
+            json!({"name": "mock", "context_ceiling": 200}),
+            None,
+        )
+        .await
+        .unwrap()["arch_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let listed = c.call("arch.ls", json!({}), None).await.unwrap();
+    let row = listed
+        .as_array()
+        .expect("arch.ls is a list")
+        .iter()
+        .find(|a| a["arch_id"] == json!(arch))
+        .unwrap_or_else(|| panic!("the mounted arch is missing from {listed}"));
+    assert_eq!(
+        row["state"], "ready",
+        "an arch that just mounted is ready: {listed}"
+    );
+    assert!(
+        row["reason"].is_null(),
+        "a ready arch has nothing to explain: {listed}"
+    );
+    assert!(row["manifest"]["name"] == json!("mock"), "{listed}");
+
+    // The same state reaches the namespace, which is the other surface an
+    // operator reads an arch off.
+    let entry = c
+        .call("ns.ls", json!({"path": format!("/arches/{arch}")}), None)
+        .await
+        .unwrap();
+    assert_eq!(entry["state"], "ready", "{entry}");
+
+    // And the boot report every client asks for names the states too.
+    let info = c.call("boot.info", json!({}), None).await.unwrap();
+    assert_eq!(info["arch_states"][0]["arch_id"], json!(arch), "{info}");
+    assert_eq!(info["arch_states"][0]["state"], "ready", "{info}");
+    server.abort();
+}

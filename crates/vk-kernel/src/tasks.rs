@@ -119,6 +119,16 @@ pub struct TopView {
     /// no entry here is one that has been unmounted since.
     #[serde(default)]
     pub governed: BTreeMap<String, bool>,
+    /// `ready` or `unavailable` per mounted arch (SP1b ruling 14). Beside the
+    /// counters for the same reason `governed` is: counters are what an arch
+    /// has spent and outlive it, this is whether it can be called at all. An
+    /// arch with counters and no entry here is one that has been unmounted.
+    #[serde(default)]
+    pub states: BTreeMap<String, String>,
+    /// Why each unavailable arch is unavailable. Only those: a ready arch has
+    /// nothing to explain.
+    #[serde(default)]
+    pub unavailable: BTreeMap<String, String>,
     pub tasks: BTreeMap<String, TaskStatus>,
     pub stopped_scopes: Vec<String>,
     pub liveness: BTreeMap<String, u64>,
@@ -582,9 +592,13 @@ impl RealKernel {
         // them it contains, must not have to run one first to find out
         // (Ruling 9d). A row of zeros is an answer — and an arch with counters
         // but no governance is one that has been unmounted since.
-        for (id, m) in self.arches() {
+        for (id, m, state) in self.arch_states() {
             v.arches.entry(id.clone()).or_default();
-            v.governed.insert(id, m.governed);
+            v.governed.insert(id.clone(), m.governed);
+            v.states.insert(id.clone(), state.name().into());
+            if let Some(why) = state.reason() {
+                v.unavailable.insert(id, why.into());
+            }
         }
         for t in self.tasks(ctx) {
             v.tasks.insert(t.id, t.status);
@@ -1096,7 +1110,7 @@ mod tests {
         ));
         assert!(matches!(
             crate::ns::resolve(&k, &machine(0), &format!("/arches/{arch}")).unwrap(),
-            crate::ns::Entry::Arch(_)
+            crate::ns::Entry::Arch { .. }
         ));
         match crate::ns::resolve(&k, &machine(0), "/devices/phone-1").unwrap() {
             crate::ns::Entry::Device { id } => assert_eq!(id, "phone-1"),

@@ -80,6 +80,92 @@ pub trait ArchAdapter: Send + Sync {
     fn complete(&self, prompt: &str, max_tokens: u32) -> Result<Completion, AdapterError>;
 }
 
+/// How to make this arch again: the `kind` that picks an adapter and the
+/// `config` that adapter reads (SP1b ruling 14).
+///
+/// Recorded beside the manifest at `arch.mount`, because a manifest says what
+/// an arch *is* and nothing about how to build one. Without it a restart had
+/// no choice but to invent an adapter, and what it invented was the mock —
+/// so a node that had Gemma before the restart had the mock after it, under
+/// the same arch id, with nothing in the record saying so.
+///
+/// `config` is the adapter's own shape, free-form on purpose: every engine is
+/// configured differently and the kernel is not the place that knows how. What
+/// the kernel does know is what may never be in there — see [`MountSpec::new`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MountSpec {
+    pub kind: String,
+    pub config: serde_json::Value,
+}
+
+impl MountSpec {
+    /// A spec, refused if its config carries anything shaped like a credential.
+    ///
+    /// A spec is durable and unencrypted — it is in the metadata database, not
+    /// the blob store — so a secret written into one is a secret at rest in
+    /// the clear, for as long as the arch is mounted. Neither adapter this
+    /// node has takes a credential today; the guard is here so that the kind
+    /// that does is refused at the door rather than discovered later.
+    ///
+    /// The rule is on *strings* under a credential-shaped name, not on the
+    /// name alone, because `max_tokens` is a name like that and a count is not
+    /// a credential. A secret is an opaque string; a number never is one.
+    pub fn new(kind: impl Into<String>, config: serde_json::Value) -> anyhow::Result<MountSpec> {
+        let spec = MountSpec {
+            kind: kind.into(),
+            config,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// The spec that re-creates a [`MockAdapter`] exactly: the manifest is the
+    /// mock, so carrying it whole is the only way the arch id comes back the
+    /// same.
+    pub fn mock(manifest: &ArchManifest, budget: u32) -> MountSpec {
+        MountSpec {
+            kind: "mock".into(),
+            config: serde_json::json!({ "manifest": manifest, "budget": budget }),
+        }
+    }
+
+    /// [`MountSpec::new`]'s check, for a spec that was built rather than made.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.kind.is_empty(), "a mount spec must name its kind");
+        no_secrets(&self.config)
+    }
+}
+
+/// Does this name read like a credential? Substring rather than whole word: a
+/// later kind is as likely to call it `apiKey` or `x_auth_token` as `key`.
+fn secret_shaped(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    ["secret", "token", "key", "password", "passwd", "credential"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+/// Walk a config and refuse the first string sitting under such a name,
+/// wherever in the tree it is: a credential nested two objects down is still
+/// a credential.
+fn no_secrets(config: &serde_json::Value) -> anyhow::Result<()> {
+    match config {
+        serde_json::Value::Object(map) => {
+            for (name, value) in map {
+                anyhow::ensure!(
+                    !(secret_shaped(name) && value.is_string()),
+                    "a mount spec is stored in the clear and must not carry a secret: \
+                     drop `{name}` from the config, or keep it in the keyring"
+                );
+                no_secrets(value)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Array(items) => items.iter().try_for_each(no_secrets),
+        _ => Ok(()),
+    }
+}
+
 pub struct MockAdapter {
     pub manifest: ArchManifest,
     pub budget: u32,

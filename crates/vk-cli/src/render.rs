@@ -111,7 +111,7 @@ pub fn status(v: &Value) -> String {
         ("node", text(&v["node_id"])),
         ("state dir", text(&v["state_dir"])),
         ("export root", text(&v["export_root"])),
-        ("arches", text(&v["arches"])),
+        ("arches", arch_count(v)),
         ("devices", text(&v["devices"])),
         (
             "ledger",
@@ -142,6 +142,23 @@ pub fn status(v: &Value) -> String {
         ));
     }
     fields(&rows)
+}
+
+/// How many arches this node has, and how many of them cannot run (SP1b
+/// ruling 14). A bare count would let `vk status` say "arches: 2" on a morning
+/// when neither of them would answer a prompt — which is the morning somebody
+/// most needs to be told.
+fn arch_count(v: &Value) -> String {
+    let total = text(&v["arches"]);
+    let down = array(v, "arch_states")
+        .iter()
+        .filter(|a| a["state"] == Value::String("unavailable".into()))
+        .count();
+    if down == 0 {
+        total
+    } else {
+        format!("{total} ({down} unavailable)")
+    }
 }
 
 /// The end of a daemon's log, quoted back at the person who started it.
@@ -202,10 +219,33 @@ pub fn ls(v: &Value) -> String {
                 entries.iter().map(text).collect::<Vec<_>>().join("\n")
             }
         }
+        Some("arches") => arches(&v["arches"]),
         Some("ledger_tail") => dmesg(&v["events"]),
         Some("task") => task(v),
         _ => serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()),
     }
+}
+
+/// `/arches`: what this node has mounted, and which of them would answer a
+/// prompt right now (SP1b ruling 14). An unavailable arch is on the screen
+/// with its reason, because it is the one an operator has to act on.
+fn arches(v: &Value) -> String {
+    let arches = v.as_array().map_or(&[][..], |a| a.as_slice());
+    if arches.is_empty() {
+        return "(no arch is mounted)".into();
+    }
+    let rows: Vec<Vec<String>> = arches
+        .iter()
+        .map(|a| {
+            vec![
+                text(&a["arch_id"]),
+                text(&a["name"]),
+                text(&a["state"]),
+                a["reason"].as_str().unwrap_or("-").to_string(),
+            ]
+        })
+        .collect();
+    table(&["ARCH", "NAME", "STATE", "WHY"], &rows)
 }
 
 /// Tasks and how far each has got.
@@ -241,6 +281,11 @@ pub fn top(v: &Value) -> String {
                 .map(|(id, s)| {
                     vec![
                         id.clone(),
+                        // Would a prompt sent to it be answered? A dash for
+                        // an arch that is no longer mounted — its counters
+                        // outlive it — and `unavailable` for one whose engine
+                        // this node could not bring back (Ruling 14).
+                        v["states"][id].as_str().unwrap_or("-").to_string(),
                         // Is the inference a process this kernel started and
                         // capped? A dash for an arch that is no longer
                         // mounted: its counters outlive it, its governance
@@ -269,6 +314,7 @@ pub fn top(v: &Value) -> String {
         table(
             &[
                 "ARCH",
+                "STATE",
                 "GOVERNED",
                 "CALLS",
                 "TOKENS",
@@ -279,6 +325,13 @@ pub fn top(v: &Value) -> String {
             &arches,
         )
     });
+    // Why, under the table rather than in it: a reason is a sentence and a
+    // sentence in a column makes every other column unreadable.
+    if let Some(down) = v["unavailable"].as_object().filter(|m| !m.is_empty()) {
+        for (id, why) in down {
+            out.push(format!("{id} is unavailable: {}", text(why)));
+        }
+    }
     let tasks: Vec<Vec<String>> = v["tasks"]
         .as_object()
         .map(|m| m.iter().map(|(id, s)| vec![id.clone(), text(s)]).collect())
@@ -654,5 +707,121 @@ mod tests {
         assert!(rendered.contains(&paths[0]), "{rendered}");
         // Without them, the step still says where it was asked to write.
         assert!(super::task(&task).contains("out"));
+    }
+
+    /// An unavailable arch is on every screen an operator reads, with its
+    /// reason (SP1b ruling 14). The listing carries the column; `top` carries
+    /// it too, and puts the sentence under the table where a sentence can be
+    /// read without wrecking every other column.
+    #[test]
+    fn an_unavailable_arch_is_on_the_listing_and_on_the_operators_screen() {
+        // Columns are padded to their widest cell, so a row is compared by its
+        // cells rather than by the spacing between them.
+        let cells = |rendered: &str, n: usize| -> Vec<String> {
+            rendered
+                .lines()
+                .nth(n)
+                .expect("that many lines")
+                .split("  ")
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        let listing = json!({
+            "type": "arches",
+            "arches": [
+                {"arch_id": "sha256:aaa", "name": "ollama/gemma3:1b", "state": "ready"},
+                {"arch_id": "sha256:bbb", "name": "claude-code/claude-opus-5",
+                 "state": "unavailable", "reason": "cannot run `claude --version`"},
+            ],
+        });
+        let screen = super::ls(&listing);
+        assert_eq!(cells(&screen, 0), ["ARCH", "NAME", "STATE", "WHY"]);
+        assert_eq!(
+            cells(&screen, 1),
+            ["sha256:aaa", "ollama/gemma3:1b", "ready", "-"],
+            "{screen}"
+        );
+        assert_eq!(
+            cells(&screen, 2),
+            [
+                "sha256:bbb",
+                "claude-code/claude-opus-5",
+                "unavailable",
+                "cannot run `claude --version`",
+            ],
+            "{screen}"
+        );
+
+        let top = json!({
+            "arches": {"sha256:bbb": {"calls": 0, "tokens_in": 0, "tokens_in_measured": 0,
+                                      "cost_list_usd": 0.0, "projected": 0}},
+            "governed": {"sha256:bbb": true},
+            "states": {"sha256:bbb": "unavailable"},
+            "unavailable": {"sha256:bbb": "cannot run `claude --version`"},
+            "tasks": {}, "stopped_scopes": [], "liveness": {},
+        });
+        let screen = super::top(&top);
+        assert_eq!(cells(&screen, 0)[..3], ["ARCH", "STATE", "GOVERNED"]);
+        assert_eq!(
+            cells(&screen, 1)[..3],
+            ["sha256:bbb", "unavailable", "yes"],
+            "{screen}"
+        );
+        assert!(
+            screen.contains("sha256:bbb is unavailable: cannot run `claude --version`"),
+            "the reason belongs under the table, where a sentence fits:\n{screen}"
+        );
+
+        // An arch with counters but no state is one that has been unmounted
+        // since: a dash, not a claim that it is ready.
+        let unmounted = json!({
+            "arches": {"sha256:ccc": {"calls": 3, "tokens_in": 9, "tokens_in_measured": 0,
+                                      "cost_list_usd": 0.0, "projected": 0}},
+            "governed": {}, "states": {}, "unavailable": {},
+            "tasks": {}, "stopped_scopes": [], "liveness": {},
+        });
+        let screen = super::top(&unmounted);
+        assert_eq!(cells(&screen, 1)[..3], ["sha256:ccc", "-", "-"], "{screen}");
+    }
+
+    /// `vk status` counts the arches a node has, and says how many of them
+    /// would refuse a prompt — a bare "arches: 2" on a node where neither
+    /// works is the number that gets somebody through a whole morning before
+    /// they find out.
+    #[test]
+    fn status_says_how_many_arches_cannot_run() {
+        // `label<pad>  value`, read back by label.
+        let value = |rendered: &str, label: &str| {
+            rendered
+                .lines()
+                .find_map(|l| l.split_once("  ").filter(|(k, _)| k.trim_end() == label))
+                .map(|(_, v)| v.trim_start().to_string())
+        };
+        let node = |states: Value| {
+            json!({
+                "node_id": "n1", "state_dir": "/s", "export_root": "/s/exports",
+                "arches": 2, "arch_states": states, "devices": 1, "ledger_len": 9,
+                "ledger_ok": true, "forced": false, "recovered_partial_line": false,
+                "stopped_scopes": [], "policies_version": "0",
+            })
+        };
+        let all_up = node(json!([
+            {"arch_id": "sha256:aaa", "state": "ready"},
+            {"arch_id": "sha256:bbb", "state": "ready"},
+        ]));
+        assert_eq!(
+            value(&super::status(&all_up), "arches").as_deref(),
+            Some("2")
+        );
+        let one_down = node(json!([
+            {"arch_id": "sha256:aaa", "state": "ready"},
+            {"arch_id": "sha256:bbb", "state": "unavailable", "reason": "no engine"},
+        ]));
+        assert_eq!(
+            value(&super::status(&one_down), "arches").as_deref(),
+            Some("2 (1 unavailable)")
+        );
     }
 }

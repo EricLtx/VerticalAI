@@ -4,8 +4,16 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
+/// Every metadata table. Each is `(key TEXT PRIMARY KEY, json TEXT, updated_ms
+/// INTEGER)` and the typed wrapper lives in vk-kernel, so a new kind of row
+/// costs a name here and a struct there rather than a migration.
+///
+/// `mounts` is the logical `mounts(arch_id, kind, config_json)` Task 1b calls
+/// for: the key is the arch id and the JSON is the `MountSpec` — the `kind`
+/// and the `config` — that the next boot re-creates that arch from.
 pub const TABLES: &[&str] = &[
     "arches",
+    "mounts",
     "registers",
     "tasks",
     "leases",
@@ -125,6 +133,22 @@ impl Db {
         self.conn
             .execute(&format!("DELETE FROM {table} WHERE key = ?1"), params![key])?;
         Ok(())
+    }
+
+    /// Run `f` as one transaction: everything it writes lands together or not
+    /// at all.
+    ///
+    /// For the rows that are two halves of one fact — an arch's manifest and
+    /// the mount spec the next boot re-creates it from — where a crash between
+    /// the two writes would leave a node that lists an arch it cannot make
+    /// again. `unchecked_transaction` because every write here goes through
+    /// `&self`; there is one connection and one writer, so there is no second
+    /// transaction for this one to nest inside.
+    pub fn transaction<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let tx = self.conn.unchecked_transaction()?;
+        let out = f()?;
+        tx.commit()?;
+        Ok(out)
     }
 
     pub fn kv_get(&self, key: &str) -> Result<Option<String>> {

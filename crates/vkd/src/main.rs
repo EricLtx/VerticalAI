@@ -61,7 +61,18 @@ async fn main() -> anyhow::Result<()> {
     // a second daemon over a store one is already serving stops here, before
     // it has read or written anything, and says which lock file it could not
     // take.
-    let mut kernel = vk_kernel::RealKernel::open(&state_dir, key_source, &a.node_id)?;
+    // With the factory that knows this build's arch kinds (SP1b ruling 14).
+    // Opening the kernel is what re-creates every arch this node had mounted,
+    // so the daemon hands it the one thing the kernel cannot know: how to make
+    // a `claude-code`, an `ollama` or a mock. Without it every persisted arch
+    // came back as a mock under the real arch's id — the failure nothing
+    // downstream could detect.
+    let mut kernel = vk_kernel::RealKernel::open_with_factory(
+        &state_dir,
+        key_source,
+        &a.node_id,
+        vk_ipc::server::adapter_factory(state_dir.clone()),
+    )?;
     // The endpoint before the record. Binding is the other way a start can be
     // refused — another daemon is serving this name — and a daemon that will
     // never serve must not have enrolled a device or appended its `boot`
@@ -97,6 +108,16 @@ async fn main() -> anyhow::Result<()> {
         state_dir = %state_dir.display(),
         "vkd booted"
     );
+    // One line per arch that did not come back, at warn: a node serving with
+    // Gemma missing is serving, and the operator has to be able to find out
+    // why from the log rather than from a task that failed an hour later.
+    for id in &report.unavailable_arches {
+        tracing::warn!(
+            arch_id = %id,
+            "this arch could not be re-created at boot and is unavailable; \
+             `vk ls /arches` says why. Mount it again once its engine is back."
+        );
+    }
     if report.recovered_partial_line {
         tracing::warn!(
             "the last ledger line was unterminated and has been dropped: one event that a \

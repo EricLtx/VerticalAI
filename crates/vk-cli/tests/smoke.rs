@@ -186,11 +186,11 @@ fn the_vk_shell_drives_a_task_from_mount_to_release() {
     .to_string();
     let ls = sh.json(&["ls", "/arches", "--json"]);
     assert!(
-        ls["entries"]
+        ls["arches"]
             .as_array()
-            .expect("entries")
+            .expect("arches")
             .iter()
-            .any(|e| e.as_str().is_some_and(|s| s.contains(&arch))),
+            .any(|a| a["arch_id"].as_str() == Some(arch.as_str())),
         "mounted arch missing from /arches: {ls}"
     );
 
@@ -1101,4 +1101,204 @@ fn vk_man_reads_the_contracts_without_a_daemon() {
     let why = String::from_utf8(bad.stderr).unwrap();
     assert!(why.contains("no-such-contract"), "{why}");
     assert!(why.contains("ledger_event"), "{why}");
+}
+
+/// The restart case, end to end (Ruling 14). A daemon that comes up over a
+/// store with a real arch in it re-creates that arch from the spec its mount
+/// recorded — it does not put the mock there and carry on. Driven against the
+/// `claude` stand-in, so the proof is in the numbers: only the real adapter
+/// reports the provider's own token count, and a mock standing in for it would
+/// report an estimate instead.
+#[test]
+fn a_real_arch_is_re_created_when_the_daemon_restarts_and_is_never_a_mock() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let sh = Shell {
+        endpoint: endpoint.clone(),
+        node_key: dir.path().join("node.key"),
+    };
+    let claude = path_of(&fake_claude(dir.path()));
+
+    // A node with a real arch on it, then stopped.
+    let draft = {
+        let _daemon = Daemon(
+            vkd_cmd(dir.path(), &endpoint, &[])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn vkd"),
+        );
+        wait_until(&sh, true, "vkd never answered").expect("status");
+        let mounted = sh.json(&[
+            "mount",
+            "claude-code",
+            "--bin",
+            &claude,
+            "--draft-model",
+            "claude-sonnet-5",
+            "--judge-model",
+            "claude-opus-5",
+            "--json",
+        ]);
+        str_of(&mounted["draft"], "arch_id").to_string()
+    };
+    wait_until(&sh, false, "the killed daemon still holds the endpoint");
+
+    // The same store, a new daemon: the arch is there and it is ready.
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    wait_until(&sh, true, "vkd never answered after the restart").expect("status");
+    let ls = sh.json(&["ls", "/arches", "--json"]);
+    let row = ls["arches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("/arches is a list of arches: {ls}"))
+        .iter()
+        .find(|a| a["arch_id"].as_str() == Some(draft.as_str()))
+        .unwrap_or_else(|| panic!("the mounted arch did not survive the restart: {ls}"));
+    assert_eq!(
+        row["state"], "ready",
+        "a re-created arch is ready, not a placeholder: {ls}"
+    );
+    let screen = sh.ok(&["ls", "/arches"]);
+    assert!(
+        screen.contains("STATE") && screen.contains("ready"),
+        "the operator reads the state off the listing:\n{screen}"
+    );
+
+    // And it is the real adapter, not the mock `load` used to fabricate: a
+    // task runs through the stand-in and `vk top` reports the count the
+    // stand-in measured (7 + 11 + 23 a call), which no mock ever reports.
+    let task = str_of(
+        &sh.json(&[
+            "task",
+            "submit",
+            "--goal",
+            "Say something",
+            "--plan",
+            &draft,
+            "--draft",
+            &draft,
+            "--json",
+        ]),
+        "id",
+    )
+    .to_string();
+    let done = sh.json(&["task", "step", &task, "--all", "--json"]);
+    assert_eq!(done["status"], "done", "{done}");
+    let top = sh.json(&["top", "--json"]);
+    let stats = &top["arches"][&draft];
+    assert_eq!(stats["calls"], 2, "{top}");
+    assert_eq!(
+        stats["tokens_in"],
+        2 * (7 + 11 + 23),
+        "the arch that answered measured its own call, so it is the real one: {top}"
+    );
+    assert_eq!(top["states"][&draft], "ready", "{top}");
+    let screen = sh.ok(&["top"]);
+    assert!(
+        screen.contains("STATE"),
+        "the operator's screen says which arches are usable:\n{screen}"
+    );
+    assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
+}
+
+/// The other half of Ruling 14: an arch whose engine is gone comes back
+/// *unavailable*, with the reason, and every task step that names it is
+/// refused. The stand-in is deleted while the daemon is down, which is what an
+/// uninstalled `claude` looks like from here.
+#[test]
+fn an_arch_whose_engine_has_gone_comes_back_unavailable_and_refuses_to_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let sh = Shell {
+        endpoint: endpoint.clone(),
+        node_key: dir.path().join("node.key"),
+    };
+    let claude = fake_claude(dir.path());
+    let bin = path_of(&claude);
+
+    let draft = {
+        let _daemon = Daemon(
+            vkd_cmd(dir.path(), &endpoint, &[])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn vkd"),
+        );
+        wait_until(&sh, true, "vkd never answered").expect("status");
+        let mounted = sh.json(&[
+            "mount",
+            "claude-code",
+            "--bin",
+            &bin,
+            "--draft-model",
+            "claude-sonnet-5",
+            "--judge-model",
+            "claude-opus-5",
+            "--json",
+        ]);
+        str_of(&mounted["draft"], "arch_id").to_string()
+    };
+    wait_until(&sh, false, "the killed daemon still holds the endpoint");
+    std::fs::remove_file(&claude).expect("uninstall the stand-in");
+
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    wait_until(
+        &sh,
+        true,
+        "an unavailable arch must not stop the node serving",
+    )
+    .expect("status");
+
+    let ls = sh.json(&["ls", "/arches", "--json"]);
+    let row = ls["arches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("/arches is a list of arches: {ls}"))
+        .iter()
+        .find(|a| a["arch_id"].as_str() == Some(draft.as_str()))
+        .unwrap_or_else(|| panic!("an unavailable arch is still listed: {ls}"));
+    assert_eq!(row["state"], "unavailable", "{ls}");
+    assert!(
+        row["reason"].as_str().is_some_and(|r| !r.is_empty()),
+        "an operator is told why: {ls}"
+    );
+
+    // A task naming it fails, saying what is wrong — it does not quietly run
+    // on a mock and hand back an answer nobody asked for.
+    let task = str_of(
+        &sh.json(&[
+            "task",
+            "submit",
+            "--goal",
+            "Say something",
+            "--plan",
+            &draft,
+            "--draft",
+            &draft,
+            "--json",
+        ]),
+        "id",
+    )
+    .to_string();
+    let refused = sh.run(&["task", "step", &task, "--all"]);
+    assert!(
+        !refused.status.success(),
+        "a step on an unavailable arch must not succeed"
+    );
+    let why = String::from_utf8_lossy(&refused.stderr);
+    assert!(why.contains("arch unavailable"), "{why}");
+    let top = sh.json(&["top", "--json"]);
+    assert_eq!(top["states"][&draft], "unavailable", "{top}");
+    assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
 }

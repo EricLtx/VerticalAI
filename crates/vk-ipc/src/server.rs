@@ -7,7 +7,7 @@ use crate::{
     PresenceProof, Request, Response, RpcError, E_BAD_PARAMS, E_INTERNAL, E_INVARIANT, E_METHOD,
     E_NOT_FOUND, E_STORE,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
@@ -20,7 +20,7 @@ use vk_contracts::arch::ArchManifest;
 use vk_contracts::labels::{Clearance, Label, Scope};
 use vk_contracts::principal::{Approval, ApprovalKind, Principal};
 use vk_contracts::syscalls::{Ctx, Kernel, KernelError};
-use vk_kernel::arch::{ArchAdapter, MockAdapter};
+use vk_kernel::arch::{ArchAdapter, MockAdapter, MountSpec};
 use vk_kernel::tasks::StepKind;
 use vk_kernel::{now_ms, RealKernel, Remount};
 
@@ -191,7 +191,11 @@ fn reply(id: u64, outcome: Result<Value, RpcError>) -> Response {
 fn kerr(e: KernelError) -> RpcError {
     let code = match e {
         KernelError::NotFound(_) => E_NOT_FOUND,
-        KernelError::Store(_) => E_STORE,
+        // Not `E_NOT_FOUND`: the arch is there and the client can see it in
+        // `arch.ls`. What failed is the machinery behind it, which is the
+        // store class — the same class an adapter's non-invariant failure
+        // already reports (SP1b review, Important 2).
+        KernelError::ArchUnavailable(_) | KernelError::Store(_) => E_STORE,
         KernelError::I1(_)
         | KernelError::I2(_)
         | KernelError::I3(_)
@@ -334,19 +338,29 @@ fn dispatch(
     // the node (SP1b review, Minor 8 / ruling 8).
     let claude_version = (req.method == "arch.mount" && req.params["kind"] == "claude-code")
         .then(|| claude_code_version(&req.params["config"]))
-        .transpose()?;
+        .transpose()
+        .map_err(|e| bad(&format!("{e:#}")))?;
     // The same, and more so, for an Ollama arch: mounting one starts a
     // container, waits for the server and may pull gigabytes of weights. None
     // of that may happen with the kernel lock held.
     let ollama = (req.method == "arch.mount" && req.params["kind"] == "ollama")
         .then(|| ollama_adapter(&req.params["config"]))
-        .transpose()?;
+        .transpose()
+        .map_err(|e| bad(&format!("{e:#}")))?;
     let mut k = lock(kernel)?;
     let p = req.params;
     match req.method.as_str() {
         "boot.info" => Ok(json!({
             "node_id": k.node_id,
             "arches": k.arches().len(),
+            // Which of them came up usable (SP1b ruling 14). The count alone
+            // would let a node report two arches on a morning when neither
+            // can run, which is the morning somebody most needs to be told.
+            "arch_states": k.arch_states().into_iter().map(|(id, _, state)| json!({
+                "arch_id": id,
+                "state": state.name(),
+                "reason": state.reason(),
+            })).collect::<Vec<_>>(),
             "devices": k.devices().ids().len(),
             "ledger_len": k.ledger().events().len(),
             // The verdict boot reports, not a recomputation of the chain
@@ -386,10 +400,21 @@ fn dispatch(
                 .map_err(kerr)
                 .and_then(to_value)
         }
+        // Every arch this node has mounted, with the state that says whether
+        // calling it would work (SP1b ruling 14). An unavailable arch is
+        // listed rather than hidden: it is the thing an operator has to go and
+        // fix, and leaving it out is how nobody ever does.
         "arch.ls" => to_value(
-            k.arches()
+            k.arch_states()
                 .into_iter()
-                .map(|(id, m)| json!({ "arch_id": id, "manifest": m }))
+                .map(|(id, m, state)| {
+                    json!({
+                        "arch_id": id,
+                        "manifest": m,
+                        "state": state.name(),
+                        "reason": state.reason(),
+                    })
+                })
                 .collect::<Vec<_>>(),
         ),
         // The one door a *real* arch comes in by. `kind` picks the adapter and
@@ -399,10 +424,18 @@ fn dispatch(
         // that mounts a new kind needs no new verb (SP1b ruling 4).
         "arch.mount" => {
             let kind = p["kind"].as_str().ok_or_else(|| bad("kind"))?;
+            // Recorded before anything is mounted, so a config this node could
+            // not make a spec out of — one carrying a credential — is refused
+            // rather than mounted into an arch no boot can bring back.
+            let spec = mount_spec_of(kind, &p["config"])?;
             let adapter: Arc<dyn ArchAdapter> = match kind {
                 "claude-code" => {
                     let version = claude_version.ok_or_else(|| internal("no claude version"))?;
-                    Arc::new(claude_code_adapter(&k, &p["config"], &version)?)
+                    let state_dir = k.store().state_dir.clone();
+                    Arc::new(
+                        claude_code_adapter(&state_dir, &p["config"], &version)
+                            .map_err(|e| bad(&format!("{e:#}")))?,
+                    )
                 }
                 // Already mounted, above, before the lock: all that is left
                 // here is to hand the kernel the adapter it produced.
@@ -425,7 +458,7 @@ fn dispatch(
                 Remount::Keep
             };
             let outcome = k
-                .mount_with(adapter, remount)
+                .mount_with(adapter, Some(spec), remount)
                 .map_err(|e| bad(&e.to_string()))?;
             let answer = json!({
                 "arch_id": outcome.arch_id,
@@ -445,12 +478,17 @@ fn dispatch(
                 .as_u64()
                 .map_or(Ok(4096), u32::try_from)
                 .map_err(|_| bad("context_ceiling"))?;
+            let manifest = mock_manifest(name, ceiling);
+            // The mock gets a spec like every other kind: a mock arch that
+            // vanished on restart would be a second, quieter version of the
+            // bug this task is about.
+            let spec = MountSpec::mock(&manifest, ceiling);
             let adapter = MockAdapter {
-                manifest: mock_manifest(name, ceiling),
+                manifest,
                 budget: ceiling,
             };
             let outcome = k
-                .mount(Arc::new(adapter))
+                .mount_with(Arc::new(adapter), Some(spec), Remount::Keep)
                 .map_err(|e| bad(&e.to_string()))?;
             Ok(json!({
                 "arch_id": outcome.arch_id,
@@ -591,15 +629,64 @@ fn claude_binary(config: &Value) -> std::path::PathBuf {
 /// The version is part of the arch identity: a mount without it would mint an
 /// arch id naming no particular Claude Code, and every call on it would fail
 /// anyway — so it is refused here, where the person mounting is still
-/// listening. Called before the kernel lock is taken.
-fn claude_code_version(config: &Value) -> Result<String, RpcError> {
+/// listening. Called before the kernel lock is taken, and again at boot by the
+/// factory, where a binary that is gone is what makes the arch unavailable.
+fn claude_code_version(config: &Value) -> anyhow::Result<String> {
     let binary = claude_binary(config);
     vk_arch_claude_code::probe_version(&binary).ok_or_else(|| {
-        bad(&format!(
+        anyhow::anyhow!(
             "cannot run `{} --version`: install Claude Code, or pass the binary's path",
             binary.display()
-        ))
+        )
     })
+}
+
+/// How this node makes an adapter out of a persisted [`MountSpec`] — the three
+/// kinds it is compiled with (SP1b ruling 14).
+///
+/// `vkd` hands this to `RealKernel::open_with_factory`, and the kernel calls
+/// it once per persisted arch at boot. It is the *same* code `arch.mount`
+/// runs, reached by the same `kind` and the same `config`, which is the only
+/// way a re-created arch can be relied on to be the arch that was mounted:
+/// two construction paths would drift, and the drift would show up as an arch
+/// id that changed under an operator who did nothing.
+///
+/// `state_dir` is this node's, not a client's: it is where the Claude Code
+/// arch's working directory lives, and a spec does not get to name it.
+///
+/// Everything slow is inside the adapters and bounded by their own timeouts —
+/// `claude --version`, a `docker start`, waiting for the Ollama server — so a
+/// boot costs at worst one such timeout per arch. An error is an unavailable
+/// arch, never a boot that fails: an engine that is not running is not a
+/// reason for a node to stop serving everything else it has.
+pub fn adapter_factory(state_dir: std::path::PathBuf) -> vk_kernel::AdapterFactory {
+    let mock = vk_kernel::mock_factory();
+    Box::new(move |spec: &MountSpec| match spec.kind.as_str() {
+        "mock" => mock(spec),
+        "claude-code" => {
+            let version = claude_code_version(&spec.config)?;
+            Ok(Box::new(claude_code_adapter(
+                &state_dir,
+                &spec.config,
+                &version,
+            )?))
+        }
+        "ollama" => Ok(Box::new(ollama_adapter(&spec.config)?)),
+        other => anyhow::bail!("no arch kind {other}"),
+    })
+}
+
+/// The spec `arch.mount` records for what it just mounted.
+///
+/// `recreate` never survives into it: it destroys and rebuilds a container, so
+/// a spec carrying it would throw the container away on every boot (Ruling
+/// 10). It is an action a person asks for once, not a property of the arch.
+fn mount_spec_of(kind: &str, config: &Value) -> Result<MountSpec, RpcError> {
+    let mut config = config.clone();
+    if let Some(map) = config.as_object_mut() {
+        map.remove("recreate");
+    }
+    MountSpec::new(kind, config).map_err(|e| bad(&format!("{e:#}")))
 }
 
 /// Build the Claude Code adapter `arch.mount { kind: "claude-code" }` asks
@@ -607,27 +694,26 @@ fn claude_code_version(config: &Value) -> Result<String, RpcError> {
 /// defaults; the working directory does not, because it is this node's to
 /// choose and not a client's (SP1b ruling 4).
 fn claude_code_adapter(
-    k: &RealKernel,
+    state_dir: &std::path::Path,
     config: &Value,
     claude_version: &str,
-) -> Result<ClaudeCodeAdapter, RpcError> {
+) -> anyhow::Result<ClaudeCodeAdapter> {
     let defaults = ClaudeCodeConfig::default();
-    let u32_of = |name: &str, fallback: u32| -> Result<u32, RpcError> {
+    let u32_of = |name: &str, fallback: u32| -> anyhow::Result<u32> {
         match config.get(name) {
             None | Some(Value::Null) => Ok(fallback),
             Some(v) => v
                 .as_u64()
                 .and_then(|n| u32::try_from(n).ok())
-                .ok_or_else(|| bad(name)),
+                .ok_or_else(|| anyhow::anyhow!("{name} must be a whole number of tokens")),
         }
     };
     // One fixed, empty directory under the state directory, not a temp
     // directory per call: `claude` creates `~/.claude/projects/<mangled
     // cwd>/memory/` for wherever it runs, so a new directory each time would
     // leave a new one of those behind each time (spike 2a).
-    let cwd = k.store().state_dir.join("claude-code-cwd");
-    vk_store::paths::private_dir(&cwd)
-        .map_err(|e| internal(&format!("create {}: {e}", cwd.display())))?;
+    let cwd = state_dir.join("claude-code-cwd");
+    vk_store::paths::private_dir(&cwd).with_context(|| format!("create {}", cwd.display()))?;
     let default_timeout = u32::try_from(defaults.timeout.as_secs()).unwrap_or(u32::MAX);
     let cfg = ClaudeCodeConfig {
         binary: claude_binary(config),
@@ -654,15 +740,15 @@ fn claude_code_adapter(
 /// server that is already running says this node did not start it. Saying
 /// nothing gets the container, on loopback, under this node's caps — the
 /// ungoverned arch is one a person has to ask for by name.
-fn ollama_adapter(config: &Value) -> Result<OllamaAdapter, RpcError> {
+fn ollama_adapter(config: &Value) -> anyhow::Result<OllamaAdapter> {
     let defaults = OllamaConfig::default();
-    let u32_of = |name: &str, fallback: u32| -> Result<u32, RpcError> {
+    let u32_of = |name: &str, fallback: u32| -> anyhow::Result<u32> {
         match config.get(name) {
             None | Some(Value::Null) => Ok(fallback),
             Some(v) => v
                 .as_u64()
                 .and_then(|n| u32::try_from(n).ok())
-                .ok_or_else(|| bad(name)),
+                .ok_or_else(|| anyhow::anyhow!("{name} must be a whole number")),
         }
     };
     let string_of = |name: &str, fallback: &str| -> String {
@@ -688,7 +774,9 @@ fn ollama_adapter(config: &Value) -> Result<OllamaAdapter, RpcError> {
         max_tokens: u32_of("max_tokens", defaults.max_tokens)?,
         seed: match config.get("seed") {
             None | Some(Value::Null) => defaults.seed,
-            Some(v) => v.as_u64().ok_or_else(|| bad("seed"))?,
+            Some(v) => v
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("seed must be a whole number"))?,
         },
         temperature: defaults.temperature,
         container,
@@ -696,7 +784,7 @@ fn ollama_adapter(config: &Value) -> Result<OllamaAdapter, RpcError> {
         // one destroys a container, so it is never a default (Ruling 10).
         recreate: config.get("recreate") == Some(&Value::Bool(true)),
     };
-    OllamaAdapter::mount(cfg).map_err(|e| bad(&format!("{e:#}")))
+    OllamaAdapter::mount(cfg)
 }
 
 fn mock_manifest(name: &str, ctx: u32) -> ArchManifest {
