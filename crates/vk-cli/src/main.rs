@@ -717,8 +717,10 @@ fn detach(cmd: &mut Command, state_dir: &Path) -> Result<()> {
 
 /// How a daemon this shell started stopped being a daemon it is waiting for.
 enum Started {
-    /// It answered on the endpoint.
-    Serving,
+    /// It answered on the endpoint, with the `boot.info` it answered with —
+    /// which says how many arches are still coming up behind it, so `vk boot`
+    /// can tell the person who ran it (Task 1b review, Important 1).
+    Serving(Box<Value>),
     /// It gave up before answering — a refused ledger, a key it could not
     /// read, an endpoint already taken.
     Exited(std::process::ExitStatus),
@@ -764,6 +766,7 @@ fn boot(cli: &Cli, rt: &tokio::runtime::Runtime, a: &BootArgs) -> Result<()> {
                 "endpoint": ep.0,
                 "state_dir": state_dir.display().to_string(),
                 "already_running": true,
+                "arches_starting": info["arches_starting"].as_u64().unwrap_or(0),
             }),
             render::booted,
         );
@@ -805,8 +808,8 @@ fn boot(cli: &Cli, rt: &tokio::runtime::Runtime, a: &BootArgs) -> Result<()> {
     let start = Instant::now();
     let outcome = rt.block_on(async {
         loop {
-            if serving(&ep).await.is_some() {
-                return Started::Serving;
+            if let Some(info) = serving(&ep).await {
+                return Started::Serving(Box::new(info));
             }
             match child.try_wait() {
                 Ok(Some(status)) => return Started::Exited(status),
@@ -820,8 +823,8 @@ fn boot(cli: &Cli, rt: &tokio::runtime::Runtime, a: &BootArgs) -> Result<()> {
         }
     });
     let log = state_dir.join("vkd.log");
-    match outcome {
-        Started::Serving => {}
+    let info = match outcome {
+        Started::Serving(info) => *info,
         // It said why on its way out. The log is where a detached daemon
         // speaks, so its last lines are the answer — naming a file to go and
         // read is not.
@@ -847,13 +850,17 @@ fn boot(cli: &Cli, rt: &tokio::runtime::Runtime, a: &BootArgs) -> Result<()> {
                 log.display()
             );
         }
-    }
+    };
     show(
         cli,
         json!({
             "pid": pid,
             "endpoint": ep.0,
             "state_dir": state_dir.display().to_string(),
+            // The node is serving; some of its arches may still be coming up.
+            // Said here rather than left to be discovered by a task step that
+            // asks to be retried (Task 1b review, Important 1).
+            "arches_starting": info["arches_starting"].as_u64().unwrap_or(0),
         }),
         render::booted,
     )

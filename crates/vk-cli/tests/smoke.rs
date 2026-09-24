@@ -1153,6 +1153,9 @@ fn a_real_arch_is_re_created_when_the_daemon_restarts_and_is_never_a_mock() {
             .expect("spawn vkd"),
     );
     wait_until(&sh, true, "vkd never answered after the restart").expect("status");
+    // The node answers before its arches are built, so this waits for the
+    // startup pass rather than for the endpoint (Task 1b review, Important 1).
+    settled_arches(&sh);
     let ls = sh.json(&["ls", "/arches", "--json"]);
     let row = ls["arches"]
         .as_array()
@@ -1260,6 +1263,9 @@ fn an_arch_whose_engine_has_gone_comes_back_unavailable_and_refuses_to_run() {
         "an unavailable arch must not stop the node serving",
     )
     .expect("status");
+    // It is `starting` until the factory has been tried and has failed; the
+    // verdict is what this test is about, so wait for the pass.
+    settled_arches(&sh);
 
     let ls = sh.json(&["ls", "/arches", "--json"]);
     let row = ls["arches"]
@@ -1301,4 +1307,216 @@ fn an_arch_whose_engine_has_gone_comes_back_unavailable_and_refuses_to_run() {
     let top = sh.json(&["top", "--json"]);
     assert_eq!(top["states"][&draft], "unavailable", "{top}");
     assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
+}
+
+/// A `claude` stand-in that is *slow* to answer `--version`, and otherwise
+/// identical to `fake_claude`'s — same version string, so the same arch
+/// identity, so the same arch id. Swapping one for the other is a node whose
+/// engine has become slow to start, which is the ordinary case after a machine
+/// reboot: Docker Desktop still coming up, a model still loading.
+fn slow_claude(dir: &std::path::Path, bin: &std::path::Path) {
+    let reply = path_of(&dir.join("reply.json"));
+    // `ping` rather than `timeout`: `timeout` refuses to run when stdin is
+    // redirected, which is exactly how the adapter runs it.
+    let script = if cfg!(windows) {
+        "@echo off\r\nif \"%~1\"==\"--version\" (\r\n  ping -n 4 127.0.0.1 >nul\r\n  \
+         echo 0.0.0-smoke\r\n  exit /b 0\r\n)\r\nfindstr \"^\" >nul\r\ntype \"{R}\"\r\nexit /b 0\r\n"
+    } else {
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then sleep 3; echo 0.0.0-smoke; exit 0; fi\n\
+         cat >/dev/null\ncat '{R}'\n"
+    };
+    std::fs::write(bin, script.replace("{R}", &reply)).expect("write the slow stand-in");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o700)).expect("chmod +x");
+    }
+}
+
+/// Every arch in `vk ls /arches --json`, by id.
+fn arch_states(sh: &Shell) -> std::collections::BTreeMap<String, String> {
+    sh.json(&["ls", "/arches", "--json"])["arches"]
+        .as_array()
+        .expect("/arches is a list of arches")
+        .iter()
+        .map(|a| {
+            (
+                str_of(a, "arch_id").to_string(),
+                str_of(a, "state").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Wait until this node's startup pass has reached every arch: none is
+/// `starting` any more, so each one is `ready` or `unavailable` for good.
+///
+/// A daemon answers *before* its arches are built (Task 1b review, Important
+/// 1), so a test that asserts what an arch came back as has to wait for the
+/// pass — the endpoint answering is no longer the same moment.
+fn settled_arches(sh: &Shell) -> std::collections::BTreeMap<String, String> {
+    let start = Instant::now();
+    loop {
+        let states = arch_states(sh);
+        if !states.values().any(|s| s == "starting") {
+            return states;
+        }
+        assert!(
+            start.elapsed() < READY_TIMEOUT * 3,
+            "the arches never finished starting: {states:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A node with real arches comes back **serving**, and re-creates them behind
+/// the endpoint (Task 1b review, Important 1).
+///
+/// Re-creation used to run inside `RealKernel::open`, before the endpoint was
+/// bound, so a node whose engine took longer than `vk boot`'s 10 s to answer
+/// was killed by the very verb documented to start it. Here the two arches
+/// take ~3 s each to probe; `vk boot` must come back in less than one of those
+/// and say how many are still coming up, the listing must show `starting` and
+/// then `ready`, a step submitted during the window must be retryable rather
+/// than failed, and a second daemon over the same store must still be refused
+/// by the store lock before anything is built.
+#[test]
+fn a_node_with_slow_arches_serves_while_they_start_and_vk_boot_does_not_kill_it() {
+    let vkd = vkd_exe();
+    assert!(vkd.exists());
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let sh = Shell {
+        endpoint: endpoint.clone(),
+        node_key: dir.path().join("node.key"),
+    };
+    let claude = fake_claude(dir.path());
+    let bin = path_of(&claude);
+
+    // Two arches, mounted while the stand-in is still fast.
+    let mounted = {
+        let _daemon = Daemon(
+            vkd_cmd(dir.path(), &endpoint, &[])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn vkd"),
+        );
+        wait_until(&sh, true, "vkd never answered").expect("status");
+        let m = sh.json(&[
+            "mount",
+            "claude-code",
+            "--bin",
+            &bin,
+            "--draft-model",
+            "claude-sonnet-5",
+            "--judge-model",
+            "claude-opus-5",
+            "--json",
+        ]);
+        str_of(&m["draft"], "arch_id").to_string()
+    };
+    wait_until(&sh, false, "the killed daemon still holds the endpoint");
+
+    // The same engine, now slow to say what version it is.
+    slow_claude(dir.path(), &claude);
+
+    // `vk boot`, the documented verb, over the same store.
+    let here = path_of(dir.path());
+    let master = path_of(&dir.path().join("master.key"));
+    let key = path_of(&dir.path().join("node.key"));
+    let boot = [
+        "boot",
+        "--state-dir",
+        &here,
+        "--master-key-file",
+        &master,
+        "--node-key-file",
+        &key,
+        "--json",
+    ];
+    let started = Instant::now();
+    let booted = sh.json(&boot);
+    let took = started.elapsed();
+    let daemon = Detached(booted["pid"].as_u64().expect("a pid to stop it with"));
+    assert!(
+        took < Duration::from_secs(3),
+        "vk boot waited {took:?} for arches it should have let come up behind the endpoint"
+    );
+    assert_eq!(
+        booted["arches_starting"], 2,
+        "the node says what is still coming up: {booted}"
+    );
+    let human = sh.ok(&["ls", "/arches"]);
+    assert!(human.contains("STATE"), "{human}");
+
+    // Listed as `starting` while they come up, and a step that names one is
+    // told to retry — the task is queued, not failed.
+    let states = arch_states(&sh);
+    assert_eq!(
+        states.get(&mounted).map(String::as_str),
+        Some("starting"),
+        "{states:?}"
+    );
+    let task = str_of(
+        &sh.json(&[
+            "task",
+            "submit",
+            "--goal",
+            "Say something",
+            "--plan",
+            &mounted,
+            "--draft",
+            &mounted,
+            "--json",
+        ]),
+        "id",
+    )
+    .to_string();
+    let retry = sh.run(&["task", "step", &task, "--all"]);
+    assert!(
+        !retry.status.success(),
+        "a step on a starting arch does not run yet"
+    );
+    let why = String::from_utf8_lossy(&retry.stderr);
+    assert!(why.contains("is starting; retry"), "{why}");
+    let queued = sh.json(&["task", "show", &task, "--json"]);
+    assert_eq!(
+        queued["status"], "queued",
+        "a task waiting on an arch that is coming up is queued, not failed: {queued}"
+    );
+    assert_eq!(queued["steps"][0]["status"], "pending", "{queued}");
+
+    // A second daemon over the same store is still refused — by the store
+    // lock, before it builds anything.
+    let second = Daemon(
+        vkd_cmd(dir.path(), &vk_ipc::transport::test_endpoint().0, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn a second vkd"),
+    );
+    let (exit, refusal) = exit_of(second, "a second vkd over a served store is still running");
+    assert!(!exit.success(), "a second daemon must be refused: {exit:?}");
+    assert!(
+        refusal.contains("lock"),
+        "refused by the store lock: {refusal}"
+    );
+
+    // They come up, and the very same task runs — no re-submission.
+    let states = settled_arches(&sh);
+    assert!(
+        states.values().all(|s| s == "ready"),
+        "every arch was re-created: {states:?}"
+    );
+    let done = sh.json(&["task", "step", &task, "--all", "--json"]);
+    assert_eq!(done["status"], "done", "{done}");
+    let top = sh.json(&["top", "--json"]);
+    assert_eq!(
+        top["arches"][&mounted]["tokens_in"],
+        2 * (7 + 11 + 23),
+        "it is the real adapter that answered: {top}"
+    );
+    assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
+    drop(daemon);
 }

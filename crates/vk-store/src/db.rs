@@ -237,4 +237,53 @@ mod tests {
         db.migrate().unwrap();
         assert_eq!(db.kv_get("schema_version").unwrap().as_deref(), Some("1"));
     }
+
+    /// The primitive `persist_mount` and `unmount` rest their atomicity on
+    /// (Task 1b review, Minor 3): everything a transaction writes lands
+    /// together, and a closure that fails leaves the store exactly as it was.
+    #[test]
+    fn a_transaction_commits_both_writes_or_neither() {
+        let d = tempfile::tempdir().unwrap();
+        let db = Db::open(&d.path().join("vk.sqlite")).unwrap();
+        db.put_json("kv_test", "keep", &Thing { n: 1 }).unwrap();
+
+        // Committed: both rows are there afterwards.
+        let out = db
+            .transaction(|| {
+                db.put_json("kv_test", "a", &Thing { n: 1 })?;
+                db.put_json("arches", "b", &Thing { n: 2 })?;
+                Ok(7)
+            })
+            .unwrap();
+        assert_eq!(out, 7, "the closure's value comes back");
+        assert_eq!(
+            db.get_json::<Thing>("kv_test", "a").unwrap(),
+            Some(Thing { n: 1 })
+        );
+        assert_eq!(
+            db.get_json::<Thing>("arches", "b").unwrap(),
+            Some(Thing { n: 2 })
+        );
+
+        // Rolled back: the first write is undone by the second's failure, and
+        // a row written before the transaction is untouched.
+        let err = db
+            .transaction(|| -> Result<()> {
+                db.put_json("kv_test", "c", &Thing { n: 3 })?;
+                db.delete("kv_test", "keep")?;
+                anyhow::bail!("the second half did not land")
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("did not land"), "{err}");
+        assert_eq!(
+            db.get_json::<Thing>("kv_test", "c").unwrap(),
+            None,
+            "a write inside a transaction that failed must not survive it"
+        );
+        assert_eq!(
+            db.get_json::<Thing>("kv_test", "keep").unwrap(),
+            Some(Thing { n: 1 }),
+            "and a delete inside it must not either"
+        );
+    }
 }

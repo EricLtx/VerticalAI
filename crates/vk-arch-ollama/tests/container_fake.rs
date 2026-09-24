@@ -352,9 +352,22 @@ fn a_container_is_adopted_only_when_it_is_the_one_this_mount_asks_for() {
         "n1",
     )
     .expect("open a kernel");
-    let mounted = kernel.mount(Arc::new(first)).expect("mount the arch");
+    // The spec a real `arch.mount` would record beside the manifest, so the
+    // next boot could make this arch again.
+    let spec = |_: ()| {
+        vk_kernel::arch::MountSpec::new(
+            "ollama",
+            serde_json::json!({ "model": "gemma3:1b", "num_ctx": 8192 }),
+        )
+        .expect("a spec of plain configuration")
+    };
+    let mounted = kernel
+        .mount(Arc::new(first), spec(()))
+        .expect("mount the arch");
     assert!(!mounted.already_mounted);
-    let again = kernel.mount(Arc::new(second)).expect("mount it again");
+    let again = kernel
+        .mount(Arc::new(second), spec(()))
+        .expect("mount it again");
     assert_eq!(again.arch_id, mounted.arch_id);
     assert!(again.already_mounted, "the same arch, said so");
     assert!(

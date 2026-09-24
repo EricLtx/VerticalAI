@@ -87,6 +87,11 @@ pub struct BootReport {
     /// existed.
     #[serde(default)]
     pub unavailable_arches: Vec<String>,
+    /// Which of `arches` were still being built when the node started serving
+    /// (Task 1b review, Important 1). The node answers throughout; these are
+    /// the ones a step would be told to retry on for a few seconds more.
+    #[serde(default)]
+    pub starting_arches: Vec<String>,
     pub devices: Vec<String>,
     pub stopped_scopes: Vec<String>,
     /// Placeholder (spec §4.3): there is no policy engine in SP1a, so boot
@@ -226,8 +231,12 @@ fn adapter_failed(arch_id: &str, e: arch::AdapterError) -> KernelError {
 /// to gain one. `vkd` passes the real factory to
 /// [`RealKernel::open_with_factory`]; [`RealKernel::open`] uses one that knows
 /// only the mock, which is all a kernel test needs.
+/// `Arc`, not `Box`: the daemon calls the factory on a background task with
+/// the kernel mutex *not* held, so the same factory has to be reachable from
+/// outside the kernel as well as from `start_arches_now` inside it
+/// (Task 1b review, Important 1).
 pub type AdapterFactory =
-    Box<dyn Fn(&arch::MountSpec) -> Result<Box<dyn arch::ArchAdapter>> + Send + Sync>;
+    Arc<dyn Fn(&arch::MountSpec) -> Result<Box<dyn arch::ArchAdapter>> + Send + Sync>;
 
 /// Is this arch usable, and if not, why not (SP1b ruling 14)?
 ///
@@ -241,24 +250,33 @@ pub type AdapterFactory =
 pub enum ArchState {
     /// The adapter is there: the factory made it and it is the arch the id says.
     Ready,
+    /// The spec is known and the adapter is being built right now — a
+    /// `docker start`, a cold model load, a `claude --version` (Task 1b
+    /// review, Important 1). The node serves throughout; a step that names
+    /// this arch is told to retry rather than failed, because nothing is
+    /// wrong: the arch is seconds away.
+    Starting,
     /// It is not, and this is what stopped it — the factory's own error, or
-    /// the two arch ids when the runtime under this node changed.
+    /// what differs between the manifest that was stored and the one the
+    /// factory just made.
     Unavailable(String),
 }
 
 impl ArchState {
-    /// The word every read surface prints: `ready` or `unavailable`.
+    /// The word every read surface prints: `ready`, `starting` or `unavailable`.
     pub fn name(&self) -> &'static str {
         match self {
             ArchState::Ready => "ready",
+            ArchState::Starting => "starting",
             ArchState::Unavailable(_) => "unavailable",
         }
     }
 
-    /// Why it is not usable; `None` for one that is.
+    /// Why it is not usable; `None` for one that is, and for one still coming
+    /// up — there is nothing wrong with it to explain.
     pub fn reason(&self) -> Option<&str> {
         match self {
-            ArchState::Ready => None,
+            ArchState::Ready | ArchState::Starting => None,
             ArchState::Unavailable(why) => Some(why),
         }
     }
@@ -271,18 +289,71 @@ struct UnavailableArch {
     reason: String,
 }
 
+/// An arch whose adapter has not been built yet: the manifest it must come
+/// back as, and the spec to build it from.
+struct PendingMount {
+    manifest: ArchManifest,
+    spec: arch::MountSpec,
+}
+
+/// What differs between the manifest an arch was mounted with and the one the
+/// factory has just made — `None` when they are the same manifest (Task 1b
+/// review, Important 2).
+///
+/// The whole manifest, not the arch id. `arch_id` hashes `ArchIdentity` alone,
+/// so `clearance`, `capabilities`, `retention_days`, `governed` and the rest
+/// can all differ under an id that matches — and the adapter's manifest is the
+/// one `i2_flow` consults on the very next prompt. The mount path has always
+/// refused exactly this ("already mounted with a different manifest"); the
+/// boot path used to let it through.
+///
+/// The field names are read off the serialised manifests rather than listed
+/// here, so a field added to `ArchManifest` later is named by this without
+/// anybody having to remember to come back.
+fn manifest_difference(stored: &ArchManifest, made: &ArchManifest) -> Option<String> {
+    if hash_canonical(stored) == hash_canonical(made) {
+        return None;
+    }
+    let (stored_id, made_id) = (stored.arch_id(), made.arch_id());
+    if stored_id != made_id {
+        return Some(format!("identity {stored_id} → {made_id}"));
+    }
+    let (a, b) = (
+        serde_json::to_value(stored).unwrap_or_default(),
+        serde_json::to_value(made).unwrap_or_default(),
+    );
+    let named: Vec<&str> = a
+        .as_object()
+        .map(|o| {
+            o.iter()
+                .filter(|(field, value)| b.get(field) != Some(*value))
+                .map(|(field, _)| field.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(if named.is_empty() {
+        "it is not the manifest that was stored".into()
+    } else {
+        named.join(", ")
+    })
+}
+
 pub struct RealKernel {
     pub node_id: String,
     store: Store,
     clock: HlcClock,
     adapters: BTreeMap<String, Arc<dyn arch::ArchAdapter>>,
-    /// The arches that are mounted and not usable. Disjoint from `adapters`:
-    /// an id is in exactly one of the two, which is what makes
-    /// `mounted_arch_is_ready` a lookup rather than a question.
+    /// The arches whose adapter is still being built. Disjoint from
+    /// `adapters` and `unavailable`: an id is in exactly one of the three,
+    /// which is what makes `arch_state` a lookup rather than a question.
+    starting: BTreeMap<String, PendingMount>,
+    /// The arches that are mounted and not usable.
     unavailable: BTreeMap<String, UnavailableArch>,
-    /// Makes an adapter out of a persisted spec. Used at boot, never on the
-    /// `arch.mount` path — building an adapter starts containers and waits on
-    /// binaries, and the daemon does that before it takes the kernel lock.
+    /// Makes an adapter out of a persisted spec. Never called with the kernel
+    /// mutex held — building an adapter starts containers and waits on
+    /// binaries. `vkd` clones this out and drives startup from a background
+    /// task; `start_arches_now` is the in-process version, for callers that
+    /// have no mutex.
     factory: AdapterFactory,
     budgets: BTreeMap<String, u32>,
     locks: LockTable,
@@ -306,7 +377,7 @@ pub struct RealKernel {
 /// is a hash of it and re-deriving it from a name and a ceiling would mint a
 /// different arch.
 pub fn mock_factory() -> AdapterFactory {
-    Box::new(|spec: &arch::MountSpec| {
+    Arc::new(|spec: &arch::MountSpec| {
         anyhow::ensure!(
             spec.kind == "mock",
             "this kernel was opened without a factory for arch kind {}; \
@@ -324,23 +395,32 @@ pub fn mock_factory() -> AdapterFactory {
 }
 
 impl RealKernel {
-    /// Open the store and bring this node's state back, with a factory that
-    /// knows only the mock arch. What every kernel test uses; `vkd` uses
-    /// [`RealKernel::open_with_factory`], because only the daemon knows which
-    /// arch kinds this build has.
+    /// Open the store, bring this node's state back, and build every mounted
+    /// arch before returning, with a factory that knows only the mock.
+    ///
+    /// What every kernel test uses. The building is synchronous here because
+    /// the mock is instantaneous and there is no mutex in the way; `vkd` uses
+    /// [`RealKernel::open_with_factory`] and drives startup itself, because
+    /// real engines are not instantaneous and its kernel is behind a mutex.
     pub fn open(state_dir: &Path, key_source: KeySource, node_id: &str) -> Result<RealKernel> {
-        RealKernel::open_with_factory(state_dir, key_source, node_id, mock_factory())
+        let mut k = RealKernel::open_with_factory(state_dir, key_source, node_id, mock_factory())?;
+        k.start_arches_now();
+        Ok(k)
     }
 
     /// The same, with the factory that re-creates every kind this node can
-    /// mount (SP1b ruling 14).
+    /// mount (SP1b ruling 14) — and **without building anything**.
     ///
-    /// `load` calls it once per persisted arch, and each call may reach
-    /// outside the process — run `claude --version`, `docker start` a
-    /// container that is not running. Each of those is bounded by the
-    /// adapter's own timeout, so boot costs at worst one such timeout per
-    /// arch, and an arch the factory refuses costs the node nothing but a
-    /// warning and an `Unavailable` row.
+    /// Every persisted arch comes back `Starting`, and the caller brings them
+    /// up afterwards through [`RealKernel::pending_mounts`] and
+    /// [`RealKernel::install_arch`]. That split is the whole point: building
+    /// an adapter runs `claude --version`, a `docker start`, a cold model
+    /// load — up to minutes of it — and doing that inside `open` left the
+    /// node unreachable for the whole time, so `vk boot` timed out after 10 s
+    /// and *killed* the daemon it had just started (Task 1b review,
+    /// Important 1). The store lock is still taken here, before anything
+    /// else, so a second daemon is refused before a single container is
+    /// touched.
     pub fn open_with_factory(
         state_dir: &Path,
         key_source: KeySource,
@@ -353,6 +433,7 @@ impl RealKernel {
             store,
             clock: HlcClock::new(node_id),
             adapters: BTreeMap::new(),
+            starting: BTreeMap::new(),
             unavailable: BTreeMap::new(),
             factory,
             budgets: BTreeMap::new(),
@@ -440,59 +521,36 @@ impl RealKernel {
         Ok(())
     }
 
-    /// Bring every mounted arch back (SP1b ruling 14).
+    /// Read every mounted arch back off disk (SP1b ruling 14). Builds nothing.
     ///
-    /// Each persisted manifest is re-created through the factory from the
-    /// spec its mount recorded. There are four outcomes and three of them are
-    /// `Unavailable`, which is the whole change: before this, every one of
-    /// them was silently a `MockAdapter` under the real arch's id.
-    ///
-    /// - the factory makes the arch the stored id names → `Ready`;
-    /// - the factory fails → `Unavailable` with its error. Warned, listed,
-    ///   refused by the scheduler. Never a boot failure: an engine that is not
-    ///   running is not a reason for the node to stop serving the rest of what
-    ///   it has;
-    /// - the factory makes a *different* arch — new weights, a new image, a
-    ///   newer `claude` — → the stored id is `Unavailable("manifest changed")`
-    ///   and the new arch is **not** mounted. Substituting one model for
-    ///   another behind an id is exactly what an arch id exists to prevent, so
-    ///   the operator re-mounts and gets the new id knowingly;
-    /// - no spec was recorded (an arch mounted before this existed, or by a
-    ///   caller that gave none) → `Unavailable`, saying to mount it again.
+    /// An arch with a spec becomes `Starting` — the caller builds it, after
+    /// the endpoint is answering. An arch with no spec (one mounted before
+    /// Task 1b existed) has nothing to build from, so it is `Unavailable` at
+    /// once and says to mount it again; there is no point in making the
+    /// operator wait for a startup pass to tell them that.
     fn load_arches(&mut self) -> Result<()> {
         let specs: BTreeMap<String, arch::MountSpec> =
             self.store.db.list_json("mounts")?.into_iter().collect();
         let manifests: Vec<(String, ArchManifest)> = self.store.db.list_json("arches")?;
         for (id, manifest) in &manifests {
-            let Some(spec) = specs.get(id) else {
-                self.mark_unavailable(
+            match specs.get(id) {
+                None => self.mark_unavailable(
                     id,
                     manifest,
                     "no mount spec was recorded for this arch, so there is nothing to make it \
                      from; mount it again"
                         .into(),
-                );
-                continue;
-            };
-            let adapter = match (self.factory)(spec) {
-                Ok(adapter) => adapter,
-                Err(e) => {
-                    self.mark_unavailable(id, manifest, format!("{e:#}"));
-                    continue;
+                ),
+                Some(spec) => {
+                    self.starting.insert(
+                        id.clone(),
+                        PendingMount {
+                            manifest: manifest.clone(),
+                            spec: spec.clone(),
+                        },
+                    );
                 }
-            };
-            let made = adapter.manifest().arch_id();
-            if made != *id {
-                // Dropped here, outside any lock this kernel holds — it is
-                // still being constructed — because dropping an adapter can
-                // stop a container, and the one just made is not this node's
-                // to keep.
-                drop(adapter);
-                self.mark_unavailable(id, manifest, format!("manifest changed: {id} → {made}"));
-                continue;
             }
-            self.budgets.insert(id.clone(), adapter.context_budget());
-            self.adapters.insert(id.clone(), Arc::from(adapter));
         }
         // A spec whose arch is gone is a leftover of a failed write, never a
         // mount: `unmount` deletes both rows and `mount` writes both together.
@@ -504,6 +562,107 @@ impl RealKernel {
             }
         }
         Ok(())
+    }
+
+    /// Every arch still waiting for its adapter, with the spec to build it
+    /// from. What the daemon's startup task iterates (Task 1b review,
+    /// Important 1).
+    ///
+    /// A snapshot, taken under the kernel lock and then let go of: the caller
+    /// builds each adapter with the lock **released** and hands the result to
+    /// [`RealKernel::install_arch`], which takes the lock again for as long as
+    /// a map insert. The mutex is never held across a `docker start`.
+    pub fn pending_mounts(&self) -> Vec<(String, arch::MountSpec)> {
+        self.starting
+            .iter()
+            .map(|(id, p)| (id.clone(), p.spec.clone()))
+            .collect()
+    }
+
+    /// This node's adapter factory, for a caller that will use it outside the
+    /// kernel lock.
+    pub fn adapter_factory(&self) -> AdapterFactory {
+        self.factory.clone()
+    }
+
+    /// How many arches are still coming up. `boot.info`'s `arches_starting`,
+    /// and what `vk boot` reports to the person who just started the node.
+    pub fn arches_starting(&self) -> usize {
+        self.starting.len()
+    }
+
+    /// Install what the factory made for a `Starting` arch — or record why it
+    /// could not be made (SP1b ruling 14, Task 1b review Importants 1 and 2).
+    ///
+    /// Returns an adapter the **caller** must drop, once it has released the
+    /// kernel lock: dropping one can `docker stop` a container, which is the
+    /// one thing that must never happen under the mutex. `None` when there is
+    /// nothing to throw away.
+    ///
+    /// Three ways this ends with nothing installed, and each of them is a case
+    /// the daemon actually meets:
+    /// - the arch left `Starting` while its adapter was being built — an
+    ///   operator ran `vk mount` or `vk umount` in those seconds — so what was
+    ///   built is stale and goes back to the caller to drop;
+    /// - the factory failed → `Unavailable` with its error;
+    /// - what came back is not the manifest that was stored → `Unavailable`
+    ///   naming what differs and how to retire the old id. Never installed:
+    ///   the adapter's manifest is what `i2_flow` reads, so adopting a
+    ///   manifest whose clearance is not the one on disk would widen what an
+    ///   arch may see, on the first prompt after a restart, with nothing
+    ///   anywhere recording that it had changed.
+    pub fn install_arch(
+        &mut self,
+        arch_id: &str,
+        made: Result<Box<dyn arch::ArchAdapter>>,
+    ) -> Option<Box<dyn arch::ArchAdapter>> {
+        let Some(pending) = self.starting.remove(arch_id) else {
+            tracing::debug!(
+                arch_id = %arch_id,
+                "this arch stopped waiting while its adapter was being built; discarding it"
+            );
+            return made.ok();
+        };
+        match made {
+            Err(e) => {
+                self.mark_unavailable(arch_id, &pending.manifest, format!("{e:#}"));
+                None
+            }
+            Ok(adapter) => match manifest_difference(&pending.manifest, adapter.manifest()) {
+                Some(what) => {
+                    self.mark_unavailable(
+                        arch_id,
+                        &pending.manifest,
+                        format!(
+                            "manifest changed: {what} — run `vk umount {arch_id}` to retire it"
+                        ),
+                    );
+                    Some(adapter)
+                }
+                None => {
+                    self.budgets
+                        .insert(arch_id.into(), adapter.context_budget());
+                    self.adapters.insert(arch_id.into(), Arc::from(adapter));
+                    tracing::info!(arch_id = %arch_id, name = %pending.manifest.name, "arch ready");
+                    None
+                }
+            },
+        }
+    }
+
+    /// Build and install every `Starting` arch on this thread, now.
+    ///
+    /// For a caller that holds no mutex: [`RealKernel::open`], and tests. The
+    /// daemon must **not** use it — its kernel is behind a mutex it would have
+    /// to hold for the whole pass — and uses `pending_mounts` +
+    /// `install_arch` around its own lock instead.
+    pub fn start_arches_now(&mut self) {
+        let factory = self.adapter_factory();
+        for (id, spec) in self.pending_mounts() {
+            // The adapter this did not install, dropped here rather than left
+            // to fall inside `install_arch`: same rule, no lock is held.
+            drop(self.install_arch(&id, factory(&spec)));
+        }
     }
 
     fn mark_unavailable(&mut self, id: &str, manifest: &ArchManifest, reason: String) {
@@ -555,6 +714,7 @@ impl RealKernel {
             recovered_partial_line: self.recovered_partial_line(),
             arches: self.arches().into_iter().map(|(id, _)| id).collect(),
             unavailable_arches: self.unavailable.keys().cloned().collect(),
+            starting_arches: self.starting.keys().cloned().collect(),
             devices: self.devices.ids(),
             stopped_scopes: self.stops.stopped_scopes(),
             policies_version: self.load_policies_version()?,
@@ -673,12 +833,15 @@ impl RealKernel {
     /// Letting the second silently win would relabel a mounted arch, so a
     /// conflicting manifest is refused.
     ///
-    /// An arch mounted this way records no [`arch::MountSpec`], so the next
-    /// boot has nothing to make it from and lists it `Unavailable`. For tests
-    /// and for callers that mount something transient; everything a person
-    /// mounts comes in through `arch.mount`, which always records one.
-    pub fn mount(&mut self, adapter: Arc<dyn arch::ArchAdapter>) -> Result<MountOutcome> {
-        self.mount_with(adapter, None, Remount::Keep)
+    /// The spec is not optional (Task 1b review, Minor 4): a mount that
+    /// recorded nothing would come back `Unavailable` at the next restart,
+    /// which is the bug this whole task is about, one layer down.
+    pub fn mount(
+        &mut self,
+        adapter: Arc<dyn arch::ArchAdapter>,
+        spec: arch::MountSpec,
+    ) -> Result<MountOutcome> {
+        self.mount_with(adapter, spec, Remount::Keep)
     }
 
     /// The same with the spec the next boot re-creates this arch from, and for
@@ -686,29 +849,34 @@ impl RealKernel {
     /// the adapter in the table is therefore stale — `vk mount ollama
     /// --recreate`, which replaces the container itself.
     ///
-    /// An arch that is mounted but `Unavailable` is re-attached here: the
-    /// placeholder is replaced by the adapter the caller just built, and the
-    /// outcome says `already_mounted: false`, because what was there was not
-    /// an arch anybody could use (Ruling 13 for the unavailable case).
+    /// An arch that is mounted but `Unavailable` — or still `Starting` — is
+    /// re-attached here: the placeholder is replaced by the adapter the caller
+    /// just built, and the outcome says `already_mounted: false`, because what
+    /// was there was not an arch anybody could use (Ruling 13 for the
+    /// unavailable case). A startup pass that finishes building that arch
+    /// afterwards finds it gone from `starting` and throws its result away.
     pub fn mount_with(
         &mut self,
         adapter: Arc<dyn arch::ArchAdapter>,
-        spec: Option<arch::MountSpec>,
+        spec: arch::MountSpec,
         remount: Remount,
     ) -> Result<MountOutcome> {
         let m = adapter.manifest().clone();
         m.validate()?;
-        if let Some(spec) = &spec {
-            spec.validate()?;
-        }
+        spec.validate()?;
         let id = m.arch_id();
-        // The manifest an unavailable arch was mounted with is still the
-        // manifest of that id, and it is checked exactly as a live one is: an
-        // id whose clearance quietly widened is the same danger whether the
-        // engine behind it happens to be up.
-        if let Some(down) = self.unavailable.get(&id) {
+        // The manifest an arch that is down or still coming up was mounted
+        // with is still the manifest of that id, and it is checked exactly as
+        // a live one is: an id whose clearance quietly widened is the same
+        // danger whether the engine behind it happens to be up.
+        let recorded = self
+            .unavailable
+            .get(&id)
+            .map(|down| &down.manifest)
+            .or_else(|| self.starting.get(&id).map(|p| &p.manifest));
+        if let Some(recorded) = recorded {
             anyhow::ensure!(
-                down.manifest == m,
+                *recorded == m,
                 "arch {id} is already mounted with a different manifest; unmount first"
             );
         }
@@ -729,7 +897,7 @@ impl RealKernel {
                     already_mounted: true,
                 });
             }
-            self.persist_mount(&id, &m, spec.as_ref())?;
+            self.persist_mount(&id, &m, &spec)?;
             self.budgets.insert(id.clone(), adapter.context_budget());
             // The replaced adapter leaves by the return value, never by a
             // dropped temporary: dropping it here would run its `Drop` — a
@@ -741,11 +909,12 @@ impl RealKernel {
                 already_mounted: true,
             });
         }
-        self.persist_mount(&id, &m, spec.as_ref())?;
+        self.persist_mount(&id, &m, &spec)?;
         // A placeholder is not an adapter, so there is nothing to hand back
-        // and nothing to drop: an `Unavailable` entry is a manifest and a
-        // sentence, and it goes out of the table here.
+        // and nothing to drop: an `Unavailable` entry, or one still waiting
+        // for its adapter, is a manifest and a spec, and it goes out here.
         self.unavailable.remove(&id);
+        self.starting.remove(&id);
         self.budgets.insert(id.clone(), adapter.context_budget());
         self.adapters.insert(id.clone(), adapter);
         self.log("arch.mounted", now_ms(), &id)?;
@@ -766,18 +935,11 @@ impl RealKernel {
         &self,
         id: &str,
         manifest: &ArchManifest,
-        spec: Option<&arch::MountSpec>,
+        spec: &arch::MountSpec,
     ) -> Result<()> {
         self.store.db.transaction(|| {
             self.store.db.put_json("arches", id, manifest)?;
-            match spec {
-                Some(spec) => self.store.db.put_json("mounts", id, spec)?,
-                // No spec now means no spec at the next boot: a stale one left
-                // from a previous mount would re-create something nobody
-                // asked for.
-                None => self.store.db.delete("mounts", id)?,
-            }
-            Ok(())
+            self.store.db.put_json("mounts", id, spec)
         })
     }
 
@@ -806,14 +968,21 @@ impl RealKernel {
     /// Unmounting an `Unavailable` arch is how an operator clears one whose
     /// runtime has changed for good: the placeholder, the manifest and the
     /// mount spec all go, so the next boot has nothing to try to re-create.
+    ///
+    /// The durable delete happens **before** the in-memory tables are touched
+    /// (Task 1b review, Minor 6): a delete that fails used to leave the arch
+    /// gone from this process and still on disk, with no `arch.unmounted`
+    /// event — so it came back at the next boot and the operator was never
+    /// told the unmount had not taken.
     pub fn unmount(&mut self, arch_id: &str) -> Result<Option<Arc<dyn arch::ArchAdapter>>> {
-        let removed = self.adapters.remove(arch_id);
-        self.unavailable.remove(arch_id);
-        self.budgets.remove(arch_id);
         self.store.db.transaction(|| {
             self.store.db.delete("arches", arch_id)?;
             self.store.db.delete("mounts", arch_id)
         })?;
+        let removed = self.adapters.remove(arch_id);
+        self.unavailable.remove(arch_id);
+        self.starting.remove(arch_id);
+        self.budgets.remove(arch_id);
         self.log("arch.unmounted", now_ms(), &arch_id)?;
         Ok(removed)
     }
@@ -838,16 +1007,24 @@ impl RealKernel {
             .adapters
             .iter()
             .map(|(id, a)| (id.clone(), (a.manifest().clone(), ArchState::Ready)));
+        // The manifest of an arch still coming up is the stored one, which is
+        // the one it must come back as — so a listing during startup shows
+        // what the operator mounted, not a guess.
+        let coming = self
+            .starting
+            .iter()
+            .map(|(id, p)| (id.clone(), (p.manifest.clone(), ArchState::Starting)));
         let down = self.unavailable.iter().map(|(id, u)| {
             (
                 id.clone(),
                 (u.manifest.clone(), ArchState::Unavailable(u.reason.clone())),
             )
         });
-        // Through a `BTreeMap` rather than chained: two sorted sequences
+        // Through a `BTreeMap` rather than chained: sorted sequences
         // concatenated are not one sorted sequence, and every caller of this
         // prints it in order.
         ready
+            .chain(coming)
             .chain(down)
             .collect::<BTreeMap<_, _>>()
             .into_iter()
@@ -859,6 +1036,9 @@ impl RealKernel {
     pub fn arch_state(&self, arch_id: &str) -> Option<ArchState> {
         if self.adapters.contains_key(arch_id) {
             return Some(ArchState::Ready);
+        }
+        if self.starting.contains_key(arch_id) {
+            return Some(ArchState::Starting);
         }
         self.unavailable
             .get(arch_id)
@@ -1162,6 +1342,9 @@ impl Kernel for RealKernel {
         // never quietly served by a mock, which is what this used to be.
         let adapter = match self.adapters.get(arch_id).cloned() {
             Some(adapter) => adapter,
+            None if self.starting.contains_key(arch_id) => {
+                return Err(KernelError::ArchStarting(arch_id.into()))
+            }
             None => {
                 return Err(match self.unavailable.get(arch_id) {
                     Some(down) => KernelError::ArchUnavailable(down.reason.clone()),
@@ -1449,13 +1632,12 @@ impl KernelTestHooks for RealKernel {
         // With the spec that makes it again, so a mock arch survives a restart
         // the way a real one does — `open`'s own factory knows this kind.
         let spec = arch::MountSpec::mock(&m, budget);
-        self.mount_with(
+        self.mount(
             Arc::new(arch::MockAdapter {
                 manifest: m,
                 budget,
             }),
-            Some(spec),
-            Remount::Keep,
+            spec,
         )
         .expect("mount")
         .arch_id
@@ -1630,11 +1812,16 @@ mod tests {
     fn boot_reports_what_this_node_came_up_with() {
         let d = tempfile::tempdir().unwrap();
         let mut k = open(d.path());
+        let manifest = local(personal());
+        let spec = arch::MountSpec::mock(&manifest, 100);
         let arch = k
-            .mount(Arc::new(arch::MockAdapter {
-                manifest: local(personal()),
-                budget: 100,
-            }))
+            .mount(
+                Arc::new(arch::MockAdapter {
+                    manifest,
+                    budget: 100,
+                }),
+                spec,
+            )
             .unwrap()
             .arch_id;
         k.enroll_device_persisted("phone-1", [7u8; 32]).unwrap();
@@ -1889,12 +2076,13 @@ mod tests {
         };
         let fallen = || dropped.load(std::sync::atomic::Ordering::SeqCst);
 
-        let first = k.mount(counted(1)).expect("the first mount");
+        let spec = || arch::MountSpec::mock(&local_named("counted", personal()), 100);
+        let first = k.mount(counted(1), spec()).expect("the first mount");
         assert!(!first.already_mounted);
         assert!(first.replaced.is_none());
         let events = k.ledger().events().len();
 
-        let again = k.mount(counted(2)).expect("the same arch again");
+        let again = k.mount(counted(2), spec()).expect("the same arch again");
         assert_eq!(again.arch_id, first.arch_id, "the same arch is the same id");
         assert!(again.already_mounted);
         assert!(
@@ -1924,7 +2112,7 @@ mod tests {
         // The deliberate replacement: it swaps, and the old adapter leaves by
         // the return value rather than being dropped here.
         let swapped = k
-            .mount_with(counted(3), None, Remount::Replace)
+            .mount_with(counted(3), spec(), Remount::Replace)
             .expect("a replacement");
         assert_eq!(swapped.arch_id, first.arch_id);
         assert!(swapped.already_mounted);
@@ -1951,10 +2139,15 @@ mod tests {
         name: &str,
         answer: impl Fn() -> Result<arch::Completion, arch::AdapterError> + Send + Sync + 'static,
     ) -> String {
-        k.mount(Arc::new(Scripted {
-            manifest: local_named(name, personal()),
-            answer: Box::new(answer),
-        }))
+        let manifest = local_named(name, personal());
+        let spec = arch::MountSpec::mock(&manifest, manifest.context_ceiling);
+        k.mount(
+            Arc::new(Scripted {
+                manifest,
+                answer: Box::new(answer),
+            }),
+            spec,
+        )
         .expect("mount")
         .arch_id
     }
@@ -2432,11 +2625,15 @@ mod tests {
             ..mounted.clone()
         };
         let budget = widened.context_ceiling;
+        let spec = arch::MountSpec::mock(&widened, budget);
         let err = k
-            .mount(Arc::new(arch::MockAdapter {
-                manifest: widened,
-                budget,
-            }))
+            .mount(
+                Arc::new(arch::MockAdapter {
+                    manifest: widened,
+                    budget,
+                }),
+                spec,
+            )
             .map(|o| o.arch_id)
             .unwrap_err();
         assert!(
@@ -2655,15 +2852,18 @@ mod tests {
 
     /// One stand-in adapter, and the mount that records how to make it again.
     fn mount_standin(k: &mut RealKernel, name: &str) -> String {
+        mount_standin_outcome(k, name).arch_id
+    }
+
+    fn mount_standin_outcome(k: &mut RealKernel, name: &str) -> MountOutcome {
         let manifest = local_named(name, personal());
         let budget = manifest.context_ceiling;
         k.mount_with(
             Arc::new(StandIn { manifest, budget }),
-            Some(standin_spec(name)),
+            standin_spec(name),
             Remount::Keep,
         )
         .expect("mount")
-        .arch_id
     }
 
     /// A factory that makes the stand-in `standin_spec` names — the daemon's
@@ -2671,7 +2871,7 @@ mod tests {
     /// arch claims, which is how a runtime that changed under a node is
     /// simulated: different weights, different `ArchIdentity`, different id.
     fn standin_factory(weights: Option<&'static str>) -> AdapterFactory {
-        Box::new(move |spec: &arch::MountSpec| {
+        Arc::new(move |spec: &arch::MountSpec| {
             anyhow::ensure!(spec.kind == "standin", "no arch kind {}", spec.kind);
             let name = spec.config["name"].as_str().unwrap_or("standin");
             let mut manifest = local_named(name, personal());
@@ -2686,10 +2886,20 @@ mod tests {
     /// A factory that cannot make anything: the engine is gone, Docker is not
     /// running, the binary was uninstalled.
     fn broken_factory() -> AdapterFactory {
-        Box::new(|spec: &arch::MountSpec| anyhow::bail!("no engine for {} here", spec.kind))
+        Arc::new(|spec: &arch::MountSpec| anyhow::bail!("no engine for {} here", spec.kind))
     }
 
+    /// Open the store and let the arches come up, as a node does — the two
+    /// phases the daemon runs, back to back, because a test has no mutex to
+    /// keep them apart. `open_starting` is the same without the second phase,
+    /// for the tests that are about the window between them.
     fn open_with(dir: &std::path::Path, factory: AdapterFactory) -> RealKernel {
+        let mut k = open_starting(dir, factory);
+        k.start_arches_now();
+        k
+    }
+
+    fn open_starting(dir: &std::path::Path, factory: AdapterFactory) -> RealKernel {
         RealKernel::open_with_factory(dir, KeySource::File(dir.join("master.key")), "n1", factory)
             .unwrap()
     }
@@ -2832,7 +3042,7 @@ mod tests {
             let budget = manifest.context_ceiling;
             k.mount_with(
                 Arc::new(StandIn { manifest, budget }),
-                Some(standin_spec("standin")),
+                standin_spec("standin"),
                 Remount::Keep,
             )
             .unwrap()
@@ -2864,6 +3074,23 @@ mod tests {
         assert!(
             arch::MountSpec::new("x", serde_json::json!({ "auth": { "key": "sk-1" } })).is_err()
         );
+        // Including through a list, and through an object with innocent keys
+        // of its own (Task 1b review, Minor 1): the name over the collection
+        // is what makes everything inside it a credential. A list of secrets
+        // is a secret.
+        assert!(
+            arch::MountSpec::new("x", serde_json::json!({ "api_keys": ["sk-live-1"] })).is_err(),
+            "a list under a credential-shaped name is a list of credentials"
+        );
+        assert!(arch::MountSpec::new(
+            "x",
+            serde_json::json!({ "credentials": { "user": "eric", "value": "sk-1" } })
+        )
+        .is_err());
+        assert!(
+            arch::MountSpec::new("x", serde_json::json!({ "outer": [{ "token": "sk-1" }] }))
+                .is_err()
+        );
         // And the counts every adapter here does carry are not credentials:
         // `max_tokens` is a number, and a number is not a secret.
         arch::MountSpec::new(
@@ -2871,5 +3098,240 @@ mod tests {
             serde_json::json!({ "model": "gemma3:1b", "max_tokens": 2048, "num_ctx": 8192 }),
         )
         .expect("a spec of plain configuration is not a secret");
+    }
+
+    /// An arch whose adapter has not been built yet is `Starting`, and a step
+    /// that names one is told to **retry** — not failed (Task 1b review,
+    /// Important 1). A container that takes four seconds to start must not
+    /// cost a task a human re-submission, so nothing is written down as a
+    /// failure and nothing is inferred; the step goes back to Pending and the
+    /// task to Queued, and the next `vk task step` runs it.
+    #[test]
+    fn a_step_that_names_an_arch_still_starting_is_retryable_and_then_runs() {
+        use crate::tasks::{StepKind, StepStatus, TaskStatus};
+        let d = tempfile::tempdir().unwrap();
+        let id = {
+            let mut k = open_with(d.path(), standin_factory(None));
+            mount_standin(&mut k, "standin")
+        };
+
+        // Opened, not yet started: this is the window the daemon serves in.
+        let mut k = open_starting(d.path(), standin_factory(None));
+        assert_eq!(k.arch_state(&id), Some(ArchState::Starting));
+        assert_eq!(k.arches_starting(), 1);
+        assert!(
+            k.arches().iter().any(|(i, _)| *i == id),
+            "an arch coming up is listed while it does"
+        );
+
+        let infers = |k: &RealKernel| {
+            k.ledger()
+                .events()
+                .iter()
+                .filter(|e| e.kind == "infer")
+                .count()
+        };
+        let before = infers(&k);
+        let t = k
+            .create_task(
+                &machine(1),
+                "say something",
+                "note",
+                Label::bottom(),
+                vec![StepKind::Plan {
+                    arch_id: id.clone(),
+                }],
+            )
+            .unwrap();
+        let err = k.run_task_step(&machine(2), &t.id).unwrap_err();
+        assert!(
+            matches!(err, KernelError::ArchStarting(ref named) if *named == id),
+            "{err}"
+        );
+        assert_eq!(err.to_string(), format!("arch {id} is starting; retry"));
+        let row = k.task(&machine(3), &t.id).unwrap();
+        assert!(
+            matches!(row.status, TaskStatus::Queued),
+            "a task waiting on an arch that is coming up is queued, not failed: {:?}",
+            row.status
+        );
+        assert!(
+            matches!(row.steps[0].status, StepStatus::Pending),
+            "the step is still to run: {:?}",
+            row.steps[0].status
+        );
+        assert_eq!(row.steps[0].started_ms, None);
+        assert_eq!(
+            infers(&k),
+            before,
+            "nothing was inferred, so nothing is recorded"
+        );
+
+        // The arch comes up, and the very same task runs — no re-submission.
+        k.start_arches_now();
+        assert_eq!(k.arch_state(&id), Some(ArchState::Ready));
+        assert_eq!(k.arches_starting(), 0);
+        let done = k.run_task_step(&machine(4), &t.id).unwrap();
+        assert!(matches!(done.status, TaskStatus::Done), "{:?}", done.status);
+        let decisions = k.read_register(&machine(5), &t.register).unwrap().decisions;
+        assert!(
+            decisions
+                .iter()
+                .any(|x| x.contains("the stand-in answered")),
+            "{decisions:?}"
+        );
+    }
+
+    /// Opening a store builds nothing (Task 1b review, Important 1). The whole
+    /// reason is timing: a factory that takes seconds must not run before the
+    /// daemon's endpoint answers, or `vk boot` times out and kills the node.
+    #[test]
+    fn opening_a_store_builds_no_adapter() {
+        let d = tempfile::tempdir().unwrap();
+        let id = {
+            let mut k = open_with(d.path(), standin_factory(None));
+            mount_standin(&mut k, "standin")
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = {
+            let calls = calls.clone();
+            let inner = standin_factory(None);
+            Arc::new(move |spec: &arch::MountSpec| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                inner(spec)
+            }) as AdapterFactory
+        };
+        let mut k = open_starting(d.path(), counted);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "open must not have built anything: the node is not reachable yet"
+        );
+        assert_eq!(k.pending_mounts().len(), 1);
+        k.start_arches_now();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(k.arch_state(&id), Some(ArchState::Ready));
+    }
+
+    /// Important 2: the boot path compares the **whole** manifest, not the
+    /// arch id. `arch_id` hashes `ArchIdentity` alone, so an adapter can come
+    /// back under the right id carrying a clearance that is not the one on
+    /// disk — and the adapter's manifest is what `i2_flow` reads on the very
+    /// next prompt. The mount path has always refused this; so does boot now.
+    #[test]
+    fn an_arch_re_created_with_the_same_identity_but_a_different_manifest_is_unavailable() {
+        let d = tempfile::tempdir().unwrap();
+        let id = {
+            let mut k = open_with(d.path(), standin_factory(None));
+            mount_standin(&mut k, "standin")
+        };
+
+        // Same `ArchIdentity` — so the same arch id — and a clearance that
+        // would quietly widen what this arch may be shown.
+        let widening: AdapterFactory = Arc::new(|spec: &arch::MountSpec| {
+            let name = spec.config["name"].as_str().unwrap_or("standin");
+            let manifest = local_named(
+                name,
+                Clearance {
+                    max_scope: Scope::Holdout,
+                    third_party_allowed: true,
+                },
+            );
+            let budget = manifest.context_ceiling;
+            Ok(Box::new(StandIn { manifest, budget }) as Box<dyn arch::ArchAdapter>)
+        });
+        let mut k = open_with(d.path(), widening);
+
+        match k.arch_state(&id) {
+            Some(ArchState::Unavailable(why)) => {
+                assert!(why.starts_with("manifest changed: "), "{why}");
+                assert!(why.contains("clearance"), "it names what differs: {why}");
+                assert!(
+                    why.contains(&format!("vk umount {id}")),
+                    "and how to retire it: {why}"
+                );
+            }
+            other => panic!("a widened clearance must not be adopted, got {other:?}"),
+        }
+        // The listing still shows the clearance that was stored, never the one
+        // that came back.
+        assert_eq!(
+            k.arch_states()[0].1.clearance,
+            personal(),
+            "the stored manifest is the one this node still answers with"
+        );
+        // And `i2_flow` never sees the new clearance, because the arch cannot
+        // be called at all.
+        let reg = k
+            .submit_task(&machine(1), "say something", Label::bottom())
+            .unwrap();
+        assert!(matches!(
+            k.infer(&machine(2), &id, Capability::Plan, &reg),
+            Err(KernelError::ArchUnavailable(_))
+        ));
+    }
+
+    /// Mounting an arch while its adapter is still being built is the operator
+    /// getting there first: their adapter is installed, and the one the
+    /// startup pass finishes building afterwards is handed back to be thrown
+    /// away rather than installed over the top of it.
+    #[test]
+    fn an_arch_mounted_while_it_was_starting_keeps_the_adapter_the_operator_mounted() {
+        let d = tempfile::tempdir().unwrap();
+        let id = {
+            let mut k = open_with(d.path(), standin_factory(None));
+            mount_standin(&mut k, "standin")
+        };
+        let mut k = open_starting(d.path(), standin_factory(None));
+        assert_eq!(k.arch_state(&id), Some(ArchState::Starting));
+
+        // The operator mounts it before the startup pass reaches it.
+        let pending = k.pending_mounts();
+        assert_eq!(pending.len(), 1);
+        let outcome = mount_standin_outcome(&mut k, "standin");
+        assert!(!outcome.already_mounted, "a placeholder is not an arch");
+        assert_eq!(k.arch_state(&id), Some(ArchState::Ready));
+        assert_eq!(k.arches_starting(), 0);
+
+        // The pass finishes and finds it gone from the queue: what it built is
+        // handed back, and nothing is installed over the operator's adapter.
+        let factory = k.adapter_factory();
+        let stale = k.install_arch(&pending[0].0, factory(&pending[0].1));
+        assert!(
+            stale.is_some(),
+            "the adapter nobody wanted comes back to be dropped outside the lock"
+        );
+        assert_eq!(k.arch_state(&id), Some(ArchState::Ready));
+        assert_eq!(k.arches().len(), 1);
+    }
+
+    /// Unmounting an arch that is still coming up clears it everywhere, and
+    /// what the startup pass built afterwards is not resurrected.
+    #[test]
+    fn an_arch_unmounted_while_it_was_starting_does_not_come_back() {
+        let d = tempfile::tempdir().unwrap();
+        let id = {
+            let mut k = open_with(d.path(), standin_factory(None));
+            mount_standin(&mut k, "standin")
+        };
+        let mut k = open_starting(d.path(), standin_factory(None));
+        let pending = k.pending_mounts();
+        assert!(
+            k.unmount(&id).unwrap().is_none(),
+            "a placeholder holds no adapter"
+        );
+        assert_eq!(k.arch_state(&id), None);
+
+        let factory = k.adapter_factory();
+        drop(k.install_arch(&pending[0].0, factory(&pending[0].1)));
+        assert_eq!(k.arch_state(&id), None, "an unmounted arch stays unmounted");
+        assert!(k.arches().is_empty());
+        // And the store agrees: nothing is left for the next boot to re-create.
+        assert!(k
+            .store()
+            .db
+            .list_json::<arch::MountSpec>("mounts")
+            .unwrap()
+            .is_empty());
     }
 }

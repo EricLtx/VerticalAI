@@ -209,6 +209,33 @@ vk man clearance                        # one of them, rendered
 vk man clearance --json                 # the schema itself
 ```
 
+Arches and their state: `vk ls /arches` has a `STATE` column, and `vk top` has
+one beside each arch's counters. An arch is `ready` when its adapter is there,
+`starting` while the daemon is re-creating it, and `unavailable` when it cannot
+be re-created — with the reason in the `WHY` column (under the table in `vk
+top`). `vk status` says `arches  3 (1 unavailable)` when any of them is not
+`ready`.
+
+`starting` is the window just after a restart. A daemon re-creates the arches
+it had mounted *behind* its endpoint, so it answers `vk status` and `vk ls`
+from the moment `vk boot` returns — which it does at once, saying `; 2 arches
+starting` — while a container starts or a model loads behind it. A `vk task
+step` that names an arch in that window exits non-zero with `arch <id> is
+starting; retry`, and the task stays `queued` with its step still `pending`:
+run the same `vk task step` again when the arch is `ready` and it goes on from
+where it was. Nothing is failed and nothing has to be re-submitted.
+
+**Upgrading a store made before this:** a node records *how* to re-create each
+arch from the moment it is mounted, and a store written by an earlier build has
+no such record. Every arch in one of those comes back once as `unavailable  no
+mount spec was recorded for this arch…`; mount each of them again (`vk mount
+ollama …`, `vk mount claude-code …`) and they persist across every restart
+afterwards. An arch whose engine has genuinely changed underneath — a new
+image, newer weights, a newer `claude` — comes back `unavailable  manifest
+changed: …` instead, and the reason names the `vk umount <id>` that retires the
+old id; its replacement is the mount you make next, under a new id, because an
+arch id names particular weights and is never re-pointed at different ones.
+
 Stopping the node: the `vk boot` that starts a daemon prints its `pid` (and
 `--json` gives it as a field) — `taskkill /F /PID <pid>` on Windows, `kill
 <pid>` elsewhere. A later `vk boot` on the same endpoint and state directory

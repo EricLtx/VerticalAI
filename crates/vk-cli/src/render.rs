@@ -150,14 +150,24 @@ pub fn status(v: &Value) -> String {
 /// most needs to be told.
 fn arch_count(v: &Value) -> String {
     let total = text(&v["arches"]);
-    let down = array(v, "arch_states")
-        .iter()
-        .filter(|a| a["state"] == Value::String("unavailable".into()))
-        .count();
-    if down == 0 {
+    let counted = |state: &str| {
+        array(v, "arch_states")
+            .iter()
+            .filter(|a| a["state"] == Value::String(state.into()))
+            .count()
+    };
+    let notes: Vec<String> = [
+        ("unavailable", counted("unavailable")),
+        ("starting", counted("starting")),
+    ]
+    .into_iter()
+    .filter(|(_, n)| *n > 0)
+    .map(|(what, n)| format!("{n} {what}"))
+    .collect();
+    if notes.is_empty() {
         total
     } else {
-        format!("{total} ({down} unavailable)")
+        format!("{total} ({})", notes.join(", "))
     }
 }
 
@@ -507,10 +517,19 @@ pub fn booted(v: &Value) -> String {
         text(&v["endpoint"]),
         text(&v["state_dir"])
     );
+    // The node answers from the moment it says this; its arches may still be
+    // being re-created behind it, and a step that names one of those is told
+    // to retry rather than failed. Saying so here is what stops that reading
+    // as a fault (Task 1b review, Important 1).
+    let starting = match v["arches_starting"].as_u64().unwrap_or(0) {
+        0 => String::new(),
+        1 => "; 1 arch starting".into(),
+        n => format!("; {n} arches starting"),
+    };
     if v["already_running"] == Value::Bool(true) {
-        format!("vkd is already running {where_}")
+        format!("vkd is already running {where_}{starting}")
     } else {
-        format!("vkd running (pid {}) {where_}", text(&v["pid"]))
+        format!("vkd running (pid {}) {where_}{starting}", text(&v["pid"]))
     }
 }
 

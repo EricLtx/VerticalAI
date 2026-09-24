@@ -61,12 +61,16 @@ async fn main() -> anyhow::Result<()> {
     // a second daemon over a store one is already serving stops here, before
     // it has read or written anything, and says which lock file it could not
     // take.
-    // With the factory that knows this build's arch kinds (SP1b ruling 14).
-    // Opening the kernel is what re-creates every arch this node had mounted,
-    // so the daemon hands it the one thing the kernel cannot know: how to make
-    // a `claude-code`, an `ollama` or a mock. Without it every persisted arch
-    // came back as a mock under the real arch's id — the failure nothing
-    // downstream could detect.
+    // With the factory that knows this build's arch kinds (SP1b ruling 14):
+    // the one thing the kernel cannot know is how to make a `claude-code`, an
+    // `ollama` or a mock. Without it every persisted arch came back as a mock
+    // under the real arch's id — the failure nothing downstream could detect.
+    //
+    // This takes the store's single-writer lock and reads what is mounted; it
+    // builds **nothing**. The arches are re-created by `start_arches` below,
+    // after the endpoint is answering, so the order is: lock → bind → boot →
+    // serve, with re-creation alongside the serving (Task 1b review,
+    // Important 1).
     let mut kernel = vk_kernel::RealKernel::open_with_factory(
         &state_dir,
         key_source,
@@ -98,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
         ledger_len = report.ledger_len,
         recovered_partial_line = report.recovered_partial_line,
         arches = report.arches.len(),
+        arches_starting = report.starting_arches.len(),
         devices = report.devices.len(),
         stopped_scopes = ?report.stopped_scopes,
         policies_version = %report.policies_version,
@@ -145,5 +150,13 @@ async fn main() -> anyhow::Result<()> {
         kernel.record_forced_boot(&report)?;
     }
     tracing::info!(endpoint = %endpoint.0, "vkd listening");
-    vk_ipc::server::serve_on(Arc::new(Mutex::new(kernel)), listener).await
+    let kernel = Arc::new(Mutex::new(kernel));
+    // Alongside the serving, never in front of it (Task 1b review, Important
+    // 1). The endpoint is bound and `boot()` has run, so `vk status` and
+    // `vk ls /arches` answer from this moment on, while the arches come up one
+    // by one behind them. Detached rather than awaited: a node with a cold
+    // container to start would otherwise be dark for minutes, which is what
+    // made `vk boot` kill the daemon it had just started.
+    tokio::spawn(vk_ipc::server::start_arches(kernel.clone()));
+    vk_ipc::server::serve_on(kernel, listener).await
 }

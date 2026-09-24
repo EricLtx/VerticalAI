@@ -450,6 +450,19 @@ impl RealKernel {
                     TaskStatus::Running
                 };
             }
+            // Retryable: the arch this step names is still being built. Nothing
+            // failed, so nothing is recorded as having failed — the step goes
+            // back to `Pending` and the task to `Queued`, and the next
+            // `vk task step` runs it (Task 1b review, Important 1). Marking it
+            // `Failed` would make a task need a human to re-submit it because
+            // a container took four seconds to start.
+            Err(e @ KernelError::ArchStarting(_)) => {
+                t.steps[i].status = StepStatus::Pending;
+                t.steps[i].started_ms = None;
+                t.status = TaskStatus::Queued;
+                self.save_task(&t)?;
+                return Err(e);
+            }
             Err(e) => {
                 t.steps[i].status = StepStatus::Failed(e.to_string());
                 t.steps[i].ended_ms = Some(ctx.now_ms);

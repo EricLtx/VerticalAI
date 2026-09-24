@@ -85,6 +85,11 @@ pub const E_INVARIANT: i32 = -32001;
 pub const E_NOT_FOUND: i32 = -32004;
 /// A durable read or write failed; the call had no effect it can vouch for.
 pub const E_STORE: i32 = -32005;
+/// Nothing is wrong and the call had no effect: something it needs is still
+/// coming up, and sending it again in a moment will work. The only code that
+/// asks a caller to retry — an arch whose adapter is still being built after
+/// a restart (SP1b Task 1b).
+pub const E_RETRY: i32 = -32006;
 /// JSON-RPC 2.0: method not found.
 pub const E_METHOD: i32 = -32601;
 /// JSON-RPC 2.0: invalid params (also: a line that is not a request at all).

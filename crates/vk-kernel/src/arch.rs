@@ -132,7 +132,7 @@ impl MountSpec {
     /// [`MountSpec::new`]'s check, for a spec that was built rather than made.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(!self.kind.is_empty(), "a mount spec must name its kind");
-        no_secrets(&self.config)
+        no_secrets(&self.config, None)
     }
 }
 
@@ -146,22 +146,37 @@ fn secret_shaped(name: &str) -> bool {
 }
 
 /// Walk a config and refuse the first string sitting under such a name,
-/// wherever in the tree it is: a credential nested two objects down is still
-/// a credential.
-fn no_secrets(config: &serde_json::Value) -> anyhow::Result<()> {
+/// wherever in the tree it is.
+///
+/// `under` is the credential-shaped name this value is *inside*, and it is
+/// carried down through arrays and nested objects — which is the whole point
+/// (Task 1b review, Minor 1). Checking only the immediate `(name, string)`
+/// pair let `{"api_keys": ["sk-live-1"]}` through: the name sat over an array,
+/// the array's elements had no name of their own, and the credentials landed
+/// in the metadata database in the clear. A list of secrets is a secret, and
+/// so is an object full of them.
+fn no_secrets(config: &serde_json::Value, under: Option<&str>) -> anyhow::Result<()> {
     match config {
-        serde_json::Value::Object(map) => {
-            for (name, value) in map {
-                anyhow::ensure!(
-                    !(secret_shaped(name) && value.is_string()),
-                    "a mount spec is stored in the clear and must not carry a secret: \
-                     drop `{name}` from the config, or keep it in the keyring"
-                );
-                no_secrets(value)?;
-            }
+        serde_json::Value::String(_) => {
+            anyhow::ensure!(
+                under.is_none(),
+                "a mount spec is stored in the clear and must not carry a secret: \
+                 drop `{}` from the config, or keep it in the keyring",
+                under.unwrap_or_default()
+            );
             Ok(())
         }
-        serde_json::Value::Array(items) => items.iter().try_for_each(no_secrets),
+        serde_json::Value::Object(map) => map.iter().try_for_each(|(name, value)| {
+            // A name that reads like a credential shadows whatever it is
+            // inside; anything else keeps the verdict it inherited.
+            let under = if secret_shaped(name) {
+                Some(name.as_str())
+            } else {
+                under
+            };
+            no_secrets(value, under)
+        }),
+        serde_json::Value::Array(items) => items.iter().try_for_each(|v| no_secrets(v, under)),
         _ => Ok(()),
     }
 }

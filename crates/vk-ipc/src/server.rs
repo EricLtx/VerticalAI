@@ -5,7 +5,7 @@
 use crate::transport::{self, AcceptError, Endpoint};
 use crate::{
     PresenceProof, Request, Response, RpcError, E_BAD_PARAMS, E_INTERNAL, E_INVARIANT, E_METHOD,
-    E_NOT_FOUND, E_STORE,
+    E_NOT_FOUND, E_RETRY, E_STORE,
 };
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -113,6 +113,62 @@ pub async fn serve_on(kernel: Shared, mut listener: transport::os::Listener) -> 
     }
 }
 
+/// Build every arch this node had mounted, one at a time, while the node
+/// serves (Task 1b review, Important 1).
+///
+/// `vkd` spawns this once, after the endpoint is bound and `boot()` has run.
+/// Until an arch is installed its state is `Starting`: it is listed, and a
+/// step that names it is told to retry rather than failed. Re-creation used to
+/// happen inside `RealKernel::open`, before the bind, which left the node
+/// answering nothing for the sum of the adapters' mount timeouts — minutes,
+/// for a cold container — so `vk boot` timed out at 10 s and killed the daemon
+/// it had just started.
+///
+/// **The kernel mutex is never held across a factory call.** Each iteration
+/// takes the lock only to read the queue at the start and, inside the blocking
+/// task, for the length of an `install_arch`. The adapter an install did not
+/// want goes back out and is dropped here, with the lock released, because
+/// dropping one can `docker stop` a container.
+///
+/// One at a time, not all at once: two cold model loads racing each other help
+/// nobody, and the order is the id order an operator sees in `vk ls /arches`.
+pub async fn start_arches(kernel: Shared) {
+    let Ok((factory, pending)) = kernel
+        .lock()
+        .map(|k| (k.adapter_factory(), k.pending_mounts()))
+    else {
+        tracing::error!("kernel lock poisoned; no arch was re-created");
+        return;
+    };
+    if pending.is_empty() {
+        return;
+    }
+    tracing::info!(
+        arches = pending.len(),
+        "re-creating the arches this node had mounted; it is serving while they come up"
+    );
+    for (arch_id, spec) in pending {
+        let (kernel, factory) = (kernel.clone(), factory.clone());
+        // The blocking pool: building an adapter runs child processes and
+        // blocking HTTP, which must not sit on a runtime worker.
+        let built = tokio::task::spawn_blocking(move || {
+            let made = factory(&spec);
+            let stale = match kernel.lock() {
+                Ok(mut k) => k.install_arch(&arch_id, made),
+                Err(_) => None,
+            };
+            // Here, not in the match: the guard above is gone by now, so an
+            // Ollama adapter's `Drop` does its `docker stop` unlocked.
+            drop(stale);
+        })
+        .await;
+        if let Err(e) = built {
+            tracing::error!("an arch could not be re-created: {e}");
+        }
+    }
+    tracing::info!("every arch has been re-created; `vk ls /arches` says how each one came up");
+}
+
 async fn handle_connection(
     stream: Box<dyn transport::Stream>,
     kernel: Shared,
@@ -196,6 +252,11 @@ fn kerr(e: KernelError) -> RpcError {
         // store class — the same class an adapter's non-invariant failure
         // already reports (SP1b review, Important 2).
         KernelError::ArchUnavailable(_) | KernelError::Store(_) => E_STORE,
+        // Its own code, because it asks the caller for something no other
+        // code does: wait and send this again. A client that cannot tell it
+        // from `E_STORE` has to treat a four-second container start as a
+        // failure (Task 1b review, Important 1).
+        KernelError::ArchStarting(_) => E_RETRY,
         KernelError::I1(_)
         | KernelError::I2(_)
         | KernelError::I3(_)
@@ -361,6 +422,10 @@ fn dispatch(
                 "state": state.name(),
                 "reason": state.reason(),
             })).collect::<Vec<_>>(),
+            // How many are still being built. `vk boot` prints it, so the
+            // person who just started the node knows the arches are coming
+            // rather than wondering why a step says to retry.
+            "arches_starting": k.arches_starting(),
             "devices": k.devices().ids().len(),
             "ledger_len": k.ledger().events().len(),
             // The verdict boot reports, not a recomputation of the chain
@@ -458,7 +523,7 @@ fn dispatch(
                 Remount::Keep
             };
             let outcome = k
-                .mount_with(adapter, Some(spec), remount)
+                .mount_with(adapter, spec, remount)
                 .map_err(|e| bad(&e.to_string()))?;
             let answer = json!({
                 "arch_id": outcome.arch_id,
@@ -488,7 +553,7 @@ fn dispatch(
                 budget: ceiling,
             };
             let outcome = k
-                .mount_with(Arc::new(adapter), Some(spec), Remount::Keep)
+                .mount(Arc::new(adapter), spec)
                 .map_err(|e| bad(&e.to_string()))?;
             Ok(json!({
                 "arch_id": outcome.arch_id,
@@ -661,18 +726,20 @@ fn claude_code_version(config: &Value) -> anyhow::Result<String> {
 /// reason for a node to stop serving everything else it has.
 pub fn adapter_factory(state_dir: std::path::PathBuf) -> vk_kernel::AdapterFactory {
     let mock = vk_kernel::mock_factory();
-    Box::new(move |spec: &MountSpec| match spec.kind.as_str() {
-        "mock" => mock(spec),
-        "claude-code" => {
-            let version = claude_code_version(&spec.config)?;
-            Ok(Box::new(claude_code_adapter(
-                &state_dir,
-                &spec.config,
-                &version,
-            )?))
+    Arc::new(move |spec: &MountSpec| -> Result<Box<dyn ArchAdapter>> {
+        match spec.kind.as_str() {
+            "mock" => mock(spec),
+            "claude-code" => {
+                let version = claude_code_version(&spec.config)?;
+                Ok(Box::new(claude_code_adapter(
+                    &state_dir,
+                    &spec.config,
+                    &version,
+                )?))
+            }
+            "ollama" => Ok(Box::new(ollama_adapter(&spec.config)?)),
+            other => anyhow::bail!("no arch kind {other}"),
         }
-        "ollama" => Ok(Box::new(ollama_adapter(&spec.config)?)),
-        other => anyhow::bail!("no arch kind {other}"),
     })
 }
 
