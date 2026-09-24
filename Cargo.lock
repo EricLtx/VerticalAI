@@ -2425,6 +2425,7 @@ dependencies = [
  "tracing",
  "vk-contracts",
  "vk-kernel",
+ "vk-store",
 ]
 
 [[package]]
