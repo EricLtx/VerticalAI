@@ -761,6 +761,114 @@ mod tests {
         }));
     }
 
+    /// The deterministic guard on the fence, independent of any model: every
+    /// tree and file the confinement rests on is denied by its real path, for
+    /// reading and for editing, and the allow list is exactly the workspace and
+    /// the kernel's tools. Loosen the fence and this fails.
+    #[test]
+    fn the_fence_denies_every_required_tree_and_file_by_real_path() {
+        let cfg = cfg();
+        let (allow, deny) = permission_rules(&cfg);
+        assert_eq!(allow, vec!["Read(./**)", "Edit(./**)", "mcp__vk__*"]);
+        let has = |rule: String| assert!(deny.contains(&rule), "missing deny rule {rule}");
+
+        // The run's configuration (the token) and the daemon's state, as trees.
+        for tree in [
+            cfg.config_dir.clone(),
+            cfg.state_dir.join("blobs"),
+            cfg.state_dir.join("ledger"),
+            cfg.state_dir.join("exports"),
+            cfg.state_dir.join("claude-code-cwd"),
+        ] {
+            has(format!("Read({})", tree_pattern(&tree)));
+            has(format!("Edit({})", tree_pattern(&tree)));
+        }
+        // The store, the keys, the lock and the log, as files.
+        for file in [
+            "vk.sqlite",
+            "vk.sqlite-wal",
+            "vk.sqlite-shm",
+            "master.key",
+            "node.key",
+            "lock",
+            "vkd.log",
+        ] {
+            has(format!("Read({})", file_pattern(&cfg.state_dir.join(file))));
+            has(format!("Edit({})", file_pattern(&cfg.state_dir.join(file))));
+        }
+        // The OS and program directories, wherever this platform keeps them.
+        let os_dirs: Vec<PathBuf> = if cfg!(unix) {
+            [
+                "/etc", "/root", "/proc", "/sys", "/var", "/usr", "/opt", "/boot",
+            ]
+            .iter()
+            .map(PathBuf::from)
+            .collect()
+        } else {
+            [
+                "SystemRoot",
+                "ProgramFiles",
+                "ProgramFiles(x86)",
+                "ProgramData",
+            ]
+            .iter()
+            .filter_map(|v| std::env::var_os(v).filter(|s| !s.is_empty()))
+            .map(PathBuf::from)
+            .collect()
+        };
+        assert!(!os_dirs.is_empty(), "this platform names no OS directories");
+        for tree in os_dirs {
+            has(format!("Read({})", tree_pattern(&tree)));
+            has(format!("Edit({})", tree_pattern(&tree)));
+        }
+        // The home dotfiles and credential stores.
+        for home in [
+            ".ssh/**",
+            ".aws/**",
+            ".gnupg/**",
+            ".azure/**",
+            ".kube/**",
+            ".docker/**",
+            ".config/**",
+            ".claude/**",
+            ".claude.json",
+            ".credentials.json",
+            ".netrc",
+            ".git-credentials",
+            "AppData/Roaming/**",
+        ] {
+            has(format!("Read(~/{home})"));
+            has(format!("Edit(~/{home})"));
+        }
+        // The tools that reach past the file rules.
+        for tool in DENIED_TOOLS {
+            has(tool.to_string());
+        }
+        // The inputs read-only; no settings, MCP or CLAUDE.md file writable.
+        for path in ["TASK.md", "PLAN.md", "BRIEF/**"] {
+            has(format!("Edit({path})"));
+        }
+        for path in [
+            ".claude/**",
+            "settings.json",
+            "settings.local.json",
+            ".mcp.json",
+            ".claude.json",
+            "CLAUDE.md",
+            "CLAUDE.local.md",
+        ] {
+            has(format!("Edit({path})"));
+        }
+        // Every absolute rule is anchored at the filesystem root, so none can
+        // silently become a settings-relative or cwd-relative pattern.
+        for rule in deny.iter().filter(|r| r.contains("(/")) {
+            assert!(
+                rule.contains("(//"),
+                "an absolute rule must use the `//` root anchor: {rule}"
+            );
+        }
+    }
+
     #[test]
     fn the_launch_line_pins_the_locked_down_flags_and_no_bare_tool_allows() {
         let line = launch_line(&cfg());
