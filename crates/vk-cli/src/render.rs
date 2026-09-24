@@ -548,6 +548,62 @@ pub fn ok(_: &Value) -> String {
     "ok".into()
 }
 
+/// A `--dry-run` of `vk harness run`: the launch line and the `.mcp.json` it
+/// would write, the token already redacted by the daemon.
+pub fn harness_dry_run(v: &Value) -> String {
+    let line = v["launch_line"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|x| {
+                    let s = text(x);
+                    if s.contains(' ') {
+                        format!("\"{s}\"")
+                    } else {
+                        s
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_else(|| "-".into());
+    format!(
+        "dry run for task {}\nworkspace: {}\n\nlaunch line:\n{}\n\n.mcp.json:\n{}",
+        text(&v["task_id"]),
+        text(&v["workspace"]),
+        line,
+        text(&v["mcp_json"]),
+    )
+}
+
+/// The result of a harness run: how it ended, whether the kernel contained it,
+/// what it talked to, and the artefact it left.
+pub fn harness_run(v: &Value) -> String {
+    let connections = match v["connections"].as_array() {
+        Some(a) if !a.is_empty() => a.iter().map(text).collect::<Vec<_>>().join(", "),
+        _ => "(none observed)".into(),
+    };
+    let governed = if v["governed"] == Value::Bool(true) {
+        "yes"
+    } else {
+        "no"
+    };
+    let mut rows = vec![
+        ("task", text(&v["task_id"])),
+        ("status", text(&v["status"])),
+        ("exit", text(&v["exit"])),
+        ("governed", governed.into()),
+        ("egress", connections),
+        ("samples", format!("{} (every 500 ms)", text(&v["samples"]))),
+        ("duration", format!("{} ms", text(&v["duration_ms"]))),
+        ("artefact", text(&v["artefact_hash"])),
+    ];
+    if let Some(err) = v["error"].as_str() {
+        rows.push(("error", err.into()));
+    }
+    fields(&rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

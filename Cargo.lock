@@ -2465,7 +2465,11 @@ name = "vk-harness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tracing",
+ "vk-contracts",
  "windows",
 ]
 
@@ -2487,6 +2491,7 @@ dependencies = [
  "vk-arch-claude-code",
  "vk-arch-ollama",
  "vk-contracts",
+ "vk-harness",
  "vk-kernel",
  "vk-store",
 ]
@@ -2508,7 +2513,20 @@ dependencies = [
  "tracing",
  "uuid",
  "vk-contracts",
+ "vk-harness",
  "vk-store",
+]
+
+[[package]]
+name = "vk-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "vk-ipc",
 ]
 
 [[package]]

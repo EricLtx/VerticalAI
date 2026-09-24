@@ -9,10 +9,28 @@ description = "VerticalAI harness: confined launch of the agents the kernel runs
 [dependencies]
 anyhow.workspace = true
 tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Contract types only (Ctx, Register, Label, Clearance, KernelError). Never
+# vk-kernel: the kernel depends on this crate, so the dependency may not run the
+# other way. The kernel reaches the workspace projection through the `Host`
+# trait, whose every type is a contract.
+vk-contracts = { path = "../vk-contracts" }
 
 [target.'cfg(windows)'.dependencies]
-# Job Object containment (`confine::JobGovernor`): a kernel-launched process
-# tree dies when the kernel's handle closes and stays under its memory and CPU
-# caps. 0.62 was the newest line when spike 3a (2026-09-24) compiled every
-# name the governor uses against 0.62.2, unchanged from the plan.
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
+# Job Object containment (`confine::JobGovernor`) and, for `netwatch`, the TCP
+# connection table of a launched process (`GetExtendedTcpTable`). 0.62 was the
+# newest line when spike 3a (2026-09-24) compiled every name the governor uses
+# against 0.62.2; spike 4a (2026-09-24) added the IpHelper and WinSock features
+# and compiled `netwatch` against the same version.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+] }
+
+[dev-dependencies]
+tempfile = "3"

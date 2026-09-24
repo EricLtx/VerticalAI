@@ -1,0 +1,25 @@
+[package]
+name = "vk-mcp"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "VerticalAI MCP façade: a stdio MCP server that turns each tool call into a kernel syscall under a lease"
+
+[[bin]]
+name = "vk-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# The client half of the syscall transport: the façade is a bridge, MCP on
+# stdin/stdout for Claude Code and a `vk-ipc` client back to the daemon.
+vk-ipc = { path = "../vk-ipc" }
+serde.workspace = true
+serde_json.workspace = true
+# `io-std` for the async stdin/stdout the MCP stdio transport reads and writes;
+# the workspace default set does not include it.
+tokio = { workspace = true, features = ["io-std"] }
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

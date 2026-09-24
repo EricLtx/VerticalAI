@@ -73,6 +73,11 @@ enum Cmd {
         #[command(subcommand)]
         what: TaskCmd,
     },
+    /// Run a confined agent harness (Claude Code) over a task.
+    Harness {
+        #[command(subcommand)]
+        what: HarnessCmd,
+    },
     /// STOP a scope. Human: signed with this node's device key.
     Stop {
         #[arg(default_value = "node")]
@@ -228,6 +233,40 @@ enum TaskCmd {
     },
     /// One task in full, with where its release steps write.
     Show { task_id: String },
+}
+
+#[derive(Subcommand)]
+enum HarnessCmd {
+    /// Launch the confined harness over a task's harness step.
+    ///
+    /// Give an existing TASK whose next step is a harness step, or `--goal` to
+    /// create a one-step harness task and run it. `--dry-run` prints the launch
+    /// line and the `.mcp.json` (token redacted) and runs nothing.
+    Run {
+        /// The task to run. Omit it and pass `--goal` to create one.
+        task: Option<String>,
+        /// Create a fresh single-harness-step task with this goal, then run it.
+        #[arg(long)]
+        goal: Option<String>,
+        /// Which harness. Only `claude-code` in SP1b.
+        #[arg(long, default_value = "claude-code")]
+        name: String,
+        /// The Claude Code binary, if it is not `claude` on the daemon's PATH.
+        #[arg(long)]
+        bin: Option<String>,
+        /// The model to run the harness on (the CLI's default otherwise).
+        #[arg(long)]
+        model: Option<String>,
+        /// How long the run may take, in seconds.
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+        /// Print the launch line and `.mcp.json` and exit, without running.
+        #[arg(long)]
+        dry_run: bool,
+        /// Keep the workspace after the run instead of removing it.
+        #[arg(long)]
+        keep: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -445,6 +484,7 @@ async fn call(cli: &Cli) -> Result<()> {
             render::ok,
         ),
         Cmd::Task { what } => task(cli, &c, what).await,
+        Cmd::Harness { what } => harness(cli, &c, what).await,
         Cmd::Stop { scope } => {
             let proof = presence(&c).await?;
             show(
@@ -539,6 +579,68 @@ async fn task(cli: &Cli, c: &Client, what: &TaskCmd) -> Result<()> {
             }
             show(cli, t, render::task)
         }
+    }
+}
+
+/// `vk harness run`: the confined Claude Code harness over a task's harness step.
+///
+/// The launch, the containment, the workspace projection and the egress telemetry
+/// all live in the daemon; this only names the task (or creates one from a goal),
+/// hands over the options and prints what came back.
+async fn harness(cli: &Cli, c: &Client, what: &HarnessCmd) -> Result<()> {
+    let HarnessCmd::Run {
+        task,
+        goal,
+        name,
+        bin,
+        model,
+        timeout,
+        dry_run,
+        keep,
+    } = what;
+
+    // An existing task, or a fresh single-harness-step one from a goal.
+    let task_id = match (task, goal) {
+        (Some(id), _) => id.clone(),
+        (None, Some(g)) => {
+            let created = c
+                .call(
+                    "task.create",
+                    json!({
+                        "goal": g,
+                        "artefact_type": "proposal",
+                        "steps": [ { "kind": "harness", "name": name } ],
+                    }),
+                    None,
+                )
+                .await?;
+            field(&created, "id")?
+        }
+        (None, None) => {
+            return Err(anyhow!(
+                "give a task id to run, or --goal to create one: vk harness run <TASK> | --goal \"...\""
+            ))
+        }
+    };
+
+    let mut params = json!({
+        "task_id": task_id,
+        "name": name,
+        "dry_run": dry_run,
+        "keep": keep,
+        "timeout_secs": timeout,
+    });
+    if let Some(b) = bin {
+        params["bin"] = json!(b);
+    }
+    if let Some(m) = model {
+        params["model"] = json!(m);
+    }
+    let answer = c.call("harness.run", params, None).await?;
+    if *dry_run {
+        show(cli, answer, render::harness_dry_run)
+    } else {
+        show(cli, answer, render::harness_run)
     }
 }
 

@@ -158,5 +158,7 @@ async fn main() -> anyhow::Result<()> {
     // container to start would otherwise be dark for minutes, which is what
     // made `vk boot` kill the daemon it had just started.
     tokio::spawn(vk_ipc::server::start_arches(kernel.clone()));
-    vk_ipc::server::serve_on(kernel, listener).await
+    // The endpoint travels with the server so a harness run can write it into the
+    // workspace `.mcp.json` for the harness's `vk-mcp` to dial back on.
+    vk_ipc::server::serve_on(kernel, listener, endpoint.0).await
 }

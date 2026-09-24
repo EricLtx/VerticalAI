@@ -8,10 +8,26 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use vk_contracts::arch::Capability;
 use vk_contracts::labels::Label;
-use vk_contracts::principal::ApprovalKind;
+use vk_contracts::locks::Lease;
+use vk_contracts::principal::{ApprovalKind, Principal};
 use vk_contracts::register::{Register, RegisterId};
 use vk_contracts::syscalls::{Ctx, Kernel, KernelError};
 use vk_contracts::testing::KernelTestHooks;
+
+/// The instruction the drafting harness is launched with (plan Global
+/// Constraints). Fixed text, not data — the material the harness may read is in
+/// its workspace, projected under the harness clearance.
+pub const HARNESS_PROMPT: &str = "You are the drafting harness. Read TASK.md, PLAN.md and BRIEF/. \
+Write the proposal to OUT/proposal.md, then call vk_attach_artefact with kind=proposal and \
+path=OUT/proposal.md, then call vk_request_approval.";
+
+/// How long a harness lease lives: long enough for a whole Claude Code session,
+/// after which the token is no longer honoured even if the run is orphaned.
+pub const HARNESS_LEASE_TTL_MS: u64 = 30 * 60 * 1000;
+
+/// The egress sample interval recorded in `harness.connections`; matches
+/// `vk_harness::launch::SAMPLE_EVERY`.
+const HARNESS_SAMPLE_EVERY_MS: u64 = 500;
 
 /// One unit of work the scheduler knows how to run. `Plan`/`Draft`/`Judge` are
 /// the three inference roles; the rest are the non-inference steps a task needs
@@ -95,6 +111,74 @@ struct ReleaseRecord<'a> {
     task_id: &'a str,
     hashes: Vec<String>,
     destination: String,
+}
+
+/// What phase one of a harness step produced (SP1b Task 4), for the daemon to
+/// run outside the kernel lock. The launch is driven with the lock **released**:
+/// the harness calls back over MCP (`harness.read_register`,
+/// `harness.attach_artefact`, …) while it runs, and a lock held across the wait
+/// would deadlock the harness against its own syscalls. The kernel leases and
+/// materialises here (phase one), the daemon runs [`vk_harness::launch`], then
+/// the kernel settles (phase two).
+pub struct HarnessLaunch {
+    pub workspace: PathBuf,
+    pub lease_id: String,
+    pub prompt: String,
+    pub name: String,
+    pub step_index: usize,
+}
+
+/// The `harness.connections` event payload (founder decision 2026-09-24): one
+/// per harness run, appended after the child exits and before the step's own
+/// `task.step` event. Public and owned so [`RealKernel::record_harness_connection`]
+/// and its test can build one; it is a ledger payload, not a contract type.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HarnessConnectionsRecord {
+    pub task_id: String,
+    pub step_index: usize,
+    pub lease_id: String,
+    pub harness: String,
+    /// Remote `ip:port` the harness reached, deduplicated and sorted; empty when
+    /// it opened none (or a run too short to sample).
+    pub connections: Vec<String>,
+    pub samples: usize,
+    pub sample_every_ms: u64,
+    pub governed: bool,
+    /// `code N`, `killed by governor`, or `timeout`.
+    pub exit: String,
+    pub duration_ms: u64,
+}
+
+/// The `task.step` payload of a harness step: the run's governance, exit and
+/// duration only — the endpoints ride the `harness.connections` event, never
+/// this one (founder decision 2026-09-24).
+#[derive(serde::Serialize)]
+struct HarnessStepRecord<'a> {
+    task_id: &'a str,
+    step: usize,
+    status: &'a str,
+    governed: bool,
+    exit: &'a str,
+    duration_ms: u64,
+}
+
+/// Files directly under a harness `OUT/` directory, `proposal.md` first so it is
+/// the artefact a consumer expects, then the rest in name order. Directories are
+/// ignored: a harness attaches files, not trees.
+fn out_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    files.sort();
+    // A stable sort after the name sort: proposal.md floats to the front, the
+    // rest keep their name order.
+    files.sort_by_key(|p| p.file_name().map(|n| n != "proposal.md").unwrap_or(true));
+    files
 }
 
 /// A status as the wire spells it (`waiting_human`, not `WaitingHuman`), so a
@@ -415,6 +499,16 @@ impl RealKernel {
             self.save_task(&t)?;
             return Ok(t);
         };
+        // A harness step is not run by the generic scheduler: it leases,
+        // materialises a workspace, launches a confined process and settles it,
+        // all outside the kernel lock (SP1b Task 4). Refused here *before* the
+        // row is touched — so `vk task step` on a harness step neither fails the
+        // task nor claims work — with the verb that does run it.
+        if matches!(t.steps[i].kind, StepKind::Harness { .. }) {
+            return Err(KernelError::Gate(format!(
+                "step {i} of task {task_id} is a harness step; run it with `vk harness run {task_id}`"
+            )));
+        }
         // Polling a step that is already waiting for a human is not a start.
         // Marking it `Running` again would write the row and, below, append a
         // `task.step` event on every poll: a task waiting a week would grow the
@@ -519,9 +613,13 @@ impl RealKernel {
                 let o = self.infer(ctx, arch_id, Capability::Judge, register)?;
                 Ok((StepStatus::Done, o.tokens_in))
             }
-            // SP1b replaces this with a confined launch; until then the step is
-            // honest about needing a human rather than claiming work it did not do.
-            StepKind::Harness { .. } => Ok((StepStatus::WaitingHuman, 0)),
+            // Never reached through `run_task_step`, which refuses a harness step
+            // before this (above): a harness runs via `harness_launch` /
+            // `harness_settle`, outside the kernel lock. Kept as a guard so a new
+            // caller of `run_step` cannot silently run one under the lock.
+            StepKind::Harness { .. } => Err(KernelError::Gate(
+                "harness steps are run by `vk harness run`, not the generic scheduler".into(),
+            )),
             StepKind::Approve => {
                 // The approval has to name *what* was approved, and the rule
                 // for that lives in `approval_subject` — the same call the
@@ -584,6 +682,252 @@ impl RealKernel {
                 Ok((StepStatus::Done, 0))
             }
         }
+    }
+
+    /// Acquire the lease a harness run holds (SP1b Task 4).
+    ///
+    /// Its id is the token `vk-mcp` carries and [`RealKernel::harness_session`]
+    /// reads back; the resource is `harness:<task_id>`, which is how the session
+    /// finds its way from a bare token to the register the harness may touch.
+    pub fn harness_lease(
+        &mut self,
+        ctx: &Ctx,
+        task_id: &str,
+        ttl_ms: u64,
+    ) -> Result<Lease, KernelError> {
+        self.lease(ctx, &format!("harness:{task_id}"), ttl_ms)
+    }
+
+    /// Phase one of a harness step, under the kernel lock: validate, STOP-check,
+    /// lease, materialise the label-projected workspace, mark the step running.
+    /// The daemon runs [`vk_harness::launch::launch_claude_code`] with the lock
+    /// released, then calls [`RealKernel::harness_settle`].
+    pub fn harness_launch(
+        &mut self,
+        ctx: &Ctx,
+        task_id: &str,
+    ) -> Result<HarnessLaunch, KernelError> {
+        // The task id becomes a directory name: hold it to a plain token.
+        if task_id.is_empty()
+            || !task_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        {
+            return Err(KernelError::Gate(format!(
+                "task id {task_id:?} is not a plain name"
+            )));
+        }
+        let mut t = self
+            .task(ctx, task_id)
+            .ok_or_else(|| KernelError::NotFound(task_id.into()))?;
+        if matches!(t.status, TaskStatus::Done | TaskStatus::Failed) {
+            return Err(KernelError::Gate(format!(
+                "task {task_id} is already {}",
+                status_name(t.status)
+            )));
+        }
+        // A STOP halts the harness exactly as it halts the scheduler.
+        if self.stops.stopped("node") {
+            t.status = TaskStatus::Stopped;
+            self.save_task(&t)?;
+            return Err(KernelError::Stopped("node".into()));
+        }
+        let Some(i) = t
+            .steps
+            .iter()
+            .position(|s| !matches!(s.status, StepStatus::Done))
+        else {
+            return Err(KernelError::Gate(format!(
+                "task {task_id} has no steps left to run"
+            )));
+        };
+        let name = match &t.steps[i].kind {
+            StepKind::Harness { name } => name.clone(),
+            other => {
+                return Err(KernelError::Gate(format!(
+                    "the next step of task {task_id} is not a harness step: {other:?}"
+                )))
+            }
+        };
+        // Lease first, then materialise at the harness clearance. The lease id is
+        // the token, so it must exist before the workspace's `.mcp.json` carries
+        // it; if materialise fails the lease is released before returning.
+        let lease = self.harness_lease(ctx, task_id, HARNESS_LEASE_TTL_MS)?;
+        let hctx = Ctx {
+            principal: Principal::Machine {
+                node_id: self.node_id.clone(),
+                lease_id: lease.id.clone(),
+            },
+            clearance: vk_harness::harness_clearance(),
+            partition: ctx.partition.clone(),
+            now_ms: ctx.now_ms,
+        };
+        let dir = self.harness_workspace_dir(task_id);
+        let reg_id = t.register.clone();
+        let workspace =
+            match vk_harness::Workspace::materialise(self, &hctx, &reg_id, &dir, ctx.now_ms) {
+                Ok(ws) => ws,
+                Err(e) => {
+                    // Nothing ran: give the lease back so the token cannot be reused.
+                    let _ = self.release_lease(&lease.id);
+                    return Err(KernelError::Gate(format!(
+                        "materialise harness workspace: {e:#}"
+                    )));
+                }
+            };
+        t.steps[i].status = StepStatus::Running;
+        t.steps[i].started_ms = Some(ctx.now_ms);
+        t.status = TaskStatus::Running;
+        self.save_task(&t)?;
+        Ok(HarnessLaunch {
+            workspace,
+            lease_id: lease.id,
+            prompt: HARNESS_PROMPT.into(),
+            name,
+            step_index: i,
+        })
+    }
+
+    /// Phase two of a harness step, under the kernel lock: attach whatever the
+    /// run left under `OUT/`, record its egress, end the step, release the lease
+    /// and remove the workspace (unless `keep`).
+    ///
+    /// The order is the founder's (2026-09-24): attach, then one
+    /// `harness.connections` event, then the step's own `task.step`, then the
+    /// lease release. A run that did not finish cleanly (`killed by governor`,
+    /// `timeout`, a non-zero exit) attaches nothing and fails the step — but its
+    /// egress is recorded all the same, because what a killed harness reached is
+    /// exactly what an auditor most needs.
+    pub fn harness_settle(
+        &mut self,
+        ctx: &Ctx,
+        task_id: &str,
+        launch: &HarnessLaunch,
+        run: &vk_harness::launch::HarnessRun,
+        keep: bool,
+    ) -> Result<Task, KernelError> {
+        let mut t = self
+            .task(ctx, task_id)
+            .ok_or_else(|| KernelError::NotFound(task_id.into()))?;
+        let i = launch.step_index;
+        let exit = run.exit_reason.label();
+        let succeeded = run.exit_reason.is_success();
+
+        // Attach any new file under OUT/ — proposal.md first — deduped by content
+        // against what the register already holds, so a file the harness already
+        // attached over MCP is not attached twice.
+        if succeeded {
+            let reg = self.read_register(ctx, &t.register)?;
+            let existing: std::collections::BTreeSet<String> =
+                reg.artefacts.iter().map(|a| a.hash.clone()).collect();
+            let out_dir = self.harness_workspace_dir(task_id).join("OUT");
+            for path in out_files(&out_dir) {
+                let bytes = std::fs::read(&path).map_err(store_failed)?;
+                if existing.contains(&vk_contracts::hash_bytes(&bytes)) {
+                    continue;
+                }
+                self.attach_artefact(ctx, &t.register, &t.artefact_type, &bytes)?;
+            }
+        }
+
+        // One harness.connections event, before the step's task.step.
+        self.record_harness_connection(
+            ctx.now_ms,
+            &HarnessConnectionsRecord {
+                task_id: task_id.into(),
+                step_index: i,
+                lease_id: launch.lease_id.clone(),
+                harness: launch.name.clone(),
+                connections: run.connections.clone(),
+                samples: run.samples,
+                sample_every_ms: HARNESS_SAMPLE_EVERY_MS,
+                governed: run.governed,
+                exit: exit.clone(),
+                duration_ms: run.duration_ms,
+            },
+        )?;
+        self.log(
+            "task.step",
+            ctx.now_ms,
+            &HarnessStepRecord {
+                task_id,
+                step: i,
+                status: if succeeded { "done" } else { "failed" },
+                governed: run.governed,
+                exit: &exit,
+                duration_ms: run.duration_ms,
+            },
+        )?;
+
+        // The token is spent: release the lease so no late MCP call can use it.
+        self.release_lease(&launch.lease_id)?;
+
+        t.steps[i].status = if succeeded {
+            StepStatus::Done
+        } else {
+            StepStatus::Failed(format!("harness run ended: {exit}"))
+        };
+        t.steps[i].ended_ms = Some(ctx.now_ms);
+        t.status = if !succeeded {
+            TaskStatus::Failed
+        } else if t.steps.iter().all(|s| matches!(s.status, StepStatus::Done)) {
+            TaskStatus::Done
+        } else {
+            TaskStatus::Running
+        };
+        self.save_task(&t)?;
+
+        // Remove the workspace unless asked to keep it: it held projected data.
+        if !keep {
+            let dir = self.harness_workspace_dir(task_id);
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(dir = %dir.display(), error = %e, "could not remove harness workspace");
+                }
+            }
+        }
+        Ok(t)
+    }
+
+    /// Read a file from a task's harness workspace, confined to it.
+    ///
+    /// The `rel` path is the harness's own (from `vk_attach_artefact`), so it is
+    /// held to ordinary components: an absolute path, a drive prefix or a `..`
+    /// would read outside the workspace, and the confinement is the whole point.
+    pub fn read_harness_file(&self, task_id: &str, rel: &str) -> Result<Vec<u8>, KernelError> {
+        let relp = Path::new(rel);
+        let ok = !rel.is_empty()
+            && relp
+                .components()
+                .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+        if !ok {
+            return Err(KernelError::Gate(format!(
+                "workspace path {rel:?} must be a relative subpath of the workspace"
+            )));
+        }
+        let path = self.harness_workspace_dir(task_id).join(relp);
+        std::fs::read(&path).map_err(|e| KernelError::NotFound(format!("{}: {e}", path.display())))
+    }
+
+    /// Append the one `harness.connections` event for a run (SP1b Task 4). Public
+    /// so the harness step drives it and a test can assert it — including that a
+    /// run with no samples still logs the event with an empty connection list.
+    pub fn record_harness_connection(
+        &mut self,
+        now_ms: u64,
+        rec: &HarnessConnectionsRecord,
+    ) -> Result<(), KernelError> {
+        self.log("harness.connections", now_ms, rec)
+    }
+
+    /// Release a lease by id: drop it from the table and delete its row, so the
+    /// token stops resolving. The fence row persists, as it does for every lease.
+    fn release_lease(&mut self, lease_id: &str) -> Result<(), KernelError> {
+        self.locks.release(lease_id);
+        self.store
+            .db
+            .delete("leases", lease_id)
+            .map_err(store_failed)
     }
 
     /// The operator's one screen. Everything here is read back from disk, so it

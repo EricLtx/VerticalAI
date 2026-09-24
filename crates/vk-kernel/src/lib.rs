@@ -6,7 +6,7 @@ pub mod tasks;
 
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use vk_contracts::arch::{ArchManifest, Capability};
 use vk_contracts::hash_canonical;
@@ -15,7 +15,7 @@ use vk_contracts::labels::{Label, Scope};
 use vk_contracts::ledger::{is_allowed_kind, ClockQuality, HlcClock, Ledger, RetentionClass};
 use vk_contracts::locks::{Lease, LockHome, LockTable};
 use vk_contracts::module::{GateKind, GateVerdict, ModuleManifest};
-use vk_contracts::principal::{Approval, ApprovalKind, DeviceRegistry};
+use vk_contracts::principal::{Approval, ApprovalKind, DeviceRegistry, Principal};
 use vk_contracts::register::{ArtefactRef, Register, RegisterId};
 use vk_contracts::stop::{LivenessLease, ResumeEvent, StopError, StopEvent, StopSet};
 use vk_contracts::storage::{BlobEnvelope, StorageError};
@@ -1181,6 +1181,70 @@ impl RealKernel {
             })
     }
 
+    /// The label an artefact carries, or `None` when it is not there. Read for
+    /// the workspace projection's record (`vk_harness::ProjectionRecord`), which
+    /// names the class of data admitted to a harness.
+    pub fn artefact_label(&self, hash: &str) -> Option<Label> {
+        self.store.blobs.envelope(hash).ok().map(|e| e.label)
+    }
+
+    /// Where a task's harness workspace lives: `<state_dir>/harness/<task_id>`,
+    /// the label-projected directory the harness is launched in (`0700` on Unix).
+    pub fn harness_workspace_dir(&self, task_id: &str) -> PathBuf {
+        self.store.state_dir.join("harness").join(task_id)
+    }
+
+    /// The harness session a lease token names (SP1b Task 4).
+    ///
+    /// The token is a lease id; possessing an unexpired one is the capability
+    /// that lets `vk-mcp` act as the harness. This resolves it to the machine
+    /// principal it stands for — at the harness clearance (Business, no
+    /// third-party), never the caller's own — and the task and register it may
+    /// touch. An unknown or expired token is refused as an I1 violation (the
+    /// transport maps that to `E_INVARIANT`); no presence proof is ever accepted
+    /// for a `harness.*` call, because a lease is a machine capability, not a
+    /// human's presence.
+    pub fn harness_session(
+        &self,
+        lease_id: &str,
+        now_ms: u64,
+    ) -> Result<HarnessSession, KernelError> {
+        let lease: Lease = self
+            .store
+            .db
+            .get_json("leases", lease_id)
+            .map_err(store_failed)?
+            .ok_or_else(|| KernelError::I1("unknown harness token".into()))?;
+        if lease.expired(now_ms) {
+            return Err(KernelError::I1("expired harness token".into()));
+        }
+        let task_id = lease
+            .resource
+            .strip_prefix("harness:")
+            .ok_or_else(|| KernelError::I1("token is not a harness lease".into()))?
+            .to_string();
+        let task: crate::tasks::Task = self
+            .store
+            .db
+            .get_json("tasks", &task_id)
+            .map_err(store_failed)?
+            .ok_or_else(|| KernelError::NotFound(task_id.clone()))?;
+        let ctx = Ctx {
+            principal: Principal::Machine {
+                node_id: self.node_id.clone(),
+                lease_id: lease_id.into(),
+            },
+            clearance: vk_harness::harness_clearance(),
+            partition: lease.partition.clone(),
+            now_ms,
+        };
+        Ok(HarnessSession {
+            ctx,
+            task_id,
+            register: task.register,
+        })
+    }
+
     fn log(
         &mut self,
         kind: &str,
@@ -1266,6 +1330,42 @@ impl RealKernel {
         stats.projected += u64::from(projected);
         let json = serde_json::to_string(&stats).map_err(store_failed)?;
         self.store.db.kv_set(&key, &json).map_err(store_failed)
+    }
+}
+
+/// Who a harness lease token is, and what it may act on: the machine principal
+/// at the harness clearance, plus the task and register the lease is for. What
+/// [`RealKernel::harness_session`] hands the transport for every `harness.*`
+/// call.
+pub struct HarnessSession {
+    pub ctx: Ctx,
+    pub task_id: String,
+    pub register: RegisterId,
+}
+
+/// The kernel as the workspace projection sees it (SP1b Task 4). `vk-harness`
+/// defines this trait so it need not depend on the kernel; the kernel's own
+/// read paths back it, and the projection's log rides `infer.projected` — the
+/// existing "an object was projected" kind, no new event kind.
+impl vk_harness::Host for RealKernel {
+    fn read_register(&mut self, ctx: &Ctx, reg: &RegisterId) -> Result<Register, KernelError> {
+        <Self as vk_contracts::syscalls::Kernel>::read_register(self, ctx, reg)
+    }
+
+    fn read_artefact(&self, ctx: &Ctx, hash: &str) -> Result<Vec<u8>, KernelError> {
+        RealKernel::read_artefact(self, ctx, hash)
+    }
+
+    fn artefact_label(&self, hash: &str) -> Option<Label> {
+        RealKernel::artefact_label(self, hash)
+    }
+
+    fn log_projection(
+        &mut self,
+        now_ms: u64,
+        rec: &vk_harness::ProjectionRecord,
+    ) -> Result<(), KernelError> {
+        self.log("infer.projected", now_ms, rec)
     }
 }
 

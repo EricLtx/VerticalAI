@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -20,6 +21,7 @@ use vk_contracts::arch::ArchManifest;
 use vk_contracts::labels::{Clearance, Label, Scope};
 use vk_contracts::principal::{Approval, ApprovalKind, Principal};
 use vk_contracts::syscalls::{Ctx, Kernel, KernelError};
+use vk_harness::launch::{self, ExitReason, HarnessConfig, HarnessRun};
 use vk_kernel::arch::{ArchAdapter, MockAdapter, MountSpec};
 use vk_kernel::tasks::StepKind;
 use vk_kernel::{now_ms, RealKernel, Remount};
@@ -80,15 +82,22 @@ impl Challenges {
 
 pub async fn serve(kernel: Shared, endpoint: Endpoint) -> Result<()> {
     let listener = transport::os::bind(&endpoint).await?;
-    serve_on(kernel, listener).await
+    serve_on(kernel, listener, endpoint.0).await
 }
 
 /// Serve on an endpoint the caller has already bound. `vkd` binds before it
 /// boots the kernel, so a daemon refused its endpoint — another one is
 /// serving there — has not yet appended its `boot` event to a record it will
 /// never serve.
-pub async fn serve_on(kernel: Shared, mut listener: transport::os::Listener) -> Result<()> {
+pub async fn serve_on(
+    kernel: Shared,
+    mut listener: transport::os::Listener,
+    endpoint: String,
+) -> Result<()> {
     let challenges = Arc::new(Mutex::new(Challenges::default()));
+    // The endpoint the harness's `vk-mcp` must dial back on, threaded to every
+    // connection so `harness.run` can write it into the workspace `.mcp.json`.
+    let endpoint = Arc::new(endpoint);
     loop {
         let stream = match listener.accept().await {
             Ok(s) => s,
@@ -104,9 +113,9 @@ pub async fn serve_on(kernel: Shared, mut listener: transport::os::Listener) -> 
             // The listener itself is gone: there is nothing left to serve with.
             Err(e @ AcceptError::Listener(_)) => return Err(e.into()),
         };
-        let (k, ch) = (kernel.clone(), challenges.clone());
+        let (k, ch, ep) = (kernel.clone(), challenges.clone(), endpoint.clone());
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, k, ch).await {
+            if let Err(e) = handle_connection(stream, k, ch, ep).await {
                 tracing::debug!(error = %e, "connection closed");
             }
         });
@@ -173,6 +182,7 @@ async fn handle_connection(
     stream: Box<dyn transport::Stream>,
     kernel: Shared,
     challenges: Arc<Mutex<Challenges>>,
+    endpoint: Arc<String>,
 ) -> Result<()> {
     let (r, mut w) = tokio::io::split(stream);
     let mut reader = BufReader::new(r);
@@ -184,8 +194,8 @@ async fn handle_connection(
                 // The kernel does its own disk IO, so a call runs on the
                 // blocking pool. `dispatch` is synchronous: the kernel lock is
                 // taken and released inside it, never held across an await.
-                let (k, ch) = (kernel.clone(), challenges.clone());
-                let outcome = tokio::task::spawn_blocking(move || dispatch(&k, &ch, req))
+                let (k, ch, ep) = (kernel.clone(), challenges.clone(), endpoint.clone());
+                let outcome = tokio::task::spawn_blocking(move || dispatch(&k, &ch, req, &ep))
                     .await
                     .unwrap_or_else(|e| Err(internal(&format!("dispatch aborted: {e}"))));
                 reply(id, outcome)
@@ -371,6 +381,7 @@ fn dispatch(
     kernel: &Shared,
     challenges: &Mutex<Challenges>,
     req: Request,
+    endpoint: &str,
 ) -> Result<Value, RpcError> {
     let now = now_ms();
     // A nonce presented is a nonce spent, whatever the method and whatever
@@ -408,6 +419,14 @@ fn dispatch(
         .then(|| ollama_adapter(&req.params["config"]))
         .transpose()
         .map_err(|e| bad(&format!("{e:#}")))?;
+    // Handled before the general lock, and taking the kernel lock only in short
+    // phases of its own: a harness run launches Claude Code and *waits* for it,
+    // and the harness calls back over MCP (`harness.*`) while it runs — so a lock
+    // held across the wait would deadlock the harness against its own syscalls
+    // (SP1b Task 4).
+    if req.method == "harness.run" {
+        return harness_run(kernel, endpoint, req.params);
+    }
     let mut k = lock(kernel)?;
     let p = req.params;
     match req.method.as_str() {
@@ -575,6 +594,51 @@ fn dispatch(
             // process, and every other syscall can proceed while it winds up.
             drop(k);
             drop(removed);
+            Ok(json!({ "ok": true }))
+        }
+        // The harness's own syscalls (SP1b Task 4). Each carries the lease token
+        // `vk-mcp` was launched with; the kernel maps it to the harness principal
+        // at the harness clearance. No presence proof is accepted (they are not
+        // in `takes_presence`), because a lease is a machine capability, not a
+        // human's presence; an unknown or expired token is an I1 refusal.
+        "harness.read_register" => {
+            let s = harness_session(&k, &p, now)?;
+            k.read_register(&s.ctx, &s.register)
+                .map_err(kerr)
+                .and_then(to_value)
+        }
+        "harness.write_decision" => {
+            let s = harness_session(&k, &p, now)?;
+            let text = p["text"].as_str().ok_or_else(|| bad("text"))?;
+            let mut reg = k.read_register(&s.ctx, &s.register).map_err(kerr)?;
+            reg.decisions.push(format!("harness: {text}"));
+            k.write_register(&s.ctx, reg).map_err(kerr)?;
+            Ok(json!({ "ok": true }))
+        }
+        "harness.attach_artefact" => {
+            let s = harness_session(&k, &p, now)?;
+            let kind = p["kind"].as_str().ok_or_else(|| bad("kind"))?;
+            let path = p["path"].as_str().ok_or_else(|| bad("path"))?;
+            let bytes = k.read_harness_file(&s.task_id, path).map_err(kerr)?;
+            let env = k
+                .attach_artefact(&s.ctx, &s.register, kind, &bytes)
+                .map_err(kerr)?;
+            Ok(json!({ "hash": env.hash }))
+        }
+        "harness.request_approval" => {
+            let s = harness_session(&k, &p, now)?;
+            let mut reg = k.read_register(&s.ctx, &s.register).map_err(kerr)?;
+            reg.open_questions
+                .push("approval requested by the harness".into());
+            k.write_register(&s.ctx, reg).map_err(kerr)?;
+            Ok(json!({ "ok": true, "requested": true }))
+        }
+        "harness.log" => {
+            // Validate the token even though the message only goes to the log:
+            // an unknown token is refused here rather than quietly accepted.
+            let s = harness_session(&k, &p, now)?;
+            let msg = p["message"].as_str().unwrap_or("");
+            tracing::info!(task = %s.task_id, harness = %msg, "harness log");
             Ok(json!({ "ok": true }))
         }
         "task.create" => {
@@ -884,6 +948,145 @@ fn mock_manifest(name: &str, ctx: u32) -> ArchManifest {
         },
         governed: true,
     }
+}
+
+/// Resolve the lease token in a `harness.*` request to the session it names.
+fn harness_session(
+    k: &RealKernel,
+    p: &Value,
+    now: u64,
+) -> Result<vk_kernel::HarnessSession, RpcError> {
+    let token = p["token"].as_str().ok_or_else(|| bad("token"))?;
+    k.harness_session(token, now).map_err(kerr)
+}
+
+/// The `vk-mcp` binary this daemon launches a harness's MCP server as: next to
+/// this executable, same target directory.
+fn mcp_server_path() -> PathBuf {
+    let name = format!("vk-mcp{}", std::env::consts::EXE_SUFFIX);
+    std::env::current_exe()
+        .ok()
+        .map(|p| p.with_file_name(&name))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// A run record for a launch that never started (the binary could not be
+/// spawned): nothing ran, so nothing was contained and nothing was reached.
+fn failed_run() -> HarnessRun {
+    HarnessRun {
+        exit_code: None,
+        exit_reason: ExitReason::Signal,
+        stdout_json: String::new(),
+        connections: Vec::new(),
+        samples: 0,
+        duration_ms: 0,
+        governed: false,
+    }
+}
+
+/// `harness.run`: the confined Claude Code harness, driven in three phases so the
+/// kernel lock is never held across the wait (SP1b Task 4).
+///
+/// Phase one leases and materialises under the lock; phase two launches and
+/// waits with the lock released, so the harness's own `harness.*` syscalls can be
+/// served; phase three attaches, records the egress and settles under the lock.
+/// `--dry-run` returns the launch line and the `.mcp.json` — token redacted —
+/// and runs nothing.
+fn harness_run(kernel: &Shared, endpoint: &str, p: Value) -> Result<Value, RpcError> {
+    let task_id = p["task_id"]
+        .as_str()
+        .ok_or_else(|| bad("task_id"))?
+        .to_string();
+    let dry_run = p["dry_run"].as_bool().unwrap_or(false);
+    let keep = p["keep"].as_bool().unwrap_or(false);
+    let name = p["name"].as_str().unwrap_or("claude-code").to_string();
+    let model = p["model"].as_str().map(str::to_owned);
+    // The real harness launches `claude.exe` directly (never a `.cmd` shim, so no
+    // grandchild escapes before the governor can contain the tree); a test passes
+    // its stand-in with `--bin`.
+    let binary = p["bin"]
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("claude"));
+    let mcp_server = mcp_server_path();
+    let timeout = Duration::from_secs(p["timeout_secs"].as_u64().unwrap_or(300));
+    let _ = &name;
+
+    if dry_run {
+        let workspace = lock(kernel)?.harness_workspace_dir(&task_id);
+        let cfg = HarnessConfig {
+            binary,
+            workspace: workspace.clone(),
+            lease_token: launch::REDACTED_TOKEN.to_string(),
+            endpoint: endpoint.to_string(),
+            mcp_server,
+            prompt: vk_kernel::tasks::HARNESS_PROMPT.to_string(),
+            model,
+            timeout,
+        };
+        return Ok(json!({
+            "dry_run": true,
+            "task_id": task_id,
+            "workspace": workspace.display().to_string(),
+            "launch_line": launch::launch_line(&cfg),
+            "mcp_json": launch::mcp_json(&cfg, launch::REDACTED_TOKEN),
+        }));
+    }
+
+    // Phase one: lease and materialise, under the lock.
+    let launch_plan = {
+        let mut k = lock(kernel)?;
+        let ctx = ctx_for(&k, None, now_ms())?;
+        k.harness_launch(&ctx, &task_id).map_err(kerr)?
+    };
+
+    // Phase two: launch and wait, lock released, so `harness.*` callbacks serve.
+    let cfg = HarnessConfig {
+        binary,
+        workspace: launch_plan.workspace.clone(),
+        lease_token: launch_plan.lease_id.clone(),
+        endpoint: endpoint.to_string(),
+        mcp_server,
+        prompt: launch_plan.prompt.clone(),
+        model,
+        timeout,
+    };
+    // JobGovernor::new(2 GiB, None) on Windows; the Noop elsewhere.
+    let governor = vk_harness::confine::for_this_platform(2 * 1024 * 1024 * 1024, None)
+        .map_err(|e| internal(&format!("governor: {e:#}")))?;
+    let stop_kernel = kernel.clone();
+    let should_stop = move || {
+        stop_kernel
+            .lock()
+            .map(|k| k.stopped_scopes().iter().any(|s| s == "node"))
+            .unwrap_or(false)
+    };
+    let (run, launch_error) = match launch::launch_claude_code(&cfg, governor, &should_stop) {
+        Ok(run) => (run, None),
+        Err(e) => (failed_run(), Some(format!("{e:#}"))),
+    };
+
+    // Phase three: attach, record the egress, settle, under the lock.
+    let mut k = lock(kernel)?;
+    let ctx = ctx_for(&k, None, now_ms())?;
+    let task = k
+        .harness_settle(&ctx, &task_id, &launch_plan, &run, keep)
+        .map_err(kerr)?;
+    let artefact = k
+        .read_register(&ctx, &task.register)
+        .ok()
+        .and_then(|r| r.artefacts.last().map(|a| a.hash.clone()));
+    Ok(json!({
+        "task_id": task.id,
+        "status": serde_json::to_value(task.status).unwrap_or(Value::Null),
+        "exit": run.exit_reason.label(),
+        "governed": run.governed,
+        "connections": run.connections,
+        "samples": run.samples,
+        "duration_ms": run.duration_ms,
+        "artefact_hash": artefact,
+        "error": launch_error,
+    }))
 }
 
 #[cfg(test)]

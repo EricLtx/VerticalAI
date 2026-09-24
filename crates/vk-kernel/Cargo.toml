@@ -9,6 +9,11 @@ description = "VerticalAI kernel: syscalls, locks, labels, ledger over vk-store"
 [dependencies]
 vk-contracts = { path = "../vk-contracts" }
 vk-store = { path = "../vk-store" }
+# The confined harness: the governor, the workspace projection, the launch and
+# the egress telemetry the `StepKind::Harness` scheduler drives. The dependency
+# runs this way only — `vk-harness` depends on `vk-contracts`, never back on the
+# kernel — so the kernel can call it while `vk-harness` stays a leaf.
+vk-harness = { path = "../vk-harness" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

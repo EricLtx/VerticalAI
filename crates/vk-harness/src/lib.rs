@@ -1,15 +1,34 @@
 //! The harness: how this kernel launches an agent it does not trust with its
-//! store — confined, capped, and dead the moment the kernel is.
+//! store — confined, capped, given only what it may see, and watched.
 //!
-//! What lives here now is the process governor, [`confine`]: on Windows a Job
-//! Object that a kernel-launched process tree (the Claude Code harness, an
-//! optional llama-server) is assigned to, so it dies when the kernel's handle
-//! closes and stays under a memory cap and, if asked, a CPU cap. On Linux and
-//! macOS nothing confines yet — [`confine::NoopGovernor`] says so in the log
-//! and the manifest says `governed: false` — until SP4 brings cgroups and
-//! `sandbox-exec`. The workspace projection, the launch line and the egress
-//! telemetry of the harness arrive with SP1b Task 4.
+//! Four things live here, and the kernel drives them in this order for a
+//! [`StepKind::Harness`](../vk_kernel/tasks/enum.StepKind.html) step:
 //!
-//! The Ollama arch is not governed here: its caps are its container's.
+//! * [`confine`] — the process governor. On Windows a Job Object the launched
+//!   tree is assigned to, so it dies with the kernel and stays under a memory
+//!   and CPU cap; elsewhere a [`confine::NoopGovernor`] that says so.
+//! * [`workspace`] — the label-projected workspace. Only the register's goal,
+//!   its plan, and the evidence whose label flows to the harness clearance (I2)
+//!   are written into `<state_dir>/harness/<task_id>/`; each projection is
+//!   logged, and everything above the clearance is refused.
+//! * [`launch`] — the confined launch of Claude Code: the `.mcp.json` that
+//!   points it back at the kernel through [`vk-mcp`], the launch line, the run
+//!   under the governor, and the artefact and telemetry it leaves.
+//! * [`netwatch`] — the egress telemetry. Every 500 ms the launched process's
+//!   established TCP connections are sampled (`GetExtendedTcpTable` on Windows,
+//!   a no-op elsewhere) so the run record can say what it talked to.
+//!
+//! The crate depends on `vk-contracts` and nothing else of ours: the kernel
+//! depends on *it*, so the dependency cannot run back. The kernel hands the
+//! workspace projection what it needs through the [`workspace::Host`] trait,
+//! whose every type is a contract, and drives [`launch::launch_claude_code`]
+//! from outside its own lock — because the launched harness calls back into the
+//! kernel over MCP while it runs, and a lock held across the wait would deadlock
+//! the harness against its own syscalls.
 
 pub mod confine;
+pub mod launch;
+pub mod netwatch;
+pub mod workspace;
+
+pub use workspace::{harness_clearance, Host, ProjectionRecord, Workspace};

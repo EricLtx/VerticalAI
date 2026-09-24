@@ -243,6 +243,13 @@ pub const ALLOWED_KINDS: &[&str] = &[
     "arch.mounted",
     "arch.unmounted",
     "device.enrolled",
+    // The egress a confined harness made while it ran (founder decision
+    // 2026-09-24, SP1b Task 4): one event per harness run, naming the endpoints
+    // it talked to, whether the kernel contained it, and how it ended. Its own
+    // kind rather than a field on `task.step` so an auditor can find every run's
+    // network activity by kind alone; `kind` stays a free string on the wire, so
+    // this changes no schema, exactly as `boot.forced` did.
+    "harness.connections",
     "shred",
 ];
 
@@ -321,5 +328,12 @@ mod tests {
     #[test]
     fn an_unlisted_kind_is_not_allowed() {
         assert!(!is_allowed_kind("not.a.real.kind"));
+    }
+
+    /// Founder decision 2026-09-24 (SP1b Task 4): a confined harness's egress is
+    /// its own ledger kind, so `record_harness_connection` can append it.
+    #[test]
+    fn harness_connections_is_an_allowed_kind() {
+        assert!(is_allowed_kind("harness.connections"));
     }
 }

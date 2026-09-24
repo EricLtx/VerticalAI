@@ -739,6 +739,171 @@ fn vk_boot_detaches_a_daemon_it_can_be_asked_to_stop_and_will_not_serve_two_stat
     }
 }
 
+/// A stand-in `claude` *harness*: unlike `fake_claude` (a pure-completion arch),
+/// this ignores its arguments, writes a proposal into the workspace's `OUT/`
+/// (its working directory is the workspace) and exits 0. Enough for `vk harness
+/// run` to drive a whole confined run without a subscription, a network or MCP.
+fn harness_standin(dir: &std::path::Path) -> PathBuf {
+    let bin = dir.join(if cfg!(windows) {
+        "harness-standin.cmd"
+    } else {
+        "harness-standin.sh"
+    });
+    let script = if cfg!(windows) {
+        "@echo off\r\n\
+         >OUT\\proposal.md echo # Proposal drafted by the confined harness\r\n\
+         echo {\"type\":\"result\",\"is_error\":false,\"result\":\"ok\"}\r\n\
+         exit /b 0\r\n"
+    } else {
+        "#!/bin/sh\n\
+         printf '# Proposal drafted by the confined harness\\n' > OUT/proposal.md\n\
+         printf '{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\"}\\n'\n\
+         exit 0\n"
+    };
+    std::fs::write(&bin, script).expect("write harness stand-in");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).expect("chmod +x");
+    }
+    bin
+}
+
+/// `vk harness run --dry-run` prints the exact launch line and the `.mcp.json`
+/// it would write, with the lease token redacted — and runs nothing. This is the
+/// verb an operator reads before ever spending a real Claude Code call.
+#[test]
+fn vk_harness_run_dry_run_prints_the_launch_line_and_redacted_mcp_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+
+    let dry = sh.json(&[
+        "harness",
+        "run",
+        "task-demo",
+        "--name",
+        "claude-code",
+        "--bin",
+        "claude.exe",
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(dry["dry_run"], true, "{dry}");
+    let line: Vec<String> = dry["launch_line"]
+        .as_array()
+        .expect("a launch line")
+        .iter()
+        .map(|x| x.as_str().unwrap_or("").to_string())
+        .collect();
+    // The flags the confinement rests on are all there.
+    for flag in [
+        "-p",
+        "--mcp-config",
+        "--allowedTools",
+        "--permission-mode",
+        "acceptEdits",
+        "--output-format",
+        "json",
+        "--strict-mcp-config",
+    ] {
+        assert!(
+            line.iter().any(|a| a == flag),
+            "{flag} missing from {line:?}"
+        );
+    }
+    assert!(
+        line.iter()
+            .any(|a| a == "mcp__vk__*,Read,Write,Edit,Glob,Grep"),
+        "the allowed tools are pinned: {line:?}"
+    );
+    // The .mcp.json names the vk server and redacts the token — a dry run never
+    // prints a live capability.
+    let mcp = dry["mcp_json"].as_str().expect("mcp_json");
+    assert!(mcp.contains("vk-mcp"), "{mcp}");
+    assert!(
+        mcp.contains("<redacted>"),
+        "the token must be redacted: {mcp}"
+    );
+    assert!(
+        !mcp.contains("lease-"),
+        "no real lease token in a dry run: {mcp}"
+    );
+}
+
+/// `vk harness run` drives the confined harness to a finished, attached proposal
+/// and records its egress. Against a stand-in launched with `--bin`, so it needs
+/// no subscription and reaches no network — the point being the daemon
+/// orchestration: lease, materialise, launch under the governor, attach the
+/// `OUT/` output, one `harness.connections` event, settle.
+#[test]
+fn vk_harness_run_drives_a_stand_in_to_an_attached_proposal() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+
+    let standin = path_of(&harness_standin(dir.path()));
+    let run = sh.json(&[
+        "harness",
+        "run",
+        "--goal",
+        "Draft a proposal for Acme",
+        "--name",
+        "claude-code",
+        "--bin",
+        &standin,
+        "--json",
+    ]);
+    assert_eq!(run["status"], "done", "the harness step finished: {run}");
+    assert_eq!(
+        run["governed"],
+        cfg!(windows),
+        "contained on Windows, ungoverned elsewhere: {run}"
+    );
+    let hash = run["artefact_hash"].as_str().unwrap_or("");
+    assert!(
+        hash.starts_with("sha256:"),
+        "the proposal was attached: {run}"
+    );
+
+    // The task carries the proposal, and a person reading `vk task show` sees it.
+    let task_id = run["task_id"].as_str().unwrap().to_string();
+    let shown = sh.json(&["task", "show", &task_id, "--json"]);
+    let artefacts = shown["register"]["artefacts"]
+        .as_array()
+        .or_else(|| shown["artefacts"].as_array());
+    // `task show` returns the task; its register's artefacts are what we attached.
+    assert!(shown["status"] == "done", "the shown task is done: {shown}");
+    let _ = artefacts;
+
+    // Exactly one harness.connections event is on the record for the run.
+    let tail = sh.json(&["dmesg", "-n", "20", "--json"]);
+    let conns = dmesg_kinds(&tail)
+        .iter()
+        .filter(|k| **k == "harness.connections")
+        .count();
+    assert_eq!(conns, 1, "one harness.connections event per run: {tail:?}");
+    assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
+}
+
 fn path_of(p: &std::path::Path) -> String {
     p.to_str().expect("utf-8 path").to_string()
 }
