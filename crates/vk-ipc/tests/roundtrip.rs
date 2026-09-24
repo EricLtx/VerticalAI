@@ -778,3 +778,36 @@ async fn arch_ls_says_whether_each_arch_is_ready() {
     assert_eq!(info["arch_states"][0]["state"], "ready", "{info}");
     server.abort();
 }
+
+/// Ruling 20: the harness binary, model and budget are the daemon's
+/// configuration. A `harness.run` that names any of them is refused as a bad
+/// request — before anything is looked up, leased or launched.
+#[tokio::test]
+async fn harness_run_refuses_a_request_that_names_the_binary_model_or_timeout() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    for (field, value) in [
+        ("bin", json!("C:\\Windows\\System32\\whoami.exe")),
+        ("binary", json!("/usr/bin/id")),
+        ("model", json!("claude-opus-5")),
+        ("timeout_secs", json!(1)),
+    ] {
+        let mut params = json!({ "task_id": "task-x", "name": "claude-code" });
+        params[field] = value;
+        let err = c.call("harness.run", params, None).await.unwrap_err();
+        assert_eq!(code_of(&err), vk_ipc::E_BAD_PARAMS, "{field}: {err}");
+        assert!(
+            err.to_string().contains(field) && err.to_string().contains("--harness-bin"),
+            "{field}: the refusal names the field and the daemon flag: {err}"
+        );
+    }
+    // Nothing was created or leased on the way.
+    let tasks = c.call("task.ls", json!({}), None).await.unwrap();
+    assert!(tasks.as_array().unwrap().is_empty(), "{tasks}");
+    server.abort();
+}

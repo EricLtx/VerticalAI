@@ -240,30 +240,27 @@ enum HarnessCmd {
     /// Launch the confined harness over a task's harness step.
     ///
     /// Give an existing TASK whose next step is a harness step, or `--goal` to
-    /// create a one-step harness task and run it. `--dry-run` prints the launch
-    /// line and the `.mcp.json` (token redacted) and runs nothing.
+    /// create a task (harness step, then a human approval) and run it.
+    /// `--dry-run` prints the launch line, the `mcp.json` (token redacted) and
+    /// the permission fence, and runs nothing. Which binary, model and timeout
+    /// the harness runs with is the daemon's to set (`vkd --harness-bin`,
+    /// `--harness-model`, `--harness-timeout-secs`), never this verb's.
     Run {
         /// The task to run. Omit it and pass `--goal` to create one.
         task: Option<String>,
-        /// Create a fresh single-harness-step task with this goal, then run it.
+        /// Create a fresh task with this goal — a harness step then an
+        /// approval — and run its harness step.
         #[arg(long)]
         goal: Option<String>,
         /// Which harness. Only `claude-code` in SP1b.
         #[arg(long, default_value = "claude-code")]
         name: String,
-        /// The Claude Code binary, if it is not `claude` on the daemon's PATH.
-        #[arg(long)]
-        bin: Option<String>,
-        /// The model to run the harness on (the CLI's default otherwise).
-        #[arg(long)]
-        model: Option<String>,
-        /// How long the run may take, in seconds.
-        #[arg(long, default_value_t = 300)]
-        timeout: u64,
-        /// Print the launch line and `.mcp.json` and exit, without running.
+        /// Print the launch line, `mcp.json` and `settings.json` and exit,
+        /// without running.
         #[arg(long)]
         dry_run: bool,
-        /// Keep the workspace after the run instead of removing it.
+        /// Keep the workspace after the run instead of removing it (it is
+        /// swept at the daemon's next boot regardless).
         #[arg(long)]
         keep: bool,
     },
@@ -592,14 +589,13 @@ async fn harness(cli: &Cli, c: &Client, what: &HarnessCmd) -> Result<()> {
         task,
         goal,
         name,
-        bin,
-        model,
-        timeout,
         dry_run,
         keep,
     } = what;
 
-    // An existing task, or a fresh single-harness-step one from a goal.
+    // An existing task, or a fresh one from a goal: a harness step, then the
+    // approval the harness's last instruction (`vk_request_approval`) asks for
+    // — so the request has a step to land on.
     let task_id = match (task, goal) {
         (Some(id), _) => id.clone(),
         (None, Some(g)) => {
@@ -609,7 +605,7 @@ async fn harness(cli: &Cli, c: &Client, what: &HarnessCmd) -> Result<()> {
                     json!({
                         "goal": g,
                         "artefact_type": "proposal",
-                        "steps": [ { "kind": "harness", "name": name } ],
+                        "steps": [ { "kind": "harness", "name": name }, { "kind": "approve" } ],
                     }),
                     None,
                 )
@@ -623,19 +619,14 @@ async fn harness(cli: &Cli, c: &Client, what: &HarnessCmd) -> Result<()> {
         }
     };
 
-    let mut params = json!({
+    // Only what the request may carry (Ruling 20): the binary, the model and
+    // the budget are the daemon's configuration.
+    let params = json!({
         "task_id": task_id,
         "name": name,
         "dry_run": dry_run,
         "keep": keep,
-        "timeout_secs": timeout,
     });
-    if let Some(b) = bin {
-        params["bin"] = json!(b);
-    }
-    if let Some(m) = model {
-        params["model"] = json!(m);
-    }
     let answer = c.call("harness.run", params, None).await?;
     if *dry_run {
         show(cli, answer, render::harness_dry_run)

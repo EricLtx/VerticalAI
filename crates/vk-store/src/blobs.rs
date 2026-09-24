@@ -105,6 +105,15 @@ impl BlobStore {
         self.master.fingerprint()
     }
 
+    /// The address `put(key_id, _, plaintext)` would store these bytes at,
+    /// without storing them: `sha256(key_id || 0x00 || plaintext)`. What a
+    /// caller compares a register's `ArtefactRef.hash` against to learn whether
+    /// a file is already attached under this subject — a bare hash of the bytes
+    /// never matches an address (SP1b Task 4 review, I5).
+    pub fn address_of(&self, key_id: &str, plaintext: &[u8]) -> String {
+        address(key_id, plaintext)
+    }
+
     /// `BlobEnvelope.hash` is the storage address — `sha256(key_id || 0x00 ||
     /// plaintext)` — not a hash of the plaintext alone. Two subjects that
     /// `put` byte-identical plaintext land at two different addresses, so

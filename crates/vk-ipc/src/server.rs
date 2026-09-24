@@ -28,6 +28,53 @@ use vk_kernel::{now_ms, RealKernel, Remount};
 
 type Shared = Arc<Mutex<RealKernel>>;
 
+/// What the daemon was started with, beyond the kernel: the endpoint it serves
+/// on (a harness's `vk-mcp` dials back on it) and the harness settings — the
+/// binary, the model and the run budget — which are the daemon's to set and
+/// never a request's (Ruling 20: a pipe client that could name the binary the
+/// daemon executes would be code execution as the daemon's account once Task 6
+/// puts it under one).
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    pub endpoint: String,
+    pub harness: HarnessSettings,
+}
+
+impl ServerConfig {
+    /// A config with the default harness settings, for a caller (a test) that
+    /// has only an endpoint.
+    pub fn new(endpoint: String) -> ServerConfig {
+        ServerConfig {
+            endpoint,
+            harness: HarnessSettings::default(),
+        }
+    }
+}
+
+/// How this daemon launches a harness: `vkd --harness-bin`, `--harness-model`,
+/// `--harness-timeout-secs`.
+#[derive(Debug, Clone)]
+pub struct HarnessSettings {
+    /// The Claude Code binary: `claude` by default, resolved on the daemon's
+    /// own `PATH` to `claude.exe` on Windows (never a `.cmd` shim); a test's
+    /// daemon is started with a stand-in.
+    pub binary: PathBuf,
+    /// The model the harness is pinned to.
+    pub model: Option<String>,
+    /// How long one run may take before its tree is killed.
+    pub timeout: Duration,
+}
+
+impl Default for HarnessSettings {
+    fn default() -> Self {
+        HarnessSettings {
+            binary: PathBuf::from("claude"),
+            model: Some("claude-sonnet-5".into()),
+            timeout: Duration::from_secs(300),
+        }
+    }
+}
+
 /// How long a presence challenge stays answerable.
 pub const CHALLENGE_TTL_MS: u64 = 60_000;
 /// Open challenges are bounded: past this many, the one closest to expiry is
@@ -82,7 +129,7 @@ impl Challenges {
 
 pub async fn serve(kernel: Shared, endpoint: Endpoint) -> Result<()> {
     let listener = transport::os::bind(&endpoint).await?;
-    serve_on(kernel, listener, endpoint.0).await
+    serve_on(kernel, listener, ServerConfig::new(endpoint.0)).await
 }
 
 /// Serve on an endpoint the caller has already bound. `vkd` binds before it
@@ -92,12 +139,12 @@ pub async fn serve(kernel: Shared, endpoint: Endpoint) -> Result<()> {
 pub async fn serve_on(
     kernel: Shared,
     mut listener: transport::os::Listener,
-    endpoint: String,
+    config: ServerConfig,
 ) -> Result<()> {
     let challenges = Arc::new(Mutex::new(Challenges::default()));
-    // The endpoint the harness's `vk-mcp` must dial back on, threaded to every
-    // connection so `harness.run` can write it into the workspace `.mcp.json`.
-    let endpoint = Arc::new(endpoint);
+    // The endpoint the harness's `vk-mcp` must dial back on and the daemon's
+    // harness settings, threaded to every connection for `harness.run`.
+    let endpoint = Arc::new(config);
     loop {
         let stream = match listener.accept().await {
             Ok(s) => s,
@@ -182,7 +229,7 @@ async fn handle_connection(
     stream: Box<dyn transport::Stream>,
     kernel: Shared,
     challenges: Arc<Mutex<Challenges>>,
-    endpoint: Arc<String>,
+    endpoint: Arc<ServerConfig>,
 ) -> Result<()> {
     let (r, mut w) = tokio::io::split(stream);
     let mut reader = BufReader::new(r);
@@ -381,7 +428,7 @@ fn dispatch(
     kernel: &Shared,
     challenges: &Mutex<Challenges>,
     req: Request,
-    endpoint: &str,
+    config: &ServerConfig,
 ) -> Result<Value, RpcError> {
     let now = now_ms();
     // A nonce presented is a nonce spent, whatever the method and whatever
@@ -425,7 +472,7 @@ fn dispatch(
     // held across the wait would deadlock the harness against its own syscalls
     // (SP1b Task 4).
     if req.method == "harness.run" {
-        return harness_run(kernel, endpoint, req.params);
+        return harness_run(kernel, config, req.params);
     }
     let mut k = lock(kernel)?;
     let p = req.params;
@@ -616,12 +663,14 @@ fn dispatch(
             Ok(json!({ "ok": true }))
         }
         "harness.attach_artefact" => {
-            let s = harness_session(&k, &p, now)?;
+            let token = p["token"].as_str().ok_or_else(|| bad("token"))?;
             let kind = p["kind"].as_str().ok_or_else(|| bad("kind"))?;
             let path = p["path"].as_str().ok_or_else(|| bad("path"))?;
-            let bytes = k.read_harness_file(&s.task_id, path).map_err(kerr)?;
+            // The kernel resolves the token, confines the path to the
+            // workspace, holds the file to the per-file and per-run caps and
+            // attaches it at the harness clearance (Ruling 21.6).
             let env = k
-                .attach_artefact(&s.ctx, &s.register, kind, &bytes)
+                .harness_attach_file(token, now, kind, path)
                 .map_err(kerr)?;
             Ok(json!({ "hash": env.hash }))
         }
@@ -970,13 +1019,43 @@ fn mcp_server_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
+/// The prompt a harness is launched with: the fixed instruction, plus — when
+/// the daemon's **own process environment** carries `VK_HARNESS_PROMPT_SUFFIX`
+/// — an operator's addendum. A diagnostic seam of the same class as `VK_DOCKER`:
+/// read from `vkd`'s environment, never from a request, so no pipe client can
+/// reach it. It exists so the fence can be proved from the operator's side of
+/// the prompt — a "try to read `C:\Windows\win.ini`" placed in a task's files is
+/// content the model rightly treats as an injection and refuses to act on,
+/// which proves the model's judgement and nothing about the fence.
+fn harness_prompt(base: &str) -> String {
+    match std::env::var("VK_HARNESS_PROMPT_SUFFIX") {
+        Ok(suffix) if !suffix.trim().is_empty() => format!("{base}\n\n{}", suffix.trim()),
+        _ => base.to_string(),
+    }
+}
+
+/// The operator's *system-prompt* addendum, from the daemon's own environment
+/// (`VK_HARNESS_SYSTEM_SUFFIX`), same class of seam as `harness_prompt`'s. The
+/// channel a confinement diagnostic has to use: in the two proof runs of the
+/// Task 4 fix round the model refused to act on the diagnostic when it came as
+/// task content and again when it came in the user turn — "not delivered
+/// through a trusted system channel" — so this is that channel. Empty in every
+/// ordinary run.
+fn harness_system_suffix() -> Option<String> {
+    std::env::var("VK_HARNESS_SYSTEM_SUFFIX")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
 /// A run record for a launch that never started (the binary could not be
-/// spawned): nothing ran, so nothing was contained and nothing was reached.
+/// spawned, or the launch panicked): nothing ran, so nothing was contained and
+/// nothing was reached.
 fn failed_run() -> HarnessRun {
     HarnessRun {
         exit_code: None,
-        exit_reason: ExitReason::Signal,
+        exit_reason: ExitReason::NotStarted,
         stdout_json: String::new(),
+        outcome: None,
         connections: Vec::new(),
         samples: 0,
         duration_ms: 0,
@@ -984,76 +1063,160 @@ fn failed_run() -> HarnessRun {
     }
 }
 
+/// The harness binary as the daemon will execute it (Ruling 20).
+///
+/// An explicit path is taken as given and must exist. A bare name is looked up
+/// on the daemon's own `PATH`: on Windows as `<name>.exe` — never `<name>.cmd`
+/// or `<name>.bat`, a shim that would spawn the real binary as a grandchild
+/// before the governor can contain the tree — and elsewhere as `<name>`.
+fn resolve_harness_binary(binary: &std::path::Path) -> Result<PathBuf> {
+    if binary.components().count() > 1 || binary.is_absolute() {
+        anyhow::ensure!(
+            binary.is_file(),
+            "harness binary {} does not exist (vkd --harness-bin)",
+            binary.display()
+        );
+        if binary
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+        {
+            tracing::warn!(binary = %binary.display(), "the harness binary is a .cmd/.bat shim: its child may escape containment");
+        }
+        return Ok(binary.to_path_buf());
+    }
+    let name = binary.to_string_lossy().into_owned();
+    let candidates: Vec<String> = if cfg!(windows) {
+        if name.to_ascii_lowercase().ends_with(".exe") {
+            vec![name.clone()]
+        } else {
+            vec![format!("{name}.exe")]
+        }
+    } else {
+        vec![name.clone()]
+    };
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path_var) {
+        for c in &candidates {
+            let p = dir.join(c);
+            if p.is_file() {
+                return Ok(p);
+            }
+        }
+    }
+    anyhow::bail!(
+        "harness binary `{name}` not found on the daemon's PATH{}; start vkd with --harness-bin <path>",
+        if cfg!(windows) { " (as an .exe)" } else { "" }
+    )
+}
+
 /// `harness.run`: the confined Claude Code harness, driven in three phases so the
 /// kernel lock is never held across the wait (SP1b Task 4).
 ///
-/// Phase one leases and materialises under the lock; phase two launches and
-/// waits with the lock released, so the harness's own `harness.*` syscalls can be
-/// served; phase three attaches, records the egress and settles under the lock.
-/// `--dry-run` returns the launch line and the `.mcp.json` — token redacted —
+/// The request carries `task_id`, `name`, `dry_run` and `keep` — nothing that
+/// chooses what executes: the binary, the model and the budget are the daemon's
+/// (Ruling 20), and a request that names them is refused. Everything that can
+/// be refused is refused *before* phase one, so a refusal leases nothing.
+///
+/// Phase one leases, mints the token and materialises under the lock; phase two
+/// launches and waits with the lock released, so the harness's own `harness.*`
+/// syscalls can be served; phase three settles under the lock — on every
+/// outcome, a panic in the launch included (Ruling 21.4). `--dry-run` returns
+/// the launch line, the `mcp.json` (token redacted) and the `settings.json`,
 /// and runs nothing.
-fn harness_run(kernel: &Shared, endpoint: &str, p: Value) -> Result<Value, RpcError> {
+fn harness_run(kernel: &Shared, config: &ServerConfig, p: Value) -> Result<Value, RpcError> {
+    for forbidden in ["bin", "binary", "model", "timeout_secs", "timeout"] {
+        if p.get(forbidden).is_some() {
+            return Err(bad(&format!(
+                "harness.run does not take `{forbidden}`: the harness binary, model and timeout \
+                 are daemon configuration (vkd --harness-bin, --harness-model, --harness-timeout-secs)"
+            )));
+        }
+    }
     let task_id = p["task_id"]
         .as_str()
         .ok_or_else(|| bad("task_id"))?
         .to_string();
+    let name = p["name"].as_str().unwrap_or("claude-code").to_string();
     let dry_run = p["dry_run"].as_bool().unwrap_or(false);
     let keep = p["keep"].as_bool().unwrap_or(false);
-    let name = p["name"].as_str().unwrap_or("claude-code").to_string();
-    let model = p["model"].as_str().map(str::to_owned);
-    // The real harness launches `claude.exe` directly (never a `.cmd` shim, so no
-    // grandchild escapes before the governor can contain the tree); a test passes
-    // its stand-in with `--bin`.
-    let binary = p["bin"]
-        .as_str()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("claude"));
+    let settings = &config.harness;
+    let timeout = settings.timeout;
+
+    // Refused before anything is leased: a binary that is not there, a `vk-mcp`
+    // that is not there (a tool-less Claude that "succeeds" is not a run), or a
+    // governor the OS will not give.
+    let binary =
+        resolve_harness_binary(&settings.binary).map_err(|e| internal(&format!("{e:#}")))?;
     let mcp_server = mcp_server_path();
-    let timeout = Duration::from_secs(p["timeout_secs"].as_u64().unwrap_or(300));
-    let _ = &name;
+    if !dry_run && !mcp_server.is_file() {
+        return Err(internal(&format!(
+            "no vk-mcp next to this daemon at {}: the harness would run without its kernel channel",
+            mcp_server.display()
+        )));
+    }
+    let (state_dir, workspace, config_dir) = {
+        let k = lock(kernel)?;
+        (
+            k.store().state_dir.clone(),
+            k.harness_workspace_dir(&task_id),
+            k.harness_config_dir(&task_id),
+        )
+    };
 
     if dry_run {
-        let workspace = lock(kernel)?.harness_workspace_dir(&task_id);
         let cfg = HarnessConfig {
             binary,
             workspace: workspace.clone(),
+            config_dir: config_dir.clone(),
+            state_dir,
             lease_token: launch::REDACTED_TOKEN.to_string(),
-            endpoint: endpoint.to_string(),
+            endpoint: config.endpoint.clone(),
             mcp_server,
-            prompt: vk_kernel::tasks::HARNESS_PROMPT.to_string(),
-            model,
+            prompt: harness_prompt(vk_kernel::tasks::HARNESS_PROMPT),
+            model: settings.model.clone(),
             timeout,
+            system_suffix: harness_system_suffix(),
         };
         return Ok(json!({
             "dry_run": true,
             "task_id": task_id,
             "workspace": workspace.display().to_string(),
+            "config_dir": config_dir.display().to_string(),
             "launch_line": launch::launch_line(&cfg),
             "mcp_json": launch::mcp_json(&cfg, launch::REDACTED_TOKEN),
+            "settings_json": launch::settings_json(&cfg),
         }));
     }
 
-    // Phase one: lease and materialise, under the lock.
+    // JobGovernor::new(2 GiB, None) on Windows; the Noop elsewhere. Made before
+    // the lease, so a refused governor leases nothing.
+    let governor = vk_harness::confine::for_this_platform(2 * 1024 * 1024 * 1024, None)
+        .map_err(|e| internal(&format!("governor: {e:#}")))?;
+
+    // Phase one: lease, token, workspace, under the lock.
     let launch_plan = {
         let mut k = lock(kernel)?;
         let ctx = ctx_for(&k, None, now_ms())?;
-        k.harness_launch(&ctx, &task_id).map_err(kerr)?
+        k.harness_launch(&ctx, &task_id, &name, timeout.as_millis() as u64)
+            .map_err(kerr)?
     };
 
     // Phase two: launch and wait, lock released, so `harness.*` callbacks serve.
+    // A panic here is a run that did not start, not a step left `Running`.
     let cfg = HarnessConfig {
         binary,
         workspace: launch_plan.workspace.clone(),
-        lease_token: launch_plan.lease_id.clone(),
-        endpoint: endpoint.to_string(),
+        config_dir: launch_plan.config_dir.clone(),
+        state_dir,
+        lease_token: launch_plan.token.clone(),
+        endpoint: config.endpoint.clone(),
         mcp_server,
-        prompt: launch_plan.prompt.clone(),
-        model,
+        prompt: harness_prompt(&launch_plan.prompt),
+        model: settings.model.clone(),
         timeout,
+        system_suffix: harness_system_suffix(),
     };
-    // JobGovernor::new(2 GiB, None) on Windows; the Noop elsewhere.
-    let governor = vk_harness::confine::for_this_platform(2 * 1024 * 1024 * 1024, None)
-        .map_err(|e| internal(&format!("governor: {e:#}")))?;
     let stop_kernel = kernel.clone();
     let should_stop = move || {
         stop_kernel
@@ -1061,30 +1224,55 @@ fn harness_run(kernel: &Shared, endpoint: &str, p: Value) -> Result<Value, RpcEr
             .map(|k| k.stopped_scopes().iter().any(|s| s == "node"))
             .unwrap_or(false)
     };
-    let (run, launch_error) = match launch::launch_claude_code(&cfg, governor, &should_stop) {
-        Ok(run) => (run, None),
-        Err(e) => (failed_run(), Some(format!("{e:#}"))),
+    let launched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        launch::launch_claude_code(&cfg, governor, &should_stop)
+    }));
+    let (run, launch_error) = match launched {
+        Ok(Ok(run)) => (run, None),
+        Ok(Err(e)) => (failed_run(), Some(format!("{e:#}"))),
+        Err(_) => (
+            failed_run(),
+            Some("the harness launch panicked".to_string()),
+        ),
     };
 
-    // Phase three: attach, record the egress, settle, under the lock.
+    // Phase three: settle, under the lock — whatever the run was.
     let mut k = lock(kernel)?;
     let ctx = ctx_for(&k, None, now_ms())?;
     let task = k
         .harness_settle(&ctx, &task_id, &launch_plan, &run, keep)
         .map_err(kerr)?;
-    let artefact = k
+    let (artefact, artefacts) = k
         .read_register(&ctx, &task.register)
         .ok()
-        .and_then(|r| r.artefacts.last().map(|a| a.hash.clone()));
+        .map(|r| {
+            (
+                r.artefacts.last().map(|a| a.hash.clone()),
+                r.artefacts.len(),
+            )
+        })
+        .unwrap_or((None, 0));
+    let step_status = task
+        .steps
+        .get(launch_plan.step_index)
+        .map(|s| serde_json::to_value(&s.status).unwrap_or(Value::Null))
+        .unwrap_or(Value::Null);
+    let outcome = run.outcome.as_ref();
     Ok(json!({
         "task_id": task.id,
         "status": serde_json::to_value(task.status).unwrap_or(Value::Null),
+        "step_status": step_status,
         "exit": run.exit_reason.label(),
         "governed": run.governed,
         "connections": run.connections,
         "samples": run.samples,
         "duration_ms": run.duration_ms,
         "artefact_hash": artefact,
+        "artefacts": artefacts,
+        "cost_list_usd": outcome.map(|o| o.total_cost_usd),
+        "num_turns": outcome.map(|o| o.num_turns),
+        "permission_denials": outcome.map(|o| o.permission_denials.clone()).unwrap_or_default(),
+        "kept": keep,
         "error": launch_error,
     }))
 }

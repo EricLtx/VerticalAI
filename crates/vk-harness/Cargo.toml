@@ -17,6 +17,11 @@ serde_json.workspace = true
 # trait, whose every type is a contract.
 vk-contracts = { path = "../vk-contracts" }
 
+[target.'cfg(unix)'.dependencies]
+# Signalling the launched child's whole process group at a kill; `Child::kill`
+# reaches only the process itself.
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 # Job Object containment (`confine::JobGovernor`) and, for `netwatch`, the TCP
 # connection table of a launched process (`GetExtendedTcpTable`). 0.62 was the

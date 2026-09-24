@@ -367,6 +367,24 @@ pub struct RealKernel {
     /// promises for a `--force` verdict — never persisted, so it says
     /// nothing about a previous or a future run.
     forced_boot: bool,
+    /// The live harness runs, keyed by the **hash** of each run's lease token
+    /// (SP1b Task 4, Ruling 21.2). In memory only: a harness cannot outlive
+    /// this process (the Job Object kills it when the daemon's handle closes),
+    /// so a token that was live before a restart is rightly unknown after one.
+    /// The token itself is never stored, logged or put in a payload; the
+    /// ledger and every principal carry the lease id.
+    harness_tokens: BTreeMap<String, HarnessTokenState>,
+}
+
+/// One live harness run, as the token map holds it: which lease and task the
+/// token stands for, and how much the run has attached so far (the 16 MiB
+/// per-run cap, Ruling 21.6). `oversize` remembers a file the run tried to
+/// attach past a cap, so settle can fail the step naming it.
+struct HarnessTokenState {
+    lease_id: String,
+    task_id: String,
+    bytes_attached: u64,
+    oversize: Option<String>,
 }
 
 /// The factory [`RealKernel::open`] uses: the mock and nothing else.
@@ -444,6 +462,7 @@ impl RealKernel {
             forced_boot: false,
             infer_log: vec![],
             counter: 0,
+            harness_tokens: BTreeMap::new(),
         };
         k.load()?;
         Ok(k)
@@ -724,6 +743,11 @@ impl RealKernel {
         // happened: this node came up, and then it found what the last one
         // left half-done (SP1b review, M11).
         self.recover_interrupted_steps(now_ms())?;
+        // No harness survives a restart (the Job Object dies with the daemon's
+        // handle), so every harness lease and workspace on disk is a leftover:
+        // swept here, so no stale token resolves and no projected plaintext
+        // lingers (SP1b Task 4 review, I4).
+        self.sweep_harness_state()?;
         Ok(report)
     }
 
@@ -1194,45 +1218,89 @@ impl RealKernel {
         self.store.state_dir.join("harness").join(task_id)
     }
 
+    /// Where a run's `mcp.json` (with the lease token) and `settings.json` (the
+    /// permission fence) are written: `<state_dir>/harness/<task_id>.mcp`,
+    /// **outside** the workspace, so no allow rule reaches them and the fence
+    /// denies them by name (Ruling 19).
+    pub fn harness_config_dir(&self, task_id: &str) -> PathBuf {
+        self.store
+            .state_dir
+            .join("harness")
+            .join(format!("{task_id}.mcp"))
+    }
+
+    /// The map key a token is looked up by: its SHA-256, so the token itself
+    /// is never held anywhere but in the run's `mcp.json`.
+    fn harness_token_key(token: &str) -> String {
+        vk_contracts::hash_bytes(token.as_bytes())
+    }
+
+    /// Mint a run's lease token: 32 random bytes, base64url (Ruling 21.2). A
+    /// secret, returned once to the launcher and hashed into the token map.
+    fn mint_harness_token(&mut self, lease_id: &str, task_id: &str) -> String {
+        use base64::Engine;
+        let bytes: [u8; 32] = rand::random();
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        self.harness_tokens.insert(
+            Self::harness_token_key(&token),
+            HarnessTokenState {
+                lease_id: lease_id.into(),
+                task_id: task_id.into(),
+                bytes_attached: 0,
+                oversize: None,
+            },
+        );
+        token
+    }
+
+    /// Forget a run's token, so it stops resolving at once (Ruling 21.4).
+    fn revoke_harness_token(&mut self, token: &str) {
+        self.harness_tokens.remove(&Self::harness_token_key(token));
+    }
+
+    /// Is a harness run live for this task right now?
+    pub fn harness_running(&self, task_id: &str) -> bool {
+        self.harness_tokens.values().any(|s| s.task_id == task_id)
+    }
+
     /// The harness session a lease token names (SP1b Task 4).
     ///
-    /// The token is a lease id; possessing an unexpired one is the capability
-    /// that lets `vk-mcp` act as the harness. This resolves it to the machine
-    /// principal it stands for — at the harness clearance (Business, no
-    /// third-party), never the caller's own — and the task and register it may
-    /// touch. An unknown or expired token is refused as an I1 violation (the
-    /// transport maps that to `E_INVARIANT`); no presence proof is ever accepted
-    /// for a `harness.*` call, because a lease is a machine capability, not a
-    /// human's presence.
-    pub fn harness_session(
-        &self,
-        lease_id: &str,
-        now_ms: u64,
-    ) -> Result<HarnessSession, KernelError> {
+    /// The token is the secret a run was launched with; possessing it is the
+    /// capability that lets `vk-mcp` act as the harness. This resolves it — by
+    /// its hash, through the token map — to the machine principal it stands for
+    /// (`lease_id` = the lease id, never the token) at the harness clearance
+    /// (Business, no third-party), never the caller's own, and to the task and
+    /// register it may touch. An unknown, revoked or expired token is refused as
+    /// an I1 violation (the transport maps that to `E_INVARIANT`); no presence
+    /// proof is ever accepted for a `harness.*` call, because a lease is a
+    /// machine capability, not a human's presence.
+    pub fn harness_session(&self, token: &str, now_ms: u64) -> Result<HarnessSession, KernelError> {
+        let state = self
+            .harness_tokens
+            .get(&Self::harness_token_key(token))
+            .ok_or_else(|| KernelError::I1("unknown harness token".into()))?;
         let lease: Lease = self
             .store
             .db
-            .get_json("leases", lease_id)
+            .get_json("leases", &state.lease_id)
             .map_err(store_failed)?
-            .ok_or_else(|| KernelError::I1("unknown harness token".into()))?;
+            .ok_or_else(|| KernelError::I1("harness token's lease is gone".into()))?;
         if lease.expired(now_ms) {
             return Err(KernelError::I1("expired harness token".into()));
         }
-        let task_id = lease
-            .resource
-            .strip_prefix("harness:")
-            .ok_or_else(|| KernelError::I1("token is not a harness lease".into()))?
-            .to_string();
+        if lease.resource != format!("harness:{}", state.task_id) {
+            return Err(KernelError::I1("token is not a harness lease".into()));
+        }
         let task: crate::tasks::Task = self
             .store
             .db
-            .get_json("tasks", &task_id)
+            .get_json("tasks", &state.task_id)
             .map_err(store_failed)?
-            .ok_or_else(|| KernelError::NotFound(task_id.clone()))?;
+            .ok_or_else(|| KernelError::NotFound(state.task_id.clone()))?;
         let ctx = Ctx {
             principal: Principal::Machine {
                 node_id: self.node_id.clone(),
-                lease_id: lease_id.into(),
+                lease_id: state.lease_id.clone(),
             },
             clearance: vk_harness::harness_clearance(),
             partition: lease.partition.clone(),
@@ -1240,7 +1308,7 @@ impl RealKernel {
         };
         Ok(HarnessSession {
             ctx,
-            task_id,
+            task_id: state.task_id.clone(),
             register: task.register,
         })
     }

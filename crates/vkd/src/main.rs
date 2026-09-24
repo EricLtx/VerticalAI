@@ -36,6 +36,18 @@ struct Args {
     /// onto a record that is already known not to hold.
     #[arg(long)]
     force: bool,
+    /// The Claude Code binary the harness runs (SP1b Task 4, Ruling 20): a
+    /// name looked up on this daemon's PATH (`claude` → `claude.exe` on
+    /// Windows, never a `.cmd` shim) or a path. Daemon configuration only —
+    /// no pipe client can name it.
+    #[arg(long, default_value = "claude")]
+    harness_bin: PathBuf,
+    /// The model the harness is pinned to.
+    #[arg(long, default_value = "claude-sonnet-5")]
+    harness_model: String,
+    /// How long one harness run may take before its tree is killed.
+    #[arg(long, default_value_t = 300)]
+    harness_timeout_secs: u64,
 }
 
 #[tokio::main]
@@ -159,6 +171,15 @@ async fn main() -> anyhow::Result<()> {
     // made `vk boot` kill the daemon it had just started.
     tokio::spawn(vk_ipc::server::start_arches(kernel.clone()));
     // The endpoint travels with the server so a harness run can write it into the
-    // workspace `.mcp.json` for the harness's `vk-mcp` to dial back on.
-    vk_ipc::server::serve_on(kernel, listener, endpoint.0).await
+    // run's `mcp.json` for the harness's `vk-mcp` to dial back on; the harness
+    // settings travel with it because they are this daemon's, never a request's.
+    let config = vk_ipc::server::ServerConfig {
+        endpoint: endpoint.0,
+        harness: vk_ipc::server::HarnessSettings {
+            binary: a.harness_bin,
+            model: Some(a.harness_model),
+            timeout: std::time::Duration::from_secs(a.harness_timeout_secs),
+        },
+    };
+    vk_ipc::server::serve_on(kernel, listener, config).await
 }

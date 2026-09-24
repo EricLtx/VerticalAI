@@ -68,6 +68,8 @@ async fn initialize_lists_tools_and_calls_a_tool_as_a_syscall() {
         json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2024-11-05", "capabilities": {} } }),
         json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
         json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "vk_log", "arguments": { "message": "hello from the harness" } } }),
+        // A revision this server has not read: answered with the one it has.
+        json!({ "jsonrpc": "2.0", "id": 4, "method": "initialize", "params": { "protocolVersion": "2099-01-01", "capabilities": {} } }),
     ];
     for r in &requests {
         let mut line = serde_json::to_string(r).unwrap();
@@ -120,6 +122,14 @@ async fn initialize_lists_tools_and_calls_a_tool_as_a_syscall() {
         "the tool call succeeded: {called}"
     );
     assert_eq!(called["result"]["content"][0]["text"], "logged", "{called}");
+
+    // 4: an unknown protocol revision is not echoed back as supported.
+    let unknown = read_json(&mut out).await;
+    assert_eq!(unknown["id"], 4, "{unknown}");
+    assert_eq!(
+        unknown["result"]["protocolVersion"], "2024-11-05",
+        "an unread revision is answered with a known one: {unknown}"
+    );
 
     let _ = child.kill().await;
 

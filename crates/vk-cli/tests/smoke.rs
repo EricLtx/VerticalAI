@@ -45,13 +45,16 @@ fn vkd_exe() -> PathBuf {
     BUILT.call_once(|| {
         // Captured, not inherited: a no-op build has nothing to say, and the
         // one time it does have something the message is in the failure.
+        // `vk-mcp` too: the daemon refuses to launch a harness without it
+        // beside itself (a tool-less Claude is not a run), so the harness
+        // tests need it built even when only this crate is under test.
         let out = Command::new(env!("CARGO"))
-            .args(["build", "-p", "vkd"])
+            .args(["build", "-p", "vkd", "-p", "vk-mcp"])
             .output()
             .expect("run cargo");
         assert!(
             out.status.success(),
-            "cargo build -p vkd failed:\n{}",
+            "cargo build -p vkd -p vk-mcp failed:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
     });
@@ -752,12 +755,12 @@ fn harness_standin(dir: &std::path::Path) -> PathBuf {
     let script = if cfg!(windows) {
         "@echo off\r\n\
          >OUT\\proposal.md echo # Proposal drafted by the confined harness\r\n\
-         echo {\"type\":\"result\",\"is_error\":false,\"result\":\"ok\"}\r\n\
+         echo {\"type\":\"result\",\"is_error\":false,\"num_turns\":2,\"total_cost_usd\":0,\"result\":\"ok\",\"permission_denials\":[]}\r\n\
          exit /b 0\r\n"
     } else {
         "#!/bin/sh\n\
          printf '# Proposal drafted by the confined harness\\n' > OUT/proposal.md\n\
-         printf '{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\"}\\n'\n\
+         printf '{\"type\":\"result\",\"is_error\":false,\"num_turns\":2,\"total_cost_usd\":0,\"result\":\"ok\",\"permission_denials\":[]}\\n'\n\
          exit 0\n"
     };
     std::fs::write(&bin, script).expect("write harness stand-in");
@@ -769,16 +772,18 @@ fn harness_standin(dir: &std::path::Path) -> PathBuf {
     bin
 }
 
-/// `vk harness run --dry-run` prints the exact launch line and the `.mcp.json`
-/// it would write, with the lease token redacted — and runs nothing. This is the
-/// verb an operator reads before ever spending a real Claude Code call.
+/// `vk harness run --dry-run` prints the exact launch line, the `mcp.json` it
+/// would write (token redacted) and the permission fence — and runs nothing.
+/// This is the verb an operator reads before ever spending a real Claude Code
+/// call. The binary is the daemon's (`vkd --harness-bin`), never the verb's.
 #[test]
-fn vk_harness_run_dry_run_prints_the_launch_line_and_redacted_mcp_config() {
+fn vk_harness_run_dry_run_prints_the_launch_line_the_fence_and_a_redacted_mcp_config() {
     let dir = tempfile::tempdir().unwrap();
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let node_key = dir.path().join("node.key");
+    let standin = path_of(&harness_standin(dir.path()));
     let _daemon = Daemon(
-        vkd_cmd(dir.path(), &endpoint, &[])
+        vkd_cmd(dir.path(), &endpoint, &["--harness-bin", &standin])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -793,8 +798,6 @@ fn vk_harness_run_dry_run_prints_the_launch_line_and_redacted_mcp_config() {
         "task-demo",
         "--name",
         "claude-code",
-        "--bin",
-        "claude.exe",
         "--dry-run",
         "--json",
     ]);
@@ -805,28 +808,45 @@ fn vk_harness_run_dry_run_prints_the_launch_line_and_redacted_mcp_config() {
         .iter()
         .map(|x| x.as_str().unwrap_or("").to_string())
         .collect();
-    // The flags the confinement rests on are all there.
+    // The binary is the one the daemon was started with.
+    assert_eq!(line[0], standin, "{line:?}");
+    // The flags the confinement rests on are all there, and the bare-name
+    // allow-everything flags of the first cut are not.
     for flag in [
         "-p",
         "--mcp-config",
-        "--allowedTools",
+        "--strict-mcp-config",
+        "--settings",
+        "--setting-sources",
         "--permission-mode",
-        "acceptEdits",
+        "dontAsk",
+        "--permission-prompts",
+        "none",
         "--output-format",
         "json",
-        "--strict-mcp-config",
     ] {
         assert!(
             line.iter().any(|a| a == flag),
             "{flag} missing from {line:?}"
         );
     }
+    assert!(!line.iter().any(|a| a == "--allowedTools"), "{line:?}");
+    assert!(!line.iter().any(|a| a == "acceptEdits"), "{line:?}");
+    // The MCP config and the fence live outside the workspace.
+    let workspace = dry["workspace"].as_str().unwrap();
+    let config_dir = dry["config_dir"].as_str().unwrap();
+    // Component-wise, not as text: `task-demo.mcp` is a sibling of
+    // `task-demo`, and as a string it starts with it.
+    assert!(
+        !std::path::Path::new(config_dir).starts_with(workspace),
+        "the config dir must not be inside the workspace: {dry}"
+    );
     assert!(
         line.iter()
-            .any(|a| a == "mcp__vk__*,Read,Write,Edit,Glob,Grep"),
-        "the allowed tools are pinned: {line:?}"
+            .any(|a| a.starts_with(config_dir) && a.ends_with("mcp.json")),
+        "{line:?}"
     );
-    // The .mcp.json names the vk server and redacts the token — a dry run never
+    // The mcp.json names the vk server and redacts the token — a dry run never
     // prints a live capability.
     let mcp = dry["mcp_json"].as_str().expect("mcp_json");
     assert!(mcp.contains("vk-mcp"), "{mcp}");
@@ -834,24 +854,42 @@ fn vk_harness_run_dry_run_prints_the_launch_line_and_redacted_mcp_config() {
         mcp.contains("<redacted>"),
         "the token must be redacted: {mcp}"
     );
+    assert!(!mcp.contains("lease-"), "{mcp}");
+    // The fence: the workspace and the kernel tools allowed, the shell and the
+    // web denied, the config dir denied by its real path.
+    let fence = dry["settings_json"].as_str().expect("settings_json");
+    for rule in [
+        "Read(./**)",
+        "Edit(./**)",
+        "mcp__vk__*",
+        "\"Bash\"",
+        "\"WebFetch\"",
+    ] {
+        assert!(
+            fence.contains(rule),
+            "{rule} missing from the fence:\n{fence}"
+        );
+    }
     assert!(
-        !mcp.contains("lease-"),
-        "no real lease token in a dry run: {mcp}"
+        !fence.contains("Write(") && !fence.contains("Glob("),
+        "no rule Claude Code would ignore: {fence}"
     );
 }
 
 /// `vk harness run` drives the confined harness to a finished, attached proposal
-/// and records its egress. Against a stand-in launched with `--bin`, so it needs
-/// no subscription and reaches no network — the point being the daemon
-/// orchestration: lease, materialise, launch under the governor, attach the
-/// `OUT/` output, one `harness.connections` event, settle.
+/// and records its egress. Against a stand-in the daemon was started with
+/// (`vkd --harness-bin`), so it needs no subscription and reaches no network —
+/// the point being the daemon orchestration: lease, materialise, launch under
+/// the governor, collect the declared output, one `harness.connections` event,
+/// settle, and nothing of the run left behind.
 #[test]
 fn vk_harness_run_drives_a_stand_in_to_an_attached_proposal() {
     let dir = tempfile::tempdir().unwrap();
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let node_key = dir.path().join("node.key");
+    let standin = path_of(&harness_standin(dir.path()));
     let _daemon = Daemon(
-        vkd_cmd(dir.path(), &endpoint, &[])
+        vkd_cmd(dir.path(), &endpoint, &["--harness-bin", &standin])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -860,7 +898,6 @@ fn vk_harness_run_drives_a_stand_in_to_an_attached_proposal() {
     let sh = Shell { endpoint, node_key };
     wait_until(&sh, true, "vkd did not answer").expect("status");
 
-    let standin = path_of(&harness_standin(dir.path()));
     let run = sh.json(&[
         "harness",
         "run",
@@ -868,31 +905,51 @@ fn vk_harness_run_drives_a_stand_in_to_an_attached_proposal() {
         "Draft a proposal for Acme",
         "--name",
         "claude-code",
-        "--bin",
-        &standin,
         "--json",
     ]);
-    assert_eq!(run["status"], "done", "the harness step finished: {run}");
+    // The harness step is done; the approval `--goal` put after it is next.
+    assert_eq!(
+        run["step_status"], "done",
+        "the harness step finished: {run}"
+    );
+    assert_eq!(
+        run["status"], "running",
+        "the approve step is pending: {run}"
+    );
     assert_eq!(
         run["governed"],
         cfg!(windows),
         "contained on Windows, ungoverned elsewhere: {run}"
     );
+    assert_eq!(run["exit"], "code 0", "{run}");
     let hash = run["artefact_hash"].as_str().unwrap_or("");
     assert!(
         hash.starts_with("sha256:"),
         "the proposal was attached: {run}"
     );
+    assert_eq!(run["artefacts"], 1, "attached once: {run}");
+    assert_eq!(
+        run["num_turns"], 2,
+        "read off the stand-in's result object: {run}"
+    );
+    assert!(run["error"].is_null(), "{run}");
 
-    // The task carries the proposal, and a person reading `vk task show` sees it.
+    // Nothing of the run is left on disk: no workspace, no config directory
+    // (it held the token).
     let task_id = run["task_id"].as_str().unwrap().to_string();
+    assert!(!dir.path().join("harness").join(&task_id).exists());
+    assert!(!dir
+        .path()
+        .join("harness")
+        .join(format!("{task_id}.mcp"))
+        .exists());
+
+    // A person reading `vk task show` sees the step done and the task waiting
+    // on its approval.
     let shown = sh.json(&["task", "show", &task_id, "--json"]);
-    let artefacts = shown["register"]["artefacts"]
-        .as_array()
-        .or_else(|| shown["artefacts"].as_array());
-    // `task show` returns the task; its register's artefacts are what we attached.
-    assert!(shown["status"] == "done", "the shown task is done: {shown}");
-    let _ = artefacts;
+    assert_eq!(shown["status"], "running", "{shown}");
+    assert_eq!(shown["steps"][0]["status"], "done", "{shown}");
+    assert_eq!(shown["steps"][1]["status"], "pending", "{shown}");
 
     // Exactly one harness.connections event is on the record for the run.
     let tail = sh.json(&["dmesg", "-n", "20", "--json"]);
