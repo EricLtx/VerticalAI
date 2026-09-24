@@ -58,12 +58,44 @@ fn chat_request_pins_num_ctx_seed_no_streaming_and_no_thinking() {
         r#""stream":false"#,
         r#""think":false"#,
         r#""num_ctx":8192"#,
+        // The caller's 1024 is under the mount's 2048 cap, so it is what goes
+        // out: an answer is always bounded, by the smaller of the two.
+        r#""num_predict":1024"#,
         r#""seed":7"#,
         r#""role":"user""#,
         r#""content":"hello""#,
     ] {
         assert!(wire.contains(pinned), "{pinned} missing from {wire}");
     }
+}
+
+/// And the same bound where it counts: on the wire, out of a real `complete`,
+/// as the stand-in received it.
+#[test]
+fn the_answer_is_bounded_on_the_wire_by_the_smaller_of_the_two_caps() {
+    let fake = Fake::start(Canned::default());
+    let adapter = OllamaAdapter::mount(OllamaConfig {
+        max_tokens: 128,
+        ..config(&fake, "gemma3:1b", 8192)
+    })
+    .expect("mount");
+
+    adapter
+        .complete("say something", 1024)
+        .expect("a completion");
+    adapter.complete("say something", 64).expect("a completion");
+    let sent = fake.calls("/api/chat");
+    assert_eq!(
+        sent[0]["options"]["num_predict"], 128,
+        "the mount's cap is not something a call can talk past: {}",
+        sent[0]
+    );
+    assert_eq!(
+        sent[1]["options"]["num_predict"], 64,
+        "and a caller asking for less gets less: {}",
+        sent[1]
+    );
+    assert_eq!(sent[0]["options"]["num_ctx"], 8192);
 }
 
 #[test]
@@ -187,16 +219,31 @@ fn refuses_a_prompt_the_model_would_truncate() {
 
 #[test]
 fn fails_when_the_server_reports_a_truncated_prompt() {
-    // The server claims to have read `num_ctx / 2 + 3` tokens of the prompt —
-    // spike 1a's signature of a silent truncation, with HTTP 200 and
-    // `done_reason: "stop"` over the top of it.
+    // The server claims to have read one token past the ceiling — spike 1a's
+    // signature of a silent truncation, with HTTP 200 and `done_reason:
+    // "stop"` over the top of it.
+    //
+    // `num_ctx` is deliberately *above* the model's own 32768-token window, so
+    // the ceiling (16384) and `num_ctx / 2` (32768) are different numbers: a
+    // post-check measured against the latter — as this was until the Minor 4
+    // fix — would not fire here at all, and the only guard left would be the
+    // estimate.
+    let truncated_at = 16_384 + 3;
     let fake = Fake::start(Canned {
-        prompt_eval_count: Some(8192 / 2 + 3),
+        prompt_eval_count: Some(truncated_at),
         ..Default::default()
     });
-    let adapter = OllamaAdapter::mount(config(&fake, "gemma3:1b", 8192)).expect("mount");
+    let adapter = OllamaAdapter::mount(config(&fake, "gemma3:1b", 65_536)).expect("mount");
+    assert_eq!(adapter.manifest().context_ceiling, 16_384);
+    assert!(
+        truncated_at < 65_536 / 2,
+        "this case is exactly the one `num_ctx / 2` misses"
+    );
     match adapter.complete("a short prompt", 256) {
-        Err(AdapterError::I4Prime { needed, .. }) => assert_eq!(needed, 4099),
+        Err(AdapterError::I4Prime { needed, ceiling }) => {
+            assert_eq!(needed, truncated_at);
+            assert_eq!(ceiling, adapter.context_budget());
+        }
         other => panic!("expected an I4' refusal, got {other:?}"),
     }
     assert_eq!(fake.calls("/api/chat").len(), 1, "the call did happen");

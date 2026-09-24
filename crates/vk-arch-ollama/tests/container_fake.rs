@@ -242,4 +242,35 @@ fn a_container_is_adopted_only_when_it_is_the_one_this_mount_asks_for() {
         "there was nothing to stop: {log:?}"
     );
     assert!(container::started_here(container::State::Started));
+
+    // Phase E — the container is not running, and somebody else is on the
+    // published port (Ruling 12). Nothing is started: the mount would either
+    // fail to publish the port or read its identity off that server.
+    //
+    // The port is free while `vk-ollama` is stopped, which the test above has
+    // just arranged; if something on this machine already holds it, the
+    // condition under test is true anyway and the listener is not needed.
+    let _squatter = std::net::TcpListener::bind(container::PUBLISHED_ENDPOINT).ok();
+    docker.forget();
+    let refused = container::check_port_free(&spec)
+        .expect_err("a foreign process on the port is a refusal, not a race");
+    let said = format!("{refused:#}");
+    assert!(
+        said.contains(&format!(
+            "port {} is taken by another process",
+            container::PUBLISHED_ENDPOINT
+        )),
+        "{said}"
+    );
+    assert!(said.contains("--external"), "the way out is named: {said}");
+    assert!(
+        docker.log().iter().all(|l| l.contains("inspect")),
+        "the port check must not start anything: {:?}",
+        docker.log()
+    );
+
+    // And the container's own listener is not a conflict: when it is running,
+    // there is nothing to check.
+    docker.container_is(true, ASKED_MEMORY, ASKED_NANO_CPUS, IMAGE);
+    container::check_port_free(&spec).expect("a running vk-ollama is what should be on that port");
 }

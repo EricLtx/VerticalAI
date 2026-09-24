@@ -92,23 +92,24 @@ fn the_real_container_answers_under_the_caps_the_kernel_gave_it() {
     );
     assert_eq!(manifest.name, format!("ollama/{model}"));
 
-    // The claim is spelled out, not asserted: the caps on the manifest are the
-    // ones the container was read to be running under, and they are the ones
-    // this mount asked for (Ruling 10).
+    // What the arch id says about the container: the image it runs, and that
+    // it is governed — not the size of the caps (Ruling 11). The cap values
+    // were read off the container and belong to the call record below.
     let governor = adapter
         .governor()
         .expect("a container mount has a governor");
     assert_eq!(
-        manifest.identity.sampling["container_memory_bytes"],
-        governor.memory_bytes.to_string()
-    );
-    assert_eq!(
-        manifest.identity.sampling["container_nano_cpus"],
-        governor.nano_cpus.to_string()
-    );
-    assert_eq!(
         manifest.identity.sampling["container_image"],
         governor.image
+    );
+    assert_eq!(manifest.identity.sampling["governed"], "true");
+    assert!(
+        !manifest
+            .identity
+            .sampling
+            .contains_key("container_memory_bytes"),
+        "cap values are not part of the arch: {:?}",
+        manifest.identity.sampling
     );
     assert_eq!(governor.memory_bytes, 12_884_901_888, "--memory 12g");
     assert_eq!(governor.nano_cpus, 6_000_000_000, "--cpus 6");

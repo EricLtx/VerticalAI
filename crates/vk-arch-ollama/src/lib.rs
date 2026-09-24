@@ -208,6 +208,11 @@ impl OllamaAdapter {
         // from the request.
         let (governor, started_here) = match &cfg.container {
             Some(spec) => {
+                // Before anything is started or adopted: if somebody else is
+                // already on the published port, this mount would either fail
+                // to publish it or read its identity off their server
+                // (Ruling 12).
+                container::check_port_free(spec)?;
                 let state = if cfg.recreate {
                     container::recreate(spec)?
                 } else {
@@ -338,9 +343,9 @@ impl OllamaAdapter {
                 // Not something the API reports; the default is f16 and this
                 // adapter never sets it.
                 kv_cache: "-".into(),
-                // Ollama picks both from what it finds in the container; the
-                // cap that bounds what it finds is in `sampling` below, read
-                // off the container rather than asked for.
+                // Ollama picks both from what it finds in the container. What
+                // bounds what it finds is the cap — which is *not* here: see
+                // `governed` below.
                 threads: 1,
                 batch: 1,
                 sampling: [
@@ -349,18 +354,24 @@ impl OllamaAdapter {
                     ("num_ctx".to_string(), cfg.num_ctx.to_string()),
                     ("temperature".to_string(), cfg.temperature.to_string()),
                     ("think".to_string(), "false".to_string()),
+                    // Whether this node contains the process, in the one map
+                    // the arch id is hashed from (Ruling 11). `ArchManifest`
+                    // has a `governed` field, but it is outside `ArchIdentity`
+                    // and so outside the id — and a capped container and an
+                    // uncapped one carry different clearances
+                    // (Personal/Business) and different retention. Two
+                    // manifests that disagree about that must never be able to
+                    // share an id.
+                    ("governed".to_string(), governed.to_string()),
                 ]
                 .into_iter()
-                .chain(governor.into_iter().flat_map(|g| {
-                    [
-                        ("container_image".to_string(), g.image.clone()),
-                        (
-                            "container_memory_bytes".to_string(),
-                            g.memory_bytes.to_string(),
-                        ),
-                        ("container_nano_cpus".to_string(), g.nano_cpus.to_string()),
-                    ]
-                }))
+                // The image the container actually runs, by digest: a
+                // different Ollama build is a different arch even under the
+                // same tag. The cap *values* are deliberately not here — the
+                // same model under 12 GiB and under 14 GiB is the same model,
+                // only slower — and they are recorded in the mount spec and on
+                // every call's `details` instead (Ruling 11).
+                .chain(governor.map(|g| ("container_image".to_string(), g.image.clone())))
                 .collect(),
                 seed: Some(cfg.seed),
             },
@@ -718,22 +729,45 @@ mod tests {
         assert_eq!(b.retention_days, None);
     }
 
-    /// Ruling 10: `governed` is what the container was read to be, not what
-    /// the mount asked for — and the caps that were in force are on the
-    /// manifest, so the claim can be checked rather than believed.
+    /// Ruling 11: what the arch id hashes about the container is the image it
+    /// runs and *whether* it is governed — never the size of the cap. The same
+    /// model under 12 GiB and under 14 GiB is the same model, only slower; a
+    /// capped container and an uncapped one carry different clearances and so
+    /// must never be able to share an id.
     #[test]
-    fn the_manifest_carries_the_caps_that_were_actually_in_force() {
+    fn the_cap_size_is_not_the_arch_but_being_capped_at_all_is() {
         let cfg = OllamaConfig::governed(DEFAULT_MODEL);
         let g = governor();
         let capped = OllamaAdapter::manifest_for(&cfg, &identity(), "0.33.3", Some(&g));
         assert!(capped.governed);
         let s = &capped.identity.sampling;
         assert_eq!(s["container_image"], PINNED_IMAGE_DIGEST);
-        assert_eq!(s["container_memory_bytes"], "12884901888");
-        assert_eq!(s["container_nano_cpus"], "6000000000");
+        assert_eq!(s["governed"], "true");
+        assert!(
+            !s.contains_key("container_memory_bytes") && !s.contains_key("container_nano_cpus"),
+            "cap values do not belong in the identity: {s:?}"
+        );
 
-        // A container that lost its caps is not a governor, however it was
-        // asked for — and it is not the same arch as one that has them.
+        // 12 GiB and 14 GiB on the same image: the same arch.
+        let roomier = OllamaAdapter::manifest_for(
+            &cfg,
+            &identity(),
+            "0.33.3",
+            Some(&Governor {
+                memory_bytes: 15_032_385_536,
+                ..g.clone()
+            }),
+        );
+        assert_eq!(
+            capped.arch_id(),
+            roomier.arch_id(),
+            "--memory 12g and --memory 14g are one arch"
+        );
+
+        // `--memory 0 --cpus 0` is a container Docker accepts and this node
+        // does not govern. Different clearance, different retention, and —
+        // because `governed` is in the identity — a different id, so the two
+        // manifests can never be mistaken for one another.
         let uncapped = OllamaAdapter::manifest_for(
             &cfg,
             &identity(),
@@ -741,25 +775,18 @@ mod tests {
             Some(&Governor {
                 memory_bytes: 0,
                 nano_cpus: 0,
-                ..g.clone()
-            }),
-        );
-        assert!(!uncapped.governed);
-        assert_eq!(uncapped.clearance.max_scope, Scope::Business);
-        assert_ne!(capped.arch_id(), uncapped.arch_id());
-
-        // Half the memory is a different governor, and so a different arch.
-        let smaller = OllamaAdapter::manifest_for(
-            &cfg,
-            &identity(),
-            "0.33.3",
-            Some(&Governor {
-                memory_bytes: 6_442_450_944,
                 ..g
             }),
         );
-        assert!(smaller.governed);
-        assert_ne!(capped.arch_id(), smaller.arch_id());
+        assert!(!uncapped.governed);
+        assert_eq!(uncapped.identity.sampling["governed"], "false");
+        assert_eq!(uncapped.clearance.max_scope, Scope::Business);
+        assert_eq!(uncapped.retention_days, None);
+        assert_ne!(
+            capped.arch_id(),
+            uncapped.arch_id(),
+            "a governed arch and an ungoverned one must not share an id"
+        );
     }
 
     #[test]

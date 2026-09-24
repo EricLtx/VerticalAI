@@ -32,9 +32,14 @@ use std::time::{Duration, Instant};
 /// the whole point of a named volume is that the next mount does not pull
 /// 9.6 GB again — and it is why `--recreate` can throw the container away.
 pub const VOLUME_MOUNTPOINT: &str = "/root/.ollama";
-/// The loopback publication of the server's port. Loopback only — a model
+/// Where the container's port lands on this machine. Loopback only — a model
 /// this node governs is not a service on the network.
+pub const PUBLISHED_ENDPOINT: &str = "127.0.0.1:11434";
+/// The loopback publication of the server's port, as `docker run -p` takes it.
 pub const PORT_MAPPING: &str = "127.0.0.1:11434:11434";
+/// How long a process on the published port is given to accept a connection
+/// before it is taken to be absent.
+const PORT_PROBE: Duration = Duration::from_millis(500);
 
 /// How long a `docker` command that only reads or switches state is given.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -113,6 +118,42 @@ impl Governor {
 pub struct Inspected {
     pub running: bool,
     pub governor: Governor,
+}
+
+/// Refuse before anything is started when a *foreign* process already answers
+/// on the published port (Ruling 12).
+///
+/// The failure this prevents is quiet and expensive: a host-native Ollama, or
+/// another project's container, holding 11434 while `vk-ollama` is stopped.
+/// `docker start` would fail with a port conflict — or, worse, the mount would
+/// go on to read its identity from *that* server and stamp `backend: "docker"`
+/// and `governed: true` on somebody else's process. The container's own
+/// listener is not a conflict: when it is running, there is nothing to check.
+pub fn check_port_free(spec: &ContainerSpec) -> Result<()> {
+    if inspected(spec)?.is_some_and(|i| i.running) {
+        return Ok(());
+    }
+    if !answers_on(PUBLISHED_ENDPOINT) {
+        return Ok(());
+    }
+    bail!(
+        "port {PUBLISHED_ENDPOINT} is taken by another process, and the container {} is not the \
+         one answering on it: a mount would either fail to publish the port or read its identity \
+         off somebody else's server. Stop whatever is listening there — a host-native Ollama, or \
+         another container — or mount that server with `--external http://{PUBLISHED_ENDPOINT}` \
+         (ungoverned)",
+        spec.name
+    )
+}
+
+/// Does anything accept a connection there right now?
+fn answers_on(endpoint: &str) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    endpoint
+        .to_socket_addrs()
+        .into_iter()
+        .flatten()
+        .any(|addr| TcpStream::connect_timeout(&addr, PORT_PROBE).is_ok())
 }
 
 /// Start the container if it is not running, create it if it does not exist,
@@ -453,6 +494,13 @@ fn no_docker(why: &str) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_published_endpoint_is_the_host_half_of_the_port_mapping() {
+        // The port check and the run line must never drift apart: one refuses
+        // a mount because something holds the port, the other publishes it.
+        assert_eq!(PORT_MAPPING, format!("{PUBLISHED_ENDPOINT}:11434"));
+    }
 
     #[test]
     fn the_run_line_is_the_one_the_caps_are_promised_in() {

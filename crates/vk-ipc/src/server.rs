@@ -435,10 +435,19 @@ fn dispatch(
         }
         "arch.unmount" => {
             let id = p["arch_id"].as_str().ok_or_else(|| bad("arch_id"))?;
-            k.unmount(id).map_err(|e| RpcError {
+            let removed = k.unmount(id).map_err(|e| RpcError {
                 code: E_STORE,
                 message: e.to_string(),
             })?;
+            // Out from under the kernel mutex *before* the adapter is dropped.
+            // Dropping an Ollama arch stops the container it started, which is
+            // a `docker stop` of ten seconds or more, and the kernel lock is
+            // the one thing that must never be held across a slow external
+            // call (SP1b Task 1 review, Minor 10). The row and the ledger
+            // event are already durable at this point; what is left is the
+            // process, and every other syscall can proceed while it winds up.
+            drop(k);
+            drop(removed);
             Ok(json!({ "ok": true }))
         }
         "task.create" => {

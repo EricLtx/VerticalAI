@@ -464,12 +464,22 @@ impl RealKernel {
         Ok(id)
     }
 
-    pub fn unmount(&mut self, arch_id: &str) -> Result<()> {
-        self.adapters.remove(arch_id);
+    /// Unmount an arch, and hand the caller the adapter that was removed.
+    ///
+    /// The adapter comes back rather than being dropped here because dropping
+    /// one can be slow: the Ollama arch stops the container it started, which
+    /// is a `docker stop` of ten seconds or more. This runs under the kernel
+    /// mutex, which is the one thing that must never be held across a slow
+    /// external call, so the daemon releases the lock and *then* drops what
+    /// this returned (SP1b Task 1 review, Minor 10). A caller that lets the
+    /// value fall here gets the old behaviour, which is why it is
+    /// `#[must_use]`-shaped: `Option` already is.
+    pub fn unmount(&mut self, arch_id: &str) -> Result<Option<Arc<dyn arch::ArchAdapter>>> {
+        let removed = self.adapters.remove(arch_id);
         self.budgets.remove(arch_id);
         self.store.db.delete("arches", arch_id)?;
         self.log("arch.unmounted", now_ms(), &arch_id)?;
-        Ok(())
+        Ok(removed)
     }
 
     pub fn arches(&self) -> Vec<(String, ArchManifest)> {
