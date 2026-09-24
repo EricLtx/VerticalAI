@@ -326,6 +326,14 @@ fn dispatch(
         let (nonce, exp) = lock(challenges)?.issue(now);
         return Ok(json!({ "nonce": nonce, "expires_at_ms": exp }));
     }
+    // Mounting a Claude Code arch means running the binary to ask its version,
+    // because the version is in the arch identity. That happens here, *before*
+    // the kernel lock, so a binary that is slow — or missing, and about to be
+    // waited out — delays this one mount rather than every other syscall on
+    // the node (SP1b review, Minor 8 / ruling 8).
+    let claude_version = (req.method == "arch.mount" && req.params["kind"] == "claude-code")
+        .then(|| claude_code_version(&req.params["config"]))
+        .transpose()?;
     let mut k = lock(kernel)?;
     let p = req.params;
     match req.method.as_str() {
@@ -385,7 +393,10 @@ fn dispatch(
         "arch.mount" => {
             let kind = p["kind"].as_str().ok_or_else(|| bad("kind"))?;
             let adapter: Arc<dyn ArchAdapter> = match kind {
-                "claude-code" => Arc::new(claude_code_adapter(&k, &p["config"])?),
+                "claude-code" => {
+                    let version = claude_version.ok_or_else(|| internal("no claude version"))?;
+                    Arc::new(claude_code_adapter(&k, &p["config"], &version)?)
+                }
                 other => return Err(bad(&format!("no arch kind {other}"))),
             };
             let name = adapter.manifest().name.clone();
@@ -519,11 +530,39 @@ fn dispatch(
     }
 }
 
+/// The `claude` binary a `config` names, defaulted.
+fn claude_binary(config: &Value) -> std::path::PathBuf {
+    config.get("binary").and_then(Value::as_str).map_or_else(
+        || ClaudeCodeConfig::default().binary,
+        std::path::PathBuf::from,
+    )
+}
+
+/// Ask that binary its version, and refuse the mount if it cannot say.
+///
+/// The version is part of the arch identity: a mount without it would mint an
+/// arch id naming no particular Claude Code, and every call on it would fail
+/// anyway — so it is refused here, where the person mounting is still
+/// listening. Called before the kernel lock is taken.
+fn claude_code_version(config: &Value) -> Result<String, RpcError> {
+    let binary = claude_binary(config);
+    vk_arch_claude_code::probe_version(&binary).ok_or_else(|| {
+        bad(&format!(
+            "cannot run `{} --version`: install Claude Code, or pass the binary's path",
+            binary.display()
+        ))
+    })
+}
+
 /// Build the Claude Code adapter `arch.mount { kind: "claude-code" }` asks
 /// for. Everything in `config` is optional and falls back to the adapter's own
 /// defaults; the working directory does not, because it is this node's to
 /// choose and not a client's (SP1b ruling 4).
-fn claude_code_adapter(k: &RealKernel, config: &Value) -> Result<ClaudeCodeAdapter, RpcError> {
+fn claude_code_adapter(
+    k: &RealKernel,
+    config: &Value,
+    claude_version: &str,
+) -> Result<ClaudeCodeAdapter, RpcError> {
     let defaults = ClaudeCodeConfig::default();
     let u32_of = |name: &str, fallback: u32| -> Result<u32, RpcError> {
         match config.get(name) {
@@ -543,10 +582,7 @@ fn claude_code_adapter(k: &RealKernel, config: &Value) -> Result<ClaudeCodeAdapt
         .map_err(|e| internal(&format!("create {}: {e}", cwd.display())))?;
     let default_timeout = u32::try_from(defaults.timeout.as_secs()).unwrap_or(u32::MAX);
     let cfg = ClaudeCodeConfig {
-        binary: config
-            .get("binary")
-            .and_then(Value::as_str)
-            .map_or(defaults.binary, std::path::PathBuf::from),
+        binary: claude_binary(config),
         model: config
             .get("model")
             .and_then(Value::as_str)
@@ -557,17 +593,8 @@ fn claude_code_adapter(k: &RealKernel, config: &Value) -> Result<ClaudeCodeAdapt
         context_ceiling: u32_of("context_ceiling", defaults.context_ceiling)?,
         cwd,
     };
-    let adapter = ClaudeCodeAdapter::new(cfg);
-    // The CLI version is in the arch identity. A mount that could not read it
-    // would mint an arch id naming no particular version of Claude Code, and
-    // every call on it would fail anyway — so it is refused here, where the
-    // person mounting is still listening.
-    if adapter.manifest().identity.engine_version == ClaudeCodeAdapter::UNKNOWN_VERSION {
-        return Err(bad(
-            "cannot run `claude --version`: install Claude Code, or pass the binary's path",
-        ));
-    }
-    Ok(adapter)
+    // `with_version`, not `new`: the binary was already asked, before the lock.
+    Ok(ClaudeCodeAdapter::with_version(cfg, claude_version))
 }
 
 fn mock_manifest(name: &str, ctx: u32) -> ArchManifest {

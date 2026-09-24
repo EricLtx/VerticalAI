@@ -13,9 +13,21 @@
 //! a fresh one per call: `--no-session-persistence` writes no transcript but
 //! still creates `~/.claude/projects/<mangled-cwd>/memory/`, and a temp
 //! directory per call would litter one of those each time.
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use vk_arch_claude_code::{ClaudeCodeAdapter, ClaudeCodeConfig};
 use vk_kernel::arch::ArchAdapter;
+
+/// The working directory, removed however the test ends. Not a `TempDir`,
+/// because the point of the fixed path is that repeated runs reuse one
+/// `~/.claude/projects/<mangled-cwd>` entry instead of minting a new one.
+struct Cleanup(PathBuf);
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 #[test]
 #[ignore = "spends a real Claude Code call; set VK_CLAUDE=1 and run with --ignored"]
@@ -26,6 +38,9 @@ fn the_real_claude_completes_a_prompt_and_reports_what_it_spent() {
     }
     let cwd = std::env::temp_dir().join("vk-claude-code-live");
     std::fs::create_dir_all(&cwd).expect("the fixed working directory");
+    // Removed however this test leaves: a failed assertion unwinds through the
+    // drop, so a run that spends a call does not also leave a directory behind.
+    let _leave_nothing = Cleanup(cwd.clone());
     let adapter = ClaudeCodeAdapter::new(ClaudeCodeConfig {
         cwd,
         timeout: Duration::from_secs(120),

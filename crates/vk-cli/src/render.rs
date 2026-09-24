@@ -15,6 +15,16 @@ fn text(v: &Value) -> String {
     }
 }
 
+/// A counter whose zero means "nothing was measured", shown as a dash rather
+/// than as a number a reader could take for a measurement that came out at
+/// zero. A missing or non-numeric field reads the same way.
+fn zeroless(v: &Value, render: impl Fn(f64) -> String) -> String {
+    match v.as_f64() {
+        Some(n) if n != 0.0 => render(n),
+        _ => "-".into(),
+    }
+}
+
 /// `label  value` lines, labels padded to the widest.
 fn fields(rows: &[(&str, String)]) -> String {
     let w = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
@@ -233,6 +243,11 @@ pub fn top(v: &Value) -> String {
                         id.clone(),
                         text(&s["calls"]),
                         text(&s["tokens_in"]),
+                        // How much of TOKENS the arch itself counted. A dash
+                        // where an arch reports no usage, so an estimate is
+                        // never mistaken for a figure anyone could bill.
+                        zeroless(&s["tokens_in_measured"], |n| format!("{n:.0}")),
+                        zeroless(&s["cost_list_usd"], |c| format!("{c:.5}")),
                         text(&s["projected"]),
                     ]
                 })
@@ -242,7 +257,17 @@ pub fn top(v: &Value) -> String {
     out.push(if arches.is_empty() {
         "(no arch has been called)".into()
     } else {
-        table(&["ARCH", "CALLS", "TOKENS", "PROJECTED"], &arches)
+        table(
+            &[
+                "ARCH",
+                "CALLS",
+                "TOKENS",
+                "MEASURED",
+                "COST (LIST USD)",
+                "PROJECTED",
+            ],
+            &arches,
+        )
     });
     let tasks: Vec<Vec<String>> = v["tasks"]
         .as_object()

@@ -6,18 +6,23 @@ use vk_contracts::register::Register;
 /// What an arch hands back from one call: the text, plus whatever that arch
 /// measured about the call itself.
 ///
-/// Only an arch that the provider tells can report the last two, so they are
-/// optional and the mock leaves them unset (SP1b ruling 3). They exist because
-/// the kernel's own numbers are estimates — `count_tokens` is a heuristic on
-/// every adapter that has no tokenizer to ask — while these are what the call
-/// actually was, and a record that can carry the measurement should not settle
-/// for the guess. The kernel merges them into the `infer` event's payload, so
-/// what the ledger commits to for a real call includes its measured cost and
-/// token breakdown.
+/// Only an arch that the provider tells can report the measurements, so they
+/// are optional and the mock leaves them unset (SP1b rulings 3, 7 and 8). They
+/// exist because the kernel's own numbers are estimates — `count_tokens` is a
+/// heuristic on every adapter that has no tokenizer to ask — while these are
+/// what the call actually was, and a record that can carry the measurement
+/// should not settle for the guess. The kernel prefers `tokens_in_measured`
+/// over its estimate, accumulates the cost on the arch's counters, and merges
+/// all of it into the `infer` event's payload.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Completion {
     /// The completion itself — what `raise` puts back into the register.
     pub text: String,
+    /// Prompt tokens as the provider counted them, cached ones included. When
+    /// an arch reports this the kernel records it instead of `count_tokens`'s
+    /// estimate, because there is no reason to keep a guess beside a
+    /// measurement of the same thing (ruling 7).
+    pub tokens_in_measured: Option<u32>,
     /// List-price equivalent in USD, as the provider reported it. Under a
     /// subscription nothing is billed per call, so this is what the same call
     /// would have cost on the meter, not a charge; the manifest's
@@ -34,18 +39,45 @@ impl Completion {
     pub fn text(text: impl Into<String>) -> Completion {
         Completion {
             text: text.into(),
-            cost_list_usd: None,
-            details: None,
+            ..Default::default()
         }
     }
 }
 
+/// Why a call to an arch did not produce a completion.
+///
+/// Two arms, because the kernel owes the caller two different answers. An
+/// adapter that refuses a prompt its context cannot hold is raising the
+/// kernel's own I4′ invariant, and it must reach the client as an invariant
+/// refusal — not as "no such arch", which is what an untyped adapter error
+/// used to be flattened into (SP1b review, Important 2). Everything else is a
+/// failure of the machinery: the engine would not start, the answer would not
+/// parse, the process had to be killed.
+#[derive(Debug, thiserror::Error)]
+pub enum AdapterError {
+    /// The prompt does not fit what this arch will actually accept. `needed`
+    /// is the adapter's own count of the prompt, `ceiling` the largest it
+    /// takes — both in tokens, both as that adapter measures them.
+    #[error(
+        "I4': prompt needs about {needed} tokens, past the {ceiling} this arch accepts; \
+         refusing rather than letting the far end truncate it"
+    )]
+    I4Prime { needed: u32, ceiling: u32 },
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
 pub trait ArchAdapter: Send + Sync {
     fn manifest(&self) -> &ArchManifest;
-    /// Real context budget in tokens (I4'); adapters must report what is actually loaded.
+    /// The largest prompt this arch will actually accept, in tokens (I4').
+    ///
+    /// Not the manifest's `context_ceiling` unless they are the same number:
+    /// this is what the kernel projects *into*, so an adapter that keeps
+    /// headroom must report the budget after the headroom, or the kernel will
+    /// fit a prompt to a size the adapter then refuses.
     fn context_budget(&self) -> u32;
     fn count_tokens(&self, text: &str) -> u32;
-    fn complete(&self, prompt: &str, max_tokens: u32) -> anyhow::Result<Completion>;
+    fn complete(&self, prompt: &str, max_tokens: u32) -> Result<Completion, AdapterError>;
 }
 
 pub struct MockAdapter {
@@ -63,7 +95,7 @@ impl ArchAdapter for MockAdapter {
     fn count_tokens(&self, text: &str) -> u32 {
         (text.len() / 4) as u32 + 1
     }
-    fn complete(&self, prompt: &str, _max_tokens: u32) -> anyhow::Result<Completion> {
+    fn complete(&self, prompt: &str, _max_tokens: u32) -> Result<Completion, AdapterError> {
         let role = prompt
             .lines()
             .next()

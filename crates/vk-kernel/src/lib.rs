@@ -87,11 +87,30 @@ pub struct BootReport {
     pub policies_version: String,
 }
 
-/// Cumulative per-arch call counters, persisted under the `kv` key `stats:<arch_id>`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Cumulative per-arch call counters, persisted under the `kv` key
+/// `stats:<arch_id>`. What `vk top` reads, and — until per-call usage rows
+/// exist — the only place the numbers a real arch reported survive the call
+/// (SP1b rulings 7 and 8).
+///
+/// The new fields default to zero, so a stats row written before them reads
+/// back as an arch that has measured nothing, which is what it is.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ArchStats {
     pub calls: u64,
+    /// Prompt tokens, the best number available per call: what the arch
+    /// measured when it reported one, the adapter's estimate otherwise.
     pub tokens_in: u64,
+    /// How much of `tokens_in` was measured rather than estimated. Equal to
+    /// `tokens_in` when every call on this arch reported its own usage, zero
+    /// for an arch that never does — so a reader can tell a figure they can
+    /// bill against from a heuristic.
+    #[serde(default)]
+    pub tokens_in_measured: u64,
+    /// List-price equivalent of every call on this arch, in USD. Under a
+    /// subscription this is what the calls would have cost, not what they
+    /// did; the manifest's `cost_per_1k_tokens_eur` says which.
+    #[serde(default)]
+    pub cost_list_usd: f64,
     pub projected: u64,
 }
 
@@ -125,6 +144,11 @@ struct BootForcedRecord<'a> {
 struct InferRecord<'a> {
     arch_id: &'a str,
     register: &'a str,
+    /// Prompt tokens: the arch's own count when it reported one, this node's
+    /// estimate otherwise. `measured` says which, so the record never leaves a
+    /// reader guessing whether a number is a fact or a heuristic.
+    tokens_in: u32,
+    measured: bool,
     /// `Completion::cost_list_usd` — list price for a call the subscription
     /// did not bill, so the record says what it would have cost.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,6 +156,20 @@ struct InferRecord<'a> {
     /// `Completion::details` — the arch's own measurements of the call.
     #[serde(skip_serializing_if = "Option::is_none")]
     details: Option<&'a serde_json::Value>,
+}
+
+/// An arch's refusal, as the kernel must report it.
+///
+/// `I4Prime` is the kernel's own invariant raised by the adapter that knows
+/// the real limit, and it reaches the client as an invariant refusal, like
+/// every other I4′. Everything else is machinery that did not work — the
+/// engine would not start, the answer would not parse — which is a store-class
+/// failure, not "no such arch" (SP1b review, Important 2).
+fn adapter_failed(arch_id: &str, e: arch::AdapterError) -> KernelError {
+    match e {
+        arch::AdapterError::I4Prime { .. } => KernelError::I4Prime(format!("arch {arch_id}: {e}")),
+        arch::AdapterError::Other(e) => KernelError::Store(format!("arch {arch_id} failed: {e}")),
+    }
 }
 
 pub struct RealKernel {
@@ -619,11 +657,20 @@ impl RealKernel {
             .map_err(store_failed)
     }
 
-    /// Accumulate the per-arch counters a later cost/quota task reads back.
+    /// Accumulate the per-arch counters `vk top` reads back — and, for an arch
+    /// that measures its own calls, the only place those measurements outlive
+    /// the call until per-call usage rows exist (SP1b rulings 7 and 8).
+    ///
+    /// `measured` is `None` for an arch that reports no usage; `tokens_in` is
+    /// then the estimate and only the total moves. When it is `Some`, the
+    /// measurement is what both totals take, so `tokens_in_measured` is the
+    /// part of `tokens_in` that is a fact rather than a heuristic.
     fn bump_stats(
         &self,
         arch_id: &str,
         tokens_in: u32,
+        measured: Option<u32>,
+        cost_list_usd: Option<f64>,
         projected: bool,
     ) -> Result<(), KernelError> {
         let key = format!("stats:{arch_id}");
@@ -633,6 +680,12 @@ impl RealKernel {
         };
         stats.calls += 1;
         stats.tokens_in += u64::from(tokens_in);
+        stats.tokens_in_measured += u64::from(measured.unwrap_or(0));
+        // A cost that is not a finite number is not a cost: adding it would
+        // turn the arch's running total into a NaN nothing can read back.
+        if let Some(cost) = cost_list_usd.filter(|c| c.is_finite()) {
+            stats.cost_list_usd += cost;
+        }
         stats.projected += u64::from(projected);
         let json = serde_json::to_string(&stats).map_err(store_failed)?;
         self.store.db.kv_set(&key, &json).map_err(store_failed)
@@ -742,10 +795,13 @@ impl Kernel for RealKernel {
             prompt
         };
         // What the arch is actually handed, not a clamp of what we wished for.
-        let tokens_in = count(&prompt);
+        let estimated = count(&prompt);
         let completion = adapter
             .complete(&prompt, budget.min(1024))
-            .map_err(|e| KernelError::NotFound(format!("arch error: {e}")))?;
+            .map_err(|e| adapter_failed(arch_id, e))?;
+        // An arch that counted the prompt itself has the number; the estimate
+        // was only ever a stand-in for it (ruling 7).
+        let tokens_in = completion.tokens_in_measured.unwrap_or(estimated);
         // The call has left the kernel: record it before doing anything that
         // could fail, or a real send to a real arch could leave no trace.
         self.log(
@@ -754,12 +810,20 @@ impl Kernel for RealKernel {
             &InferRecord {
                 arch_id,
                 register: &reg_id.0,
+                tokens_in,
+                measured: completion.tokens_in_measured.is_some(),
                 cost_list_usd: completion.cost_list_usd,
                 details: completion.details.as_ref(),
             },
         )?;
         self.infer_log.push((arch_id.into(), reg.label.clone()));
-        self.bump_stats(arch_id, tokens_in, projected)?;
+        self.bump_stats(
+            arch_id,
+            tokens_in,
+            completion.tokens_in_measured,
+            completion.cost_list_usd,
+            projected,
+        )?;
         arch::raise(&mut reg, role, &completion.text);
         self.write_register(ctx, reg)?;
         Ok(InferOutcome {
@@ -1305,6 +1369,143 @@ mod tests {
                 report_hash: &report_hash,
             }),
             "the payload must name the verdict `boot` found"
+        );
+    }
+
+    /// An adapter that answers however a test needs it to, so the kernel's
+    /// side of the `ArchAdapter` contract can be exercised without an engine.
+    struct Scripted {
+        manifest: ArchManifest,
+        answer: Box<dyn Fn() -> Result<arch::Completion, arch::AdapterError> + Send + Sync>,
+    }
+
+    impl arch::ArchAdapter for Scripted {
+        fn manifest(&self) -> &ArchManifest {
+            &self.manifest
+        }
+        fn context_budget(&self) -> u32 {
+            self.manifest.context_ceiling
+        }
+        fn count_tokens(&self, text: &str) -> u32 {
+            (text.len() / 4) as u32 + 1
+        }
+        fn complete(&self, _: &str, _: u32) -> Result<arch::Completion, arch::AdapterError> {
+            (self.answer)()
+        }
+    }
+
+    fn scripted(
+        k: &mut RealKernel,
+        name: &str,
+        answer: impl Fn() -> Result<arch::Completion, arch::AdapterError> + Send + Sync + 'static,
+    ) -> String {
+        k.mount(Arc::new(Scripted {
+            manifest: local_named(name, personal()),
+            answer: Box::new(answer),
+        }))
+        .expect("mount")
+    }
+
+    /// Ruling 7: an arch that counted the prompt itself has the number, and the
+    /// estimate was only ever a stand-in for it. What the kernel accounts and
+    /// reports is the measurement — and ruling 8's counters say how much of the
+    /// total is measurement rather than heuristic, so nobody has to guess
+    /// whether a figure could be billed against.
+    #[test]
+    fn a_measured_call_is_accounted_by_its_measurement_not_by_the_estimate() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let measured = scripted(&mut k, "measured", || {
+            Ok(arch::Completion {
+                text: "ok".into(),
+                tokens_in_measured: Some(14_435),
+                cost_list_usd: Some(0.0148193),
+                details: Some(serde_json::json!({ "session_id": "s-1" })),
+            })
+        });
+        let guessing = scripted(&mut k, "guessing", || Ok(arch::Completion::text("ok")));
+
+        let reg = k
+            .submit_task(&machine(1), "a goal", Label::bottom())
+            .unwrap();
+        let out = k
+            .infer(&machine(2), &measured, Capability::Plan, &reg)
+            .unwrap();
+        assert_eq!(
+            out.tokens_in, 14_435,
+            "the arch counted the prompt; the estimate is not the number to keep"
+        );
+        let guessed = k
+            .infer(&machine(3), &guessing, Capability::Plan, &reg)
+            .unwrap();
+        assert!(
+            guessed.tokens_in > 0 && guessed.tokens_in < 1_000,
+            "an arch that measures nothing still gets the estimate: {}",
+            guessed.tokens_in
+        );
+
+        let stats = k.top(&machine(4)).arches;
+        let m = &stats[&measured];
+        assert_eq!(m.calls, 1);
+        assert_eq!(m.tokens_in, 14_435);
+        assert_eq!(m.tokens_in_measured, 14_435, "all of it was measured");
+        assert!((m.cost_list_usd - 0.0148193).abs() < 1e-9, "{m:?}");
+        let g = &stats[&guessing];
+        assert_eq!(g.tokens_in, u64::from(guessed.tokens_in));
+        assert_eq!(g.tokens_in_measured, 0, "nothing here was measured");
+        assert_eq!(g.cost_list_usd, 0.0);
+
+        // And it is on disk, not in this process: `vk top` after a restart.
+        drop(k);
+        let k = open(d.path());
+        let after = k.top(&machine(5)).arches;
+        assert_eq!(after[&measured].tokens_in_measured, 14_435);
+        assert!((after[&measured].cost_list_usd - 0.0148193).abs() < 1e-9);
+    }
+
+    /// Review finding (SP1b, Important 2): an adapter refusing a prompt its
+    /// context cannot hold is raising the kernel's own I4′, and it must reach
+    /// the caller as an invariant refusal — not as `NotFound`, which the
+    /// transport sends as "no such arch". Everything else an adapter can fail
+    /// at is machinery, which is a store-class failure.
+    #[test]
+    fn an_adapters_i4_prime_stays_an_invariant_and_its_other_failures_do_not() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let too_big = scripted(&mut k, "too-big", || {
+            Err(arch::AdapterError::I4Prime {
+                needed: 190_000,
+                ceiling: 180_000,
+            })
+        });
+        let broken = scripted(&mut k, "broken", || {
+            Err(arch::AdapterError::Other(anyhow::anyhow!(
+                "claude exited 1: nothing on stderr"
+            )))
+        });
+        let reg = k
+            .submit_task(&machine(1), "a goal", Label::bottom())
+            .unwrap();
+
+        let err = k
+            .infer(&machine(2), &too_big, Capability::Plan, &reg)
+            .unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I4Prime(m) if m.contains("190000") && m.contains("180000")),
+            "{err:?}"
+        );
+        let err = k
+            .infer(&machine(3), &broken, Capability::Plan, &reg)
+            .unwrap_err();
+        assert!(
+            matches!(&err, KernelError::Store(m) if m.contains("claude exited 1")),
+            "{err:?}"
+        );
+
+        // A refused call is not a call: nothing was counted for either arch.
+        assert!(
+            k.top(&machine(4)).arches.is_empty(),
+            "a refusal must not bump the counters"
         );
     }
 

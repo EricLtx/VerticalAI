@@ -108,20 +108,33 @@ fn an_api_error_status_is_a_failure_even_when_is_error_is_absent() {
     assert!(msg.contains("overloaded_error"), "{msg}");
 }
 
-/// `--max-turns` is enforced by the CLI: it exits 1 with `error_max_turns`.
+/// `--max-turns` is enforced by the CLI. The shape is spike 2a §5.3's, measured:
+/// exit 1, `subtype: "error_max_turns"`, `terminal_reason: "max_turns"`,
+/// `stop_reason: "tool_use"`, `is_error: true`, `num_turns: 2` — note that the
+/// reason is `max_turns`, *not* the subtype, which is the easy thing to assume.
 #[test]
 fn a_turn_limit_refusal_names_its_reason() {
     let hit_limit = r#"{
       "type": "result", "subtype": "error_max_turns", "is_error": true,
-      "duration_ms": 4100, "duration_api_ms": 3900, "num_turns": 1,
-      "result": "", "terminal_reason": "error_max_turns",
+      "duration_ms": 4100, "duration_api_ms": 3900, "num_turns": 2,
+      "result": "", "terminal_reason": "max_turns", "stop_reason": "tool_use",
+      "api_error_status": null,
       "session_id": "s-2", "total_cost_usd": 0.01,
       "usage": {"input_tokens": 9, "output_tokens": 40}
     }"#;
     let msg = output::parse(hit_limit)
         .expect_err("a turn limit is a refusal")
         .to_string();
-    assert!(msg.contains("error_max_turns"), "{msg}");
+    assert!(msg.contains("max_turns"), "{msg}");
+
+    // `is_error` is what gates it, and the reason is readable beside it.
+    let raw = output::parse_fields(hit_limit).expect("the object still parses");
+    assert!(raw.is_error);
+    assert_eq!(raw.terminal_reason.as_deref(), Some("max_turns"));
+    assert_eq!(
+        raw.api_error_status, None,
+        "a turn limit is not an API error"
+    );
 }
 
 #[test]

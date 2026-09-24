@@ -47,10 +47,23 @@ struct Standin {
     child_cwd: PathBuf,
 }
 
+/// How the stand-in should misbehave. The default is a well-behaved `claude`.
+#[derive(Default, Clone, Copy)]
+struct How {
+    /// Wait ten seconds before answering, so a test can watch the adapter give
+    /// up on it.
+    slow: bool,
+    /// Exit with this code after printing the (perfectly good) reply.
+    exit: i32,
+}
+
 impl Standin {
-    /// `slow`: the stand-in waits ten seconds before answering, so a test can
-    /// watch the adapter give up on it.
-    fn new(slow: bool) -> Standin {
+    fn new() -> Standin {
+        Standin::behaving(How::default())
+    }
+
+    fn behaving(how: How) -> Standin {
+        let How { slow, exit } = how;
         let home = tempfile::tempdir().expect("temp dir");
         let at = |name: &str| home.path().join(name);
         let (bin, cwd) = (
@@ -85,7 +98,8 @@ impl Standin {
                  findstr \"^\" >\"{stdin_f}\"\r\n\
                  {delay}\r\n\
                  type \"{reply_f}\"\r\n\
-                 exit /b 0\r\n",
+                 echo the stand-in complains 1>&2\r\n\
+                 exit /b {exit}\r\n",
                 cwd_f = p(&child_cwd),
                 argv_f = p(&argv),
                 stdin_f = p(&stdin),
@@ -105,7 +119,9 @@ impl Standin {
                  for a in \"$@\"; do printf '%s\\n' \"$a\" >> '{argv_f}'; done\n\
                  cat > '{stdin_f}'\n\
                  {delay}\n\
-                 cat '{reply_f}'\n",
+                 cat '{reply_f}'\n\
+                 echo 'the stand-in complains' 1>&2\n\
+                 exit {exit}\n",
                 cwd_f = p(&child_cwd),
                 argv_f = p(&argv),
                 stdin_f = p(&stdin),
@@ -166,7 +182,7 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 
 #[test]
 fn the_pinned_launch_line_is_what_actually_runs() {
-    let fake = Standin::new(false);
+    let fake = Standin::new();
     let cfg = fake.config();
     let expected = ClaudeCodeAdapter::launch_line(&cfg);
     let adapter = ClaudeCodeAdapter::new(cfg);
@@ -217,7 +233,7 @@ fn the_pinned_launch_line_is_what_actually_runs() {
 
 #[test]
 fn the_prompt_goes_in_on_stdin_and_the_call_runs_in_the_configured_directory() {
-    let fake = Standin::new(false);
+    let fake = Standin::new();
     let adapter = ClaudeCodeAdapter::new(fake.config());
     adapter
         .complete(
@@ -241,7 +257,7 @@ fn the_prompt_goes_in_on_stdin_and_the_call_runs_in_the_configured_directory() {
 
 #[test]
 fn what_the_call_measured_comes_back_with_it() {
-    let fake = Standin::new(false);
+    let fake = Standin::new();
     let adapter = ClaudeCodeAdapter::new(fake.config());
     let out = adapter
         .complete("ROLE: draft\nGOAL: g\n", 256)
@@ -270,11 +286,87 @@ fn what_the_call_measured_comes_back_with_it() {
             + d["cache_creation"].as_u64().unwrap()
             + d["cache_read"].as_u64().unwrap()
     );
+
+    // And that is the number the kernel is handed, so it accounts the call by
+    // what it cost rather than by this adapter's three-bytes-a-token guess
+    // (ruling 7). The estimate for this short prompt is nowhere near it.
+    assert_eq!(out.tokens_in_measured, Some(14_435));
+    assert!(
+        ClaudeCodeAdapter::estimate_tokens("ROLE: draft\nGOAL: g\n") < 100,
+        "the estimate and the measurement must be visibly different numbers"
+    );
+}
+
+/// Review finding (SP1b, Minor 6): a non-zero exit is a failed call even when
+/// what it printed parses as a clean success. Reading the object and ignoring
+/// the exit code would let a future CLI fail in a way this parser does not
+/// recognise and still be taken for an answer.
+#[test]
+fn a_non_zero_exit_is_a_failure_even_with_a_well_formed_result_object() {
+    let fake = Standin::behaving(How {
+        exit: 3,
+        ..Default::default()
+    });
+    let adapter = ClaudeCodeAdapter::new(fake.config());
+    let msg = adapter
+        .complete("ROLE: draft\nGOAL: g\n", 256)
+        .expect_err("a non-zero exit is not a completion")
+        .to_string();
+    assert!(
+        msg.contains("exited 3"),
+        "the exit code belongs in it: {msg}"
+    );
+    assert!(
+        msg.contains("claims success"),
+        "and what the object said about itself: {msg}"
+    );
+    assert!(
+        msg.contains("the stand-in complains"),
+        "and the tail of stderr, which is where the reason usually is: {msg}"
+    );
+}
+
+/// Review finding (SP1b, Important 2): the budget the kernel is told must be
+/// the budget `complete` honours. Told 200 000 while refusing above 180 000,
+/// the kernel would fit a long prompt to 200 000, log an `infer.projected`
+/// event for it, and then be refused — an inference that never happened, with
+/// a projection in the ledger saying it did.
+#[test]
+fn the_advertised_budget_is_the_one_complete_actually_accepts() {
+    let fake = Standin::new();
+    // The shipped numbers first: 200 000 of ceiling, 180 000 of budget.
+    let shipped = ClaudeCodeAdapter::new(fake.config());
+    assert_eq!(shipped.manifest().context_ceiling, 200_000);
+    assert_eq!(shipped.context_budget(), 180_000);
+
+    // Then the same relationship at a size a stand-in can actually be fed: a
+    // prompt at exactly the advertised budget is sent, one token past it is
+    // refused — so there is no band the kernel would project into and this
+    // adapter would then reject.
+    let adapter = ClaudeCodeAdapter::new(ClaudeCodeConfig {
+        context_ceiling: 1_000,
+        ..fake.config()
+    });
+    assert_eq!(adapter.context_budget(), 900);
+    let at_budget = "x".repeat((900 - 64) * 3);
+    assert_eq!(ClaudeCodeAdapter::estimate_tokens(&at_budget), 900);
+    adapter
+        .complete(&at_budget, 256)
+        .expect("a prompt the advertised budget allows must be sent");
+    let past = "x".repeat((901 - 64) * 3);
+    let msg = adapter
+        .complete(&past, 256)
+        .expect_err("one token past it must not be")
+        .to_string();
+    assert!(msg.contains("901") && msg.contains("900"), "{msg}");
 }
 
 #[test]
 fn a_stand_in_that_never_answers_is_killed_at_the_timeout() {
-    let fake = Standin::new(true);
+    let fake = Standin::behaving(How {
+        slow: true,
+        ..Default::default()
+    });
     let adapter = ClaudeCodeAdapter::new(fake.config()); // 2 s
     let start = Instant::now();
     let err = adapter
@@ -298,7 +390,7 @@ fn a_stand_in_that_never_answers_is_killed_at_the_timeout() {
 /// silently truncated at the other end.
 #[test]
 fn an_over_long_prompt_is_refused_without_launching_anything() {
-    let fake = Standin::new(false);
+    let fake = Standin::new();
     let cfg = ClaudeCodeConfig {
         context_ceiling: 1_000,
         ..fake.config()
@@ -320,7 +412,7 @@ fn an_over_long_prompt_is_refused_without_launching_anything() {
 /// what the arch id hashes: the model, the CLI version and the turn limit.
 #[test]
 fn the_manifest_says_what_this_arch_is() {
-    let fake = Standin::new(false);
+    let fake = Standin::new();
     let cfg = fake.config();
     let adapter = ClaudeCodeAdapter::new(cfg);
     let m = adapter.manifest();

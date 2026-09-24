@@ -82,10 +82,23 @@ vk mount claude-code --draft-model claude-sonnet-5 --judge-model claude-opus-5 \
 It runs on **the founder's own claude.ai subscription**, which is a person's
 and not a product's. Nothing is billed per call, so the manifest's
 `cost_per_1k_tokens_eur` is `0`; what the same call would have cost on the
-meter is recorded beside it, as `cost_list_usd` on the `infer` event, with the
-token breakdown the CLI measured. **Customer nodes do not use this arch**: they
-mount API arches, which carry a key, a per-token price and — for the EU
-jurisdiction — a different host.
+meter is recorded beside it, as `cost_list_usd` on the `infer` event and on the
+arch's running counters. **Customer nodes do not use this arch**: they mount
+API arches, which carry a key, a per-token price and — for the EU jurisdiction
+— a different host.
+
+Because this arch counts its own prompts, `vk top` shows what the calls
+actually cost rather than what this node guessed they would:
+
+```
+ARCH            CALLS  TOKENS  MEASURED  COST (LIST USD)  PROJECTED
+sha256:2ee2...      2   28870     28870          0.02964          0
+sha256:fd4b...      1      74         -                -          0
+```
+
+`TOKENS` is the best number available per call, `MEASURED` how much of it the
+arch itself counted — a dash where an arch reports no usage, so an estimate is
+never mistaken for a figure anyone could bill against.
 
 Inference happens on Anthropic's servers, so the manifest is honest about it:
 `governed: false`, `locality: cloud`, `jurisdiction: US`, 30-day retention, and

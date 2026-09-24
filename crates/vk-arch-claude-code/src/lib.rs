@@ -28,7 +28,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use vk_contracts::arch::{ArchIdentity, ArchManifest, Capability, Determinism, Locality};
 use vk_contracts::labels::{Clearance, Scope};
-use vk_kernel::arch::{ArchAdapter, Completion};
+use vk_kernel::arch::{AdapterError, ArchAdapter, Completion};
 
 /// The model the draft arch runs on unless told otherwise.
 pub const DEFAULT_MODEL: &str = "claude-sonnet-5";
@@ -100,7 +100,14 @@ impl ClaudeCodeAdapter {
     /// calls of one mount must be the same arch.
     pub fn new(cfg: ClaudeCodeConfig) -> ClaudeCodeAdapter {
         let version = probe_version(&cfg.binary).unwrap_or_else(|| Self::UNKNOWN_VERSION.into());
-        let manifest = Self::manifest_for(&cfg, &version);
+        Self::with_version(cfg, &version)
+    }
+
+    /// The same, for a caller that has already asked the binary its version —
+    /// `vkd` does, before it takes the kernel lock, so a binary that is slow to
+    /// answer delays one mount and not every other syscall (SP1b review).
+    pub fn with_version(cfg: ClaudeCodeConfig, claude_version: &str) -> ClaudeCodeAdapter {
+        let manifest = Self::manifest_for(&cfg, claude_version);
         ClaudeCodeAdapter { cfg, manifest }
     }
 
@@ -192,6 +199,14 @@ impl ClaudeCodeAdapter {
     pub fn estimate_tokens(text: &str) -> u32 {
         u32::try_from(text.len() / 3 + 64).unwrap_or(u32::MAX)
     }
+
+    /// The largest prompt this arch accepts: the ceiling less the margin the
+    /// estimate above is allowed to be wrong by. One number, used both as the
+    /// budget the kernel is told and as the limit `complete` enforces, so the
+    /// two can never drift apart.
+    fn usable_ceiling(&self) -> u32 {
+        (f64::from(self.cfg.context_ceiling) * CONTEXT_HEADROOM) as u32
+    }
 }
 
 impl ArchAdapter for ClaudeCodeAdapter {
@@ -199,34 +214,39 @@ impl ArchAdapter for ClaudeCodeAdapter {
         &self.manifest
     }
 
+    /// What `complete` will actually accept, not the manifest's ceiling: the
+    /// kernel projects a long prompt *into* this number, so reporting the full
+    /// ceiling would have it fit a prompt to 200 000 tokens and then hand it to
+    /// a `complete` that refuses anything over 180 000 — a call that was
+    /// servable, refused, with an `infer.projected` event already in the ledger
+    /// for an inference that never happened (SP1b review, Important 2).
     fn context_budget(&self) -> u32 {
-        self.cfg.context_ceiling
+        self.usable_ceiling()
     }
 
     fn count_tokens(&self, text: &str) -> u32 {
         Self::estimate_tokens(text)
     }
 
-    fn complete(&self, prompt: &str, _max_tokens: u32) -> Result<Completion> {
+    fn complete(&self, prompt: &str, _max_tokens: u32) -> Result<Completion, AdapterError> {
         // I4': measured against the real ceiling before anything is spawned.
         // Sending a prompt that cannot fit means letting the far end decide
         // what to drop, which is exactly the silent truncation the kernel
         // projects prompts to avoid.
-        let estimate = Self::estimate_tokens(prompt);
-        let limit = (f64::from(self.cfg.context_ceiling) * CONTEXT_HEADROOM) as u32;
-        if estimate > limit {
-            bail!(
-                "I4': prompt is about {estimate} tokens, past the {limit} this arch will send \
-                 into a {} token context; refusing rather than letting the far end truncate it",
-                self.cfg.context_ceiling
-            );
+        let needed = Self::estimate_tokens(prompt);
+        let ceiling = self.usable_ceiling();
+        if needed > ceiling {
+            return Err(AdapterError::I4Prime { needed, ceiling });
         }
 
         let argv = Self::launch_line(&self.cfg);
         let printed = run(&argv, &self.cfg.cwd, prompt, self.cfg.timeout)?;
         let j = output::parse(&printed)?;
+        // The provider counted the prompt; this node only estimated it.
+        let measured = u32::try_from(j.tokens_in()).unwrap_or(u32::MAX);
         Ok(Completion {
             text: j.result,
+            tokens_in_measured: Some(measured),
             cost_list_usd: Some(j.total_cost_usd),
             details: Some(serde_json::json!({
                 "input_uncached": j.input_tokens,
@@ -255,8 +275,8 @@ fn latency_p50_ms(model: &str) -> u32 {
 /// token. `None` when the binary is not there, fails, or does not answer —
 /// bounded, because this runs inside `vkd`'s mount call and a binary that
 /// never returns must not wedge the daemon.
-fn probe_version(binary: &Path) -> Option<String> {
-    let mut child = Command::new(binary)
+pub fn probe_version(binary: &Path) -> Option<String> {
+    let mut child = spawn(binary)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -292,13 +312,56 @@ fn wait_or_kill(
         {
             Some(status) => return Ok(status),
             None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_tree(child);
                 bail!("{what} did not answer within {timeout:?} and was killed{advice}");
             }
             None => std::thread::sleep(POLL),
         }
     }
+}
+
+/// Kill the child *and everything it started*, then reap it.
+///
+/// Killing the process alone is not enough: an engine that spawns a helper
+/// leaves it holding the pipes and the machine, and on Windows a killed
+/// process never takes its children with it. So: `taskkill /T` there, and on
+/// Unix one signal to the process group the child leads — which is why
+/// [`spawn`] puts it in a group of its own.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    if let Ok(pgid) = i32::try_from(child.id()) {
+        // Safety: `kill(2)` with a negative pid signals the process group, and
+        // the group is this child's own — nothing else can be in it.
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A `Command` for a child this module may have to kill wholesale. On Unix it
+/// leads its own process group, so [`kill_tree`] can signal the group without
+/// reaching this process or its siblings; on Windows the tree is found from
+/// the pid at kill time instead.
+fn spawn(program: &Path) -> Command {
+    let cmd = Command::new(program);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = cmd;
+        cmd.process_group(0);
+        cmd
+    }
+    #[cfg(not(unix))]
+    cmd
 }
 
 /// Launch the CLI, feed it the prompt on stdin and hand back what it printed.
@@ -310,7 +373,7 @@ fn wait_or_kill(
 /// blocking `wait`, because a `claude` that never answers has to be killed at
 /// the timeout rather than waited on forever.
 fn run(argv: &[String], cwd: &Path, prompt: &str, timeout: Duration) -> Result<String> {
-    let mut child = Command::new(&argv[0])
+    let mut child = spawn(Path::new(&argv[0]))
         .args(&argv[1..])
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -344,22 +407,41 @@ fn run(argv: &[String], cwd: &Path, prompt: &str, timeout: Duration) -> Result<S
     let printed = String::from_utf8_lossy(&out_t.join().unwrap_or_default()).into_owned();
     let complained = String::from_utf8_lossy(&err_t.join().unwrap_or_default()).into_owned();
 
-    // The CLI exits 1 on a refusal *and still prints the object saying why*, so
-    // a non-zero exit is only fatal here when there is no object to read.
-    if !status.success() && printed.trim().is_empty() {
-        bail!(
-            "claude exited {} without printing a result: {}",
-            status
-                .code()
-                .map_or_else(|| "on a signal".into(), |c| c.to_string()),
-            if complained.trim().is_empty() {
-                "and said nothing on stderr".to_string()
-            } else {
-                complained.trim().to_string()
-            }
+    // A non-zero exit is a failed call, full stop. The CLI does print the
+    // object saying why (spike 2a: exit 1 ⇔ `is_error`), and `output::parse`
+    // turns that into the better message, so the object is tried first — but
+    // if it reads as a clean success the exit code wins, because a future CLI
+    // that fails in a way this parser does not recognise must not be read as
+    // an answer (SP1b review, Minor 6).
+    if !status.success() {
+        let how = status
+            .code()
+            .map_or_else(|| "on a signal".into(), |c| format!("{c}"));
+        let said = complained.trim();
+        let tail = if said.is_empty() {
+            "nothing on stderr".to_string()
+        } else {
+            last_chars(said, 400)
+        };
+        // The object's own reason if there is one; otherwise the exit code.
+        let why = output::parse(&printed).err().map_or_else(
+            || "and printed a result that claims success".into(),
+            |e| e.to_string(),
         );
+        bail!("claude exited {how}: {why} [stderr: {tail}]");
     }
     Ok(printed)
+}
+
+/// The last `n` characters of `s`, marked when something was cut. Used on
+/// stderr, which can be a whole stack trace and whose interesting end is the
+/// last line.
+fn last_chars(s: &str, n: usize) -> String {
+    let count = s.chars().count();
+    if count <= n {
+        return s.to_string();
+    }
+    format!("…{}", s.chars().skip(count - n).collect::<String>())
 }
 
 /// Read one of the child's pipes to the end on a thread of its own.

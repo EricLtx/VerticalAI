@@ -372,11 +372,30 @@ fn vk_mounts_two_claude_code_arches_and_a_task_runs_through_one() {
     let done = sh.json(&["task", "step", &task, "--all", "--json"]);
     assert_eq!(done["status"], "done", "{done}");
     // Both steps went out through the adapter and came back, so the arch has
-    // two calls and the tokens it was handed on its counters.
+    // two calls on its counters — and, because this arch measures its own
+    // usage, what it measured rather than what the kernel estimated: the
+    // stand-in reports 7 + 11 + 23 prompt tokens and 0.002 USD a call.
     let top = sh.json(&["top", "--json"]);
     let stats = &top["arches"][&draft];
     assert_eq!(stats["calls"], 2, "{top}");
-    assert!(stats["tokens_in"].as_u64().unwrap_or(0) > 0, "{top}");
+    assert_eq!(stats["tokens_in"], 2 * (7 + 11 + 23), "{top}");
+    assert_eq!(
+        stats["tokens_in_measured"], stats["tokens_in"],
+        "every call on this arch was measured, so none of the total is a guess: {top}"
+    );
+    let cost = stats["cost_list_usd"].as_f64().unwrap_or_default();
+    assert!((cost - 0.004).abs() < 1e-9, "{top}");
+
+    // And a person reading `vk top` sees both, not only the hash of them.
+    let screen = sh.ok(&["top"]);
+    assert!(
+        screen.contains("MEASURED") && screen.contains("COST"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("0.00400"),
+        "the cost belongs on the screen:\n{screen}"
+    );
     assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
 }
 

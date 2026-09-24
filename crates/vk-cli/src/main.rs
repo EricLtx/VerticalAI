@@ -310,7 +310,30 @@ async fn call(cli: &Cli) -> Result<()> {
                 )
             };
             let draft = mount(draft_model).await?;
-            let judge = mount(judge_model).await?;
+            let judge = match mount(judge_model).await {
+                Ok(v) => v,
+                // All or nothing. A verb whose whole reason to exist is that a
+                // node needs both arches must not leave one behind when the
+                // second refuses — the unmount is best effort, and its own
+                // failure is reported beside the one that caused it.
+                Err(why) => {
+                    let id = draft["arch_id"].as_str().unwrap_or_default();
+                    let rolled_back = c
+                        .call("arch.unmount", json!({ "arch_id": id }), None)
+                        .await
+                        .is_ok();
+                    return Err(if rolled_back {
+                        why.context(format!(
+                            "mounting {judge_model} failed; unmounted {id} again"
+                        ))
+                    } else {
+                        why.context(format!(
+                            "mounting {judge_model} failed, and {id} could not be unmounted; \
+                             remove it with: vk umount {id}"
+                        ))
+                    });
+                }
+            };
             show(
                 cli,
                 json!({ "draft": draft, "judge": judge }),
