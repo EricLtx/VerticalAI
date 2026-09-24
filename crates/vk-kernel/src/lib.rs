@@ -12,7 +12,7 @@ use vk_contracts::arch::{ArchManifest, Capability};
 use vk_contracts::hash_canonical;
 use vk_contracts::interceptors;
 use vk_contracts::labels::{Label, Scope};
-use vk_contracts::ledger::{ClockQuality, HlcClock, Ledger, RetentionClass};
+use vk_contracts::ledger::{is_allowed_kind, ClockQuality, HlcClock, Ledger, RetentionClass};
 use vk_contracts::locks::{Lease, LockHome, LockTable};
 use vk_contracts::module::{GateKind, GateVerdict, ModuleManifest};
 use vk_contracts::principal::{Approval, ApprovalKind, DeviceRegistry};
@@ -552,6 +552,19 @@ impl RealKernel {
         wall_ms: u64,
         payload: &impl serde::Serialize,
     ) -> Result<(), KernelError> {
+        // The sole choke point every kernel-originated event passes through
+        // (review finding, Task 0 fix-wave): a kind outside the contract's
+        // list is refused here, before the clock advances or anything is
+        // appended, rather than being silently hashed into the permanent
+        // record. `Ledger::append` itself stays free-form — it is shared
+        // with the stub and a node must still be able to *read* a kind a
+        // newer version minted — this gate is only on what this kernel
+        // itself will originate.
+        if !is_allowed_kind(kind) {
+            return Err(KernelError::Store(format!(
+                "ledger kind not allowed: {kind}"
+            )));
+        }
         let hlc = self.clock.now(wall_ms);
         // Through the store, not the ledger tier alone: the store records the
         // new head beside the event, which is what lets the next boot tell a
@@ -1263,6 +1276,35 @@ mod tests {
                 report_hash: &report_hash,
             }),
             "the payload must name the verdict `boot` found"
+        );
+    }
+
+    /// Review finding (Task 0 fix-wave, Ruling 2): `ALLOWED_KINDS` must be
+    /// load-bearing, not decorative. `log` is the sole choke point every
+    /// kernel-originated event passes through, so an unlisted or misspelled
+    /// kind is refused there, before the append — nothing lands in the
+    /// permanent record, and the chain that was already there is untouched.
+    #[test]
+    fn log_refuses_a_kind_outside_the_allowed_list() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        k.boot().unwrap();
+        let before = k.ledger().events().len();
+
+        let err = k.log("not.a.real.kind", now_ms(), &"payload").unwrap_err();
+        assert!(
+            matches!(&err, KernelError::Store(msg) if msg.contains("not.a.real.kind")),
+            "{err}"
+        );
+
+        assert_eq!(
+            k.ledger().events().len(),
+            before,
+            "an unlisted kind must not be appended"
+        );
+        assert!(
+            k.ledger().verify_chain(),
+            "the existing chain must still verify"
         );
     }
 
