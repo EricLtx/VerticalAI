@@ -9,6 +9,8 @@ description = "VerticalAI IPC: local transport between vk CLI and vkd"
 [dependencies]
 vk-contracts = { path = "../vk-contracts" }
 vk-kernel = { path = "../vk-kernel" }
+vk-arch-claude-code = { path = "../vk-arch-claude-code" }
+vk-store = { path = "../vk-store" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -22,4 +24,3 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-vk-store = { path = "../vk-store" }

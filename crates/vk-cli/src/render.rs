@@ -357,6 +357,22 @@ pub fn mounted(v: &Value) -> String {
     text(&v["arch_id"])
 }
 
+/// One arch per role, as `vk mount claude-code` mounts them: the role it is
+/// for, what it is, and the id every other verb takes.
+pub fn mounted_roles(v: &Value) -> String {
+    let rows = ["draft", "judge"]
+        .iter()
+        .map(|role| {
+            vec![
+                (*role).to_string(),
+                text(&v[role]["name"]),
+                text(&v[role]["arch_id"]),
+            ]
+        })
+        .collect::<Vec<_>>();
+    table(&["ROLE", "ARCH", "ID"], &rows)
+}
+
 pub fn stopped(v: &Value) -> String {
     format!("stopped; resume with: vk resume {}", text(&v["stop_id"]))
 }

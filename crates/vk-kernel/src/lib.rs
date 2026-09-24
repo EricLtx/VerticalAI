@@ -114,6 +114,26 @@ struct BootForcedRecord<'a> {
     report_hash: &'a str,
 }
 
+/// The `infer` event's payload: which arch ran which register, and — when the
+/// arch measured its own call — what it cost and what it spent (SP1b ruling 3).
+///
+/// The optional halves are skipped when absent, so the mock's `infer` commits
+/// to exactly what it used to: which arch, which register, nothing invented.
+/// Nothing here is a contract type; the ledger stores only the hash of this
+/// object, and an auditor recomputes it from the same values.
+#[derive(serde::Serialize)]
+struct InferRecord<'a> {
+    arch_id: &'a str,
+    register: &'a str,
+    /// `Completion::cost_list_usd` — list price for a call the subscription
+    /// did not bill, so the record says what it would have cost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_list_usd: Option<f64>,
+    /// `Completion::details` — the arch's own measurements of the call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<&'a serde_json::Value>,
+}
+
 pub struct RealKernel {
     pub node_id: String,
     store: Store,
@@ -723,15 +743,24 @@ impl Kernel for RealKernel {
         };
         // What the arch is actually handed, not a clamp of what we wished for.
         let tokens_in = count(&prompt);
-        let output = adapter
+        let completion = adapter
             .complete(&prompt, budget.min(1024))
             .map_err(|e| KernelError::NotFound(format!("arch error: {e}")))?;
         // The call has left the kernel: record it before doing anything that
         // could fail, or a real send to a real arch could leave no trace.
-        self.log("infer", ctx.now_ms, &(arch_id, reg_id))?;
+        self.log(
+            "infer",
+            ctx.now_ms,
+            &InferRecord {
+                arch_id,
+                register: &reg_id.0,
+                cost_list_usd: completion.cost_list_usd,
+                details: completion.details.as_ref(),
+            },
+        )?;
         self.infer_log.push((arch_id.into(), reg.label.clone()));
         self.bump_stats(arch_id, tokens_in, projected)?;
-        arch::raise(&mut reg, role, &output);
+        arch::raise(&mut reg, role, &completion.text);
         self.write_register(ctx, reg)?;
         Ok(InferOutcome {
             arch_id: arch_id.into(),

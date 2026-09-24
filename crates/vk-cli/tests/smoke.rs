@@ -250,6 +250,136 @@ fn the_vk_shell_drives_a_task_from_mount_to_release() {
     assert_eq!(tail.as_array().expect("events").len(), 5, "{tail}");
 }
 
+/// A scripted stand-in for `claude` at `dir/fake-claude.{cmd,sh}`: it answers
+/// `--version`, swallows the prompt on stdin and prints one canned result
+/// object. Enough for `vk mount claude-code --bin` to mount a real adapter and
+/// for a task to run through it, without a subscription, a network or a cost.
+fn fake_claude(dir: &std::path::Path) -> PathBuf {
+    let reply = dir.join("reply.json");
+    std::fs::write(
+        &reply,
+        r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":120,
+            "duration_api_ms":90,"num_turns":1,"result":"a stand-in completion",
+            "session_id":"smoke-1","total_cost_usd":0.002,
+            "usage":{"input_tokens":7,"cache_creation_input_tokens":11,
+                     "cache_read_input_tokens":23,"output_tokens":5}}"#,
+    )
+    .expect("write the canned reply");
+    let bin = dir.join(if cfg!(windows) {
+        "fake-claude.cmd"
+    } else {
+        "fake-claude.sh"
+    });
+    let (r, script) = (
+        path_of(&reply),
+        if cfg!(windows) {
+            "@echo off\r\nif \"%~1\"==\"--version\" (\r\n  echo 0.0.0-smoke\r\n  exit /b 0\r\n)\r\n\
+         findstr \"^\" >nul\r\ntype \"{R}\"\r\nexit /b 0\r\n"
+        } else {
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 0.0.0-smoke; exit 0; fi\n\
+         cat >/dev/null\ncat '{R}'\n"
+        },
+    );
+    std::fs::write(&bin, script.replace("{R}", &r)).expect("write the stand-in");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).expect("chmod +x");
+    }
+    bin
+}
+
+/// `vk mount claude-code` is the first verb that mounts a *real* adapter: two
+/// arches in one call, a draft and a judge, each named for its model and each
+/// with its own content-addressed id. Driven against the stand-in via `--bin`,
+/// so this test needs no subscription and spends nothing.
+#[test]
+fn vk_mounts_two_claude_code_arches_and_a_task_runs_through_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+
+    let claude = path_of(&fake_claude(dir.path()));
+    let mounted = sh.json(&[
+        "mount",
+        "claude-code",
+        "--bin",
+        &claude,
+        "--draft-model",
+        "claude-sonnet-5",
+        "--judge-model",
+        "claude-opus-5",
+        "--json",
+    ]);
+    let draft = str_of(&mounted["draft"], "arch_id").to_string();
+    let judge = str_of(&mounted["judge"], "arch_id").to_string();
+    assert_eq!(
+        str_of(&mounted["draft"], "name"),
+        "claude-code/claude-sonnet-5"
+    );
+    assert_eq!(
+        str_of(&mounted["judge"], "name"),
+        "claude-code/claude-opus-5"
+    );
+    assert_ne!(draft, judge, "two models are two arches: {mounted}");
+
+    // Both are in the namespace, and the human rendering names both.
+    let ls = sh.ok(&["ls", "/arches"]);
+    for id in [&draft, &judge] {
+        assert!(ls.contains(id.as_str()), "{id} missing from /arches:\n{ls}");
+    }
+    let plain = sh.ok(&[
+        "mount",
+        "claude-code",
+        "--bin",
+        &claude,
+        "--draft-model",
+        "claude-sonnet-5",
+        "--judge-model",
+        "claude-opus-5",
+    ]);
+    assert!(
+        plain.contains("draft") && plain.contains("judge"),
+        "{plain}"
+    );
+    assert!(plain.contains("claude-code/claude-opus-5"), "{plain}");
+
+    // And the adapter really drives the child: a task runs to completion on it.
+    let task = str_of(
+        &sh.json(&[
+            "task",
+            "submit",
+            "--goal",
+            "Say something",
+            "--plan",
+            &draft,
+            "--draft",
+            &draft,
+            "--json",
+        ]),
+        "id",
+    )
+    .to_string();
+    let done = sh.json(&["task", "step", &task, "--all", "--json"]);
+    assert_eq!(done["status"], "done", "{done}");
+    // Both steps went out through the adapter and came back, so the arch has
+    // two calls and the tokens it was handed on its counters.
+    let top = sh.json(&["top", "--json"]);
+    let stats = &top["arches"][&draft];
+    assert_eq!(stats["calls"], 2, "{top}");
+    assert!(stats["tokens_in"].as_u64().unwrap_or(0) > 0, "{top}");
+    assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
+}
+
 /// `vk boot` is the verb with real logic of its own — find the daemon, refuse
 /// to double it, hand it its state and keys, detach it, wait for it to answer.
 /// It runs here with file-backed keys, so CI never touches a keyring.

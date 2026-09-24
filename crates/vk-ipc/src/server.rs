@@ -14,11 +14,12 @@ use std::io::ErrorKind;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use vk_arch_claude_code::{ClaudeCodeAdapter, ClaudeCodeConfig};
 use vk_contracts::arch::ArchManifest;
 use vk_contracts::labels::{Clearance, Label, Scope};
 use vk_contracts::principal::{Approval, ApprovalKind, Principal};
 use vk_contracts::syscalls::{Ctx, Kernel, KernelError};
-use vk_kernel::arch::MockAdapter;
+use vk_kernel::arch::{ArchAdapter, MockAdapter};
 use vk_kernel::tasks::StepKind;
 use vk_kernel::{now_ms, RealKernel};
 
@@ -376,6 +377,21 @@ fn dispatch(
                 .map(|(id, m)| json!({ "arch_id": id, "manifest": m }))
                 .collect::<Vec<_>>(),
         ),
+        // The one door a *real* arch comes in by. `kind` picks the adapter and
+        // `config` is that adapter's own shape, because every engine is
+        // configured differently and the transport should not have to know
+        // how; what comes back is the same pair for all of them, so a client
+        // that mounts a new kind needs no new verb (SP1b ruling 4).
+        "arch.mount" => {
+            let kind = p["kind"].as_str().ok_or_else(|| bad("kind"))?;
+            let adapter: Arc<dyn ArchAdapter> = match kind {
+                "claude-code" => Arc::new(claude_code_adapter(&k, &p["config"])?),
+                other => return Err(bad(&format!("no arch kind {other}"))),
+            };
+            let name = adapter.manifest().name.clone();
+            let id = k.mount(adapter).map_err(|e| bad(&e.to_string()))?;
+            Ok(json!({ "arch_id": id, "name": name }))
+        }
         "arch.mount_mock" => {
             let name = p["name"].as_str().unwrap_or("mock");
             let ceiling = p["context_ceiling"]
@@ -501,6 +517,57 @@ fn dispatch(
             message: format!("unknown method {m}"),
         }),
     }
+}
+
+/// Build the Claude Code adapter `arch.mount { kind: "claude-code" }` asks
+/// for. Everything in `config` is optional and falls back to the adapter's own
+/// defaults; the working directory does not, because it is this node's to
+/// choose and not a client's (SP1b ruling 4).
+fn claude_code_adapter(k: &RealKernel, config: &Value) -> Result<ClaudeCodeAdapter, RpcError> {
+    let defaults = ClaudeCodeConfig::default();
+    let u32_of = |name: &str, fallback: u32| -> Result<u32, RpcError> {
+        match config.get(name) {
+            None | Some(Value::Null) => Ok(fallback),
+            Some(v) => v
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| bad(name)),
+        }
+    };
+    // One fixed, empty directory under the state directory, not a temp
+    // directory per call: `claude` creates `~/.claude/projects/<mangled
+    // cwd>/memory/` for wherever it runs, so a new directory each time would
+    // leave a new one of those behind each time (spike 2a).
+    let cwd = k.store().state_dir.join("claude-code-cwd");
+    vk_store::paths::private_dir(&cwd)
+        .map_err(|e| internal(&format!("create {}: {e}", cwd.display())))?;
+    let default_timeout = u32::try_from(defaults.timeout.as_secs()).unwrap_or(u32::MAX);
+    let cfg = ClaudeCodeConfig {
+        binary: config
+            .get("binary")
+            .and_then(Value::as_str)
+            .map_or(defaults.binary, std::path::PathBuf::from),
+        model: config
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or(&defaults.model)
+            .to_string(),
+        max_turns: u32_of("max_turns", defaults.max_turns)?,
+        timeout: Duration::from_secs(u64::from(u32_of("timeout_secs", default_timeout)?)),
+        context_ceiling: u32_of("context_ceiling", defaults.context_ceiling)?,
+        cwd,
+    };
+    let adapter = ClaudeCodeAdapter::new(cfg);
+    // The CLI version is in the arch identity. A mount that could not read it
+    // would mint an arch id naming no particular version of Claude Code, and
+    // every call on it would fail anyway — so it is refused here, where the
+    // person mounting is still listening.
+    if adapter.manifest().identity.engine_version == ClaudeCodeAdapter::UNKNOWN_VERSION {
+        return Err(bad(
+            "cannot run `claude --version`: install Claude Code, or pass the binary's path",
+        ));
+    }
+    Ok(adapter)
 }
 
 fn mock_manifest(name: &str, ctx: u32) -> ArchManifest {

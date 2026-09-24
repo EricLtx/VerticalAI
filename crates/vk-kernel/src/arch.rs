@@ -3,12 +3,49 @@ use std::collections::BTreeSet;
 use vk_contracts::arch::ArchManifest;
 use vk_contracts::register::Register;
 
+/// What an arch hands back from one call: the text, plus whatever that arch
+/// measured about the call itself.
+///
+/// Only an arch that the provider tells can report the last two, so they are
+/// optional and the mock leaves them unset (SP1b ruling 3). They exist because
+/// the kernel's own numbers are estimates — `count_tokens` is a heuristic on
+/// every adapter that has no tokenizer to ask — while these are what the call
+/// actually was, and a record that can carry the measurement should not settle
+/// for the guess. The kernel merges them into the `infer` event's payload, so
+/// what the ledger commits to for a real call includes its measured cost and
+/// token breakdown.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Completion {
+    /// The completion itself — what `raise` puts back into the register.
+    pub text: String,
+    /// List-price equivalent in USD, as the provider reported it. Under a
+    /// subscription nothing is billed per call, so this is what the same call
+    /// would have cost on the meter, not a charge; the manifest's
+    /// `cost_per_1k_tokens_eur` stays 0 and this is the honest number beside it.
+    pub cost_list_usd: Option<f64>,
+    /// Arch-specific measurements of the call (token breakdown, timings, the
+    /// provider's own id for it). Free-form on purpose: it is payload, not a
+    /// contract type, and every arch measures something different.
+    pub details: Option<serde_json::Value>,
+}
+
+impl Completion {
+    /// A completion from an arch that measured nothing — the text alone.
+    pub fn text(text: impl Into<String>) -> Completion {
+        Completion {
+            text: text.into(),
+            cost_list_usd: None,
+            details: None,
+        }
+    }
+}
+
 pub trait ArchAdapter: Send + Sync {
     fn manifest(&self) -> &ArchManifest;
     /// Real context budget in tokens (I4'); adapters must report what is actually loaded.
     fn context_budget(&self) -> u32;
     fn count_tokens(&self, text: &str) -> u32;
-    fn complete(&self, prompt: &str, max_tokens: u32) -> anyhow::Result<String>;
+    fn complete(&self, prompt: &str, max_tokens: u32) -> anyhow::Result<Completion>;
 }
 
 pub struct MockAdapter {
@@ -26,7 +63,7 @@ impl ArchAdapter for MockAdapter {
     fn count_tokens(&self, text: &str) -> u32 {
         (text.len() / 4) as u32 + 1
     }
-    fn complete(&self, prompt: &str, _max_tokens: u32) -> anyhow::Result<String> {
+    fn complete(&self, prompt: &str, _max_tokens: u32) -> anyhow::Result<Completion> {
         let role = prompt
             .lines()
             .next()
@@ -34,7 +71,7 @@ impl ArchAdapter for MockAdapter {
             .trim_start_matches("ROLE: ")
             .to_uppercase();
         let body: String = prompt.chars().take(200).collect();
-        Ok(format!("{role}: {body}"))
+        Ok(Completion::text(format!("{role}: {body}")))
     }
 }
 

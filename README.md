@@ -58,13 +58,39 @@ table or, with `--json`, as the daemon's own answer.
 | `vk status` | `uname`: what this node is, and what its boot sequence found |
 | `vk ls PATH` | the namespace: `/arches`, `/tasks`, `/artefacts`, `/devices`, `/ledger` as directories |
 | `vk ps`, `vk top` | the scheduler: what every task is doing, what each arch has cost |
-| `vk mount mock NAME`, `vk umount ID` | drivers: an arch is a device this kernel drives |
+| `vk mount mock NAME`, `vk mount claude-code`, `vk umount ID` | drivers: an arch is a device this kernel drives |
 | `vk task submit` / `step` / `show` | processes: a task is the unit of work, its register is its address space |
 | `vk stop [SCOPE]`, `vk resume ID` | signals: a STOP halts a scope until a human lifts it |
 | `vk approve ID` | the human ceremony: an approval signed by an enrolled device (invariant I1) |
 | `vk dmesg -n N` | the kernel ring buffer: the tail of the hash-chained ledger |
 | `vk ledger verify` | `fsck` for the record |
 | `vk man [NAME]` | the contracts this kernel speaks — the syscall ABI, out of `contracts/schemas/` |
+
+### Arches: this machine's Claude, and a customer's
+
+`vk mount claude-code` mounts two arches — a draft one and a judge one —
+through the Claude Code already installed on this machine, driven as a pure
+completion engine: every built-in tool removed, MCP off, one turn, no session
+on disk, and the prompt on stdin so no process list shows it.
+
+```
+vk mount claude-code                                    # sonnet to draft, opus to judge
+vk mount claude-code --draft-model claude-sonnet-5 --judge-model claude-opus-5 \
+                     --bin /path/to/claude --timeout 180
+```
+
+It runs on **the founder's own claude.ai subscription**, which is a person's
+and not a product's. Nothing is billed per call, so the manifest's
+`cost_per_1k_tokens_eur` is `0`; what the same call would have cost on the
+meter is recorded beside it, as `cost_list_usd` on the `infer` event, with the
+token breakdown the CLI measured. **Customer nodes do not use this arch**: they
+mount API arches, which carry a key, a per-token price and — for the EU
+jurisdiction — a different host.
+
+Inference happens on Anthropic's servers, so the manifest is honest about it:
+`governed: false`, `locality: cloud`, `jurisdiction: US`, 30-day retention, and
+a clearance that stops at Business and refuses third-party data. I2 will not
+lower anything above that into it. `contracts/tcb.md` says the same in prose.
 
 ### What boot does
 

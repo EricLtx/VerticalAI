@@ -129,6 +129,24 @@ enum MountCmd {
         #[arg(long, default_value_t = 4096)]
         ctx: u32,
     },
+    /// Claude, through the installed Claude Code and this machine's own
+    /// subscription: two arches, one to draft with and one to judge with.
+    ///
+    /// A cloud arch, so its clearance stops at Business and it refuses
+    /// third-party data; see `contracts/tcb.md`. Customer nodes use API arches
+    /// instead — a subscription is a person's, not a product's.
+    ClaudeCode {
+        #[arg(long, default_value = "claude-sonnet-5")]
+        draft_model: String,
+        #[arg(long, default_value = "claude-opus-5")]
+        judge_model: String,
+        /// The `claude` binary, if it is not on the daemon's PATH.
+        #[arg(long, default_value = "claude")]
+        bin: String,
+        /// How long one call may take, in seconds.
+        #[arg(long, default_value_t = 180)]
+        timeout: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -265,6 +283,40 @@ async fn call(cli: &Cli) -> Result<()> {
             .await?,
             render::mounted,
         ),
+        // Two mounts, one verb: a role needs a model behind it, and one call
+        // that leaves the node with a draft arch and no judge arch would be a
+        // node whose tasks stall at their second step.
+        Cmd::Mount {
+            what:
+                MountCmd::ClaudeCode {
+                    draft_model,
+                    judge_model,
+                    bin,
+                    timeout,
+                },
+        } => {
+            let mount = |model: &str| {
+                c.call(
+                    "arch.mount",
+                    json!({
+                        "kind": "claude-code",
+                        "config": {
+                            "binary": bin,
+                            "model": model,
+                            "timeout_secs": timeout,
+                        },
+                    }),
+                    None,
+                )
+            };
+            let draft = mount(draft_model).await?;
+            let judge = mount(judge_model).await?;
+            show(
+                cli,
+                json!({ "draft": draft, "judge": judge }),
+                render::mounted_roles,
+            )
+        }
         Cmd::Umount { arch_id } => show(
             cli,
             c.call("arch.unmount", json!({ "arch_id": arch_id }), None)
