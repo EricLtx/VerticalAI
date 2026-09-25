@@ -14,10 +14,18 @@ path = "src/lib.rs"
 name = "vkd"
 path = "src/main.rs"
 
+[features]
+# Build the EU (Bedrock) arch into this daemon. See `vk-arch-anthropic`'s own
+# feature for the build-cost measurement behind the default.
+default = ["bedrock"]
+bedrock = ["vk-ipc/bedrock"]
+
 [dependencies]
 vk-kernel = { path = "../vk-kernel" }
 vk-store = { path = "../vk-store" }
-vk-ipc = { path = "../vk-ipc" }
+vk-ipc = { path = "../vk-ipc", default-features = false }
+# The API arches key source (`--anthropic-key-file`), nothing more.
+vk-arch-anthropic = { path = "../vk-arch-anthropic", default-features = false }
 # The passkey pages (SP1b Task 5), served on loopback beside the endpoint.
 vk-web = { path = "../vk-web" }
 tokio.workspace = true

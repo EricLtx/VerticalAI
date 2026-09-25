@@ -103,6 +103,11 @@ enum Cmd {
         #[arg(long, default_value_t = 300, requires = "passkey")]
         timeout: u64,
     },
+    /// Secrets this node's daemon needs, in the OS keyring. Needs no daemon.
+    Secret {
+        #[command(subcommand)]
+        what: SecretCmd,
+    },
     /// Passkeys: the human's own device, enrolled through the browser.
     Passkey {
         #[command(subcommand)]
@@ -150,6 +155,35 @@ struct BootArgs {
 }
 
 #[derive(Subcommand)]
+enum SecretCmd {
+    /// Put a secret in this account's keyring, under service `vk`.
+    ///
+    /// `vk secret set anthropic` is the one an API arch needs: the daemon
+    /// reads it at `vk mount anthropic` and again whenever it re-creates that
+    /// arch at boot. The value is prompted for without echo and is never
+    /// printed, never logged and never written to a file — it does not go
+    /// into the mount spec either, which is stored in the clear and refuses
+    /// anything credential-shaped.
+    ///
+    /// The keyring is **this account's**. A daemon running under the Windows
+    /// service account (`vkd --as-service`) reads that account's keyring, not
+    /// this one, and is given its key with `vkd --anthropic-key-file` or by
+    /// running this verb as that account.
+    Set {
+        /// What it is called: `anthropic` for the first-party API arch.
+        name: String,
+        /// Read the value as one line on stdin instead of prompting, for
+        /// scripts. Still never echoed and never printed back.
+        #[arg(long)]
+        stdin: bool,
+        /// The keyring service. `vk` for everything this kernel reads; the
+        /// flag exists so a test can use a throwaway name.
+        #[arg(long, default_value = "vk")]
+        service: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum PasskeyCmd {
     /// Print the enrolment page's link (and open it with --open): the
     /// browser asks Windows Hello, or a phone, to make the passkey.
@@ -188,6 +222,57 @@ enum MountCmd {
         /// How long one call may take, in seconds.
         #[arg(long, default_value_t = 180)]
         timeout: u32,
+    },
+    /// Claude through the **Anthropic API**, on a key in this account's
+    /// keyring (`vk secret set anthropic`). The arch a customer node mounts.
+    ///
+    /// A cloud arch in the United States: `jurisdiction: US`, 30-day
+    /// retention, clearance capped at Business with third-party data refused,
+    /// and metered — unlike `vk mount claude-code`, every call is billed, so
+    /// the manifest carries a per-token price and `vk top` shows what the
+    /// calls cost. For a register that may not leave the Union, mount
+    /// `bedrock` instead.
+    Anthropic {
+        /// The model, as the API names it (`claude-opus-5`,
+        /// `claude-sonnet-5`, `claude-haiku-4-5`).
+        #[arg(long, default_value = "claude-opus-5")]
+        model: String,
+        /// Context ceiling in tokens. `0` is the model's documented window,
+        /// which is what nearly every mount wants.
+        #[arg(long, default_value_t = 0)]
+        ctx: u32,
+        /// The longest answer one call may produce. Capped at 4096.
+        #[arg(long, default_value_t = 4096)]
+        max_tokens: u32,
+        /// How long one call may take, in seconds.
+        #[arg(long, default_value_t = 600)]
+        timeout: u32,
+    },
+    /// Claude **hosted in the EU**, through Amazon Bedrock's `Converse` API
+    /// in Frankfurt or Ireland, on this machine's AWS credentials.
+    ///
+    /// The EU jurisdiction: `jurisdiction: EU` and no retention window,
+    /// because AWS keeps neither the inputs nor the outputs. Needs a build
+    /// with the `bedrock` cargo feature; a daemon without it refuses the
+    /// mount and says so.
+    Bedrock {
+        /// Which European region. Only these two: the manifest's
+        /// `jurisdiction: EU` is the region, so a mount elsewhere is refused
+        /// rather than mislabelled.
+        #[arg(long, default_value = "eu-central-1",
+              value_parser = ["eu-central-1", "eu-west-1"])]
+        region: String,
+        /// A model name (`claude-opus-5`), which is resolved to the region's
+        /// cross-region inference profile, or a full Bedrock model id or
+        /// profile ARN, which is used exactly as given.
+        #[arg(long, default_value = "claude-opus-5")]
+        model: String,
+        /// Context ceiling in tokens. `0` is the model's documented window.
+        #[arg(long, default_value_t = 0)]
+        ctx: u32,
+        /// The longest answer one call may produce. Capped at 4096.
+        #[arg(long, default_value_t = 4096)]
+        max_tokens: u32,
     },
     /// A Gemma-class model on this machine, served by Ollama in a container
     /// this kernel starts, caps and can stop.
@@ -339,6 +424,9 @@ fn run(cli: &Cli) -> Result<()> {
     match &cli.cmd {
         Cmd::Boot(args) => boot(cli, &rt, args),
         Cmd::Man { name } => man(cli, name.as_deref()),
+        // The keyring is this account's, not the daemon's to reach into: the
+        // shell writes it directly and no syscall is involved.
+        Cmd::Secret { what } => secret(cli, what),
         _ => rt.block_on(call(cli)),
     }
 }
@@ -371,6 +459,56 @@ fn endpoint(cli: &Cli) -> Endpoint {
         .unwrap_or_else(default_endpoint)
 }
 
+/// `vk secret set NAME` — the one verb that writes a credential, and the only
+/// place in this shell that handles one.
+///
+/// Three rules, all of them testable by reading this function: the value is
+/// never echoed (the terminal's echo is off while it is typed), never printed
+/// (what is reported back is the name, never the value) and never written
+/// anywhere but the keyring. An empty value is refused rather than stored,
+/// because an empty entry is worse than a missing one: `vk mount anthropic`
+/// would find something and fail at the far end instead of here.
+fn secret(cli: &Cli, what: &SecretCmd) -> Result<()> {
+    let SecretCmd::Set {
+        name,
+        stdin,
+        service,
+    } = what;
+    let name = name.trim();
+    if name.is_empty() || name.split_whitespace().count() != 1 {
+        return Err(anyhow!(
+            "a secret's name is one word with no spaces in it; `anthropic` is the one an \
+             API arch reads"
+        ));
+    }
+    let value = if *stdin {
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("read the secret from stdin")?;
+        line
+    } else {
+        rpassword::prompt_password(format!("{service}/{name}: "))
+            .context("read the secret from the terminal")?
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(anyhow!(
+            "nothing was entered; the keyring was not touched. An empty entry is worse \
+             than a missing one: the mount would find it and fail at the far end"
+        ));
+    }
+    keyring::Entry::new(service, name)
+        .and_then(|e| e.set_password(value))
+        .with_context(|| format!("cannot write {service}/{name} to this account's keyring"))?;
+    // The name, never the value.
+    show(
+        cli,
+        json!({ "service": service, "name": name }),
+        render::secret_set,
+    )
+}
+
 fn show(cli: &Cli, v: Value, render: fn(&Value) -> String) -> Result<()> {
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&v)?);
@@ -395,7 +533,7 @@ async fn call(cli: &Cli) -> Result<()> {
     match &cli.cmd {
         // Dispatched before the client connects: one starts a daemon rather
         // than calling one, the other needs none at all.
-        Cmd::Boot(_) | Cmd::Man { .. } => unreachable!("not a syscall"),
+        Cmd::Boot(_) | Cmd::Man { .. } | Cmd::Secret { .. } => unreachable!("not a syscall"),
         Cmd::Status => show(
             cli,
             c.call("boot.info", json!({}), None).await?,
@@ -477,6 +615,61 @@ async fn call(cli: &Cli) -> Result<()> {
                 render::mounted_roles,
             )
         }
+        // One mount, one arch, and no key on the wire: the daemon reads it
+        // out of its own keyring, so what travels is the model and the
+        // numbers (Task 2b).
+        Cmd::Mount {
+            what:
+                MountCmd::Anthropic {
+                    model,
+                    ctx,
+                    max_tokens,
+                    timeout,
+                },
+        } => show(
+            cli,
+            c.call(
+                "arch.mount",
+                json!({
+                    "kind": "anthropic",
+                    "config": {
+                        "model": model,
+                        "context_ceiling": ctx,
+                        "max_tokens": max_tokens,
+                        "timeout_secs": timeout,
+                    },
+                }),
+                None,
+            )
+            .await?,
+            render::mounted_arch,
+        ),
+        Cmd::Mount {
+            what:
+                MountCmd::Bedrock {
+                    region,
+                    model,
+                    ctx,
+                    max_tokens,
+                },
+        } => show(
+            cli,
+            c.call(
+                "arch.mount",
+                json!({
+                    "kind": "bedrock",
+                    "config": {
+                        "region": region,
+                        "model": model,
+                        "context_ceiling": ctx,
+                        "max_tokens": max_tokens,
+                    },
+                }),
+                None,
+            )
+            .await?,
+            render::mounted_arch,
+        ),
         // One mount, one arch: a local model is one engine, and which role it
         // is given is the task's to say.
         Cmd::Mount {

@@ -18,7 +18,9 @@ vkd = { path = "../vkd" }
 # `transport::pipe_dacl` — the SDDL is built once, in the crate that hands it
 # to `CreateNamedPipe`, and this crate decides *whose* SIDs go in it — plus
 # `os::ensure_user_sid`, which resolves `--user-sid` to a real user account.
-vk-ipc = { path = "../vk-ipc" }
+# The service host runs `vkd::run`, which brings whatever `vkd` was built
+# with; this crate needs the transport and not the AWS SDK of its own.
+vk-ipc = { path = "../vk-ipc", default-features = false }
 # `paths::refuse_sync_folder`, so an `ImagePath` inside OneDrive is refused.
 vk-store = { path = "../vk-store" }
 anyhow.workspace = true

@@ -19,6 +19,69 @@ The inference itself is **not governed**: it happens on Anthropic's servers, whe
 
 Subscription use is the founder's own. A claude.ai subscription is a person's, not a product's: nothing is billed per call, so the manifest's `cost_per_1k_tokens_eur` is `0` and the list-price equivalent the CLI reports rides on the `infer` event as `cost_list_usd`, visibly a comparison and not a charge. **Customer nodes use API arches** (task 2b), which carry a key, a per-token price and, for the EU jurisdiction, a different host.
 
+### Anthropic API adapters — first-party (US) and Bedrock (EU)
+
+The arches a **customer** node mounts, where the Claude Code adapter above is
+the founder's own subscription. Both are ungoverned cloud arches — `locality:
+cloud`, `governed: false`, clearance capped at Business with third-party data
+refused — and both are metered, unlike the subscription arch. The first-party
+one carries Anthropic's list price in its manifest (`cost_per_1k_tokens_eur`,
+converted at a pinned and dated rate) and the USD figure on every call;
+Bedrock is priced by AWS, whose list this node has not read, so that arch
+claims **no** price rather than one from the wrong table — `vk top` shows a
+dash, which is honest and is not the same as free.
+
+`vk mount anthropic` posts `/v1/messages` to `api.anthropic.com` over raw
+HTTPS (rustls, a connect timeout and a call timeout, and *with* the machine's
+proxy configuration honoured — the opposite of the Ollama adapter, because a
+proxy on the path to a public API is how many networks reach it at all and the
+manifest already says the register leaves the node). Header
+`anthropic-version: 2023-06-01`, `thinking: {"type":"adaptive"}`, no
+streaming, `max_tokens` bounded at 4096, and the answer is the response's
+`text` blocks concatenated — never `content[0]`, because a thinking block sits
+in front of them. Manifest: `jurisdiction: "US"`, `retention_days: Some(30)`.
+`vk mount bedrock` is the same models through Bedrock's `Converse` in
+`eu-central-1` or `eu-west-1` — **those two regions and no other, refused at
+the door**, because the manifest's `jurisdiction: "EU"` *is* the region —
+with `retention_days: None`, since AWS stores neither the inputs nor the
+outputs. Its transport is behind the `bedrock` cargo feature — on by
+default, at a measured 83 extra crates and about a minute of clean Windows
+build; a daemon built `--no-default-features` refuses that kind by name.
+
+**The key is in the OS keyring and in no other place.** Service `vk`, user
+`anthropic`, put there by `vk secret set anthropic`, which prompts with the
+terminal's echo off and never prints the value back. It is not in the mount
+spec — a spec is stored unencrypted in the metadata database, and
+`MountSpec::new` refuses a config carrying anything credential-shaped — not in
+a manifest, not in a log line and not in an error: every message these
+adapters produce is passed through a scrub that removes the key, the type that
+holds it prints as `SecretString(redacted)`, and its bytes are zeroed when the
+adapter is dropped. The daemon reads the keyring at mount and again whenever
+it re-creates a persisted arch at boot, which is what makes rotation a `vk
+secret set` and a restart. `vkd --anthropic-key-file` is the one file seam,
+for CI and for a headless node with no credential store; it is daemon
+configuration and no pipe client can name it.
+
+**I4′ on a provider that refuses rather than truncates.** The ceiling is the
+model's documented context window (1 000 000 for the Claude 5 family, from
+Anthropic's published tables; `--ctx` pins a smaller one), a prompt past nine
+tenths of it is refused before anything is sent, and the answer's own
+`usage.input_tokens` is checked against the ceiling afterwards. The pre-check
+count is the API's own `/v1/messages/count_tokens`, falling back to the
+`bytes/3 + 64` estimate when that call fails — a rate-limited counter should
+cost accuracy, not the inference. The estimate, not the API, is what
+`count_tokens` reports to the kernel's projection loop: that loop asks once per
+candidate line, and each of those would otherwise be an HTTPS round trip. The
+estimate runs high, so a prompt the kernel fitted by it is one the measured
+count also fits.
+
+**What has not been exercised.** There is no API key and no AWS credential on
+the machine these adapters were written on, so every test is against a
+loopback stand-in and **no call has ever been made to either provider**. For
+Bedrock in particular the request shape, the `eu.` cross-region
+inference-profile prefix and the credential-resolution path are pinned by unit
+tests and by AWS's documentation, and by nothing that has run.
+
 ### Ollama adapter
 
 The first **governed** arch, and the only one so far: the kernel starts the container itself (`docker run -d --name vk-ollama -p 127.0.0.1:11434:11434 -v vk-ollama:/root/.ollama --memory 12g --cpus 6 ollama/ollama:0.33.3`), so the inference is a process this node launched, capped at 12 GiB of memory and 6 CPUs, published on loopback only, with the weights in a volume it owns. `governed: true` is claimed only after the caps have been read *back* off the running container (`HostConfig.Memory`, `HostConfig.NanoCpus`): a container running without them is not a governor, whatever it was meant to be started with, and an existing `vk-ollama` whose image or caps are not the ones this mount asks for is refused rather than adopted — the remedy, `vk mount ollama --recreate`, replaces it and keeps the volume. A mount is also refused when a foreign process already answers on the published port while that container is stopped, because the identity would otherwise be read off somebody else's server.

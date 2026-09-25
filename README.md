@@ -59,7 +59,8 @@ table or, with `--json`, as the daemon's own answer.
 | `vk status` | `uname`: what this node is, and what its boot sequence found |
 | `vk ls PATH` | the namespace: `/arches`, `/tasks`, `/artefacts`, `/devices`, `/ledger` as directories |
 | `vk ps`, `vk top` | the scheduler: what every task is doing, what each arch has cost |
-| `vk mount mock NAME`, `vk mount claude-code`, `vk mount ollama --model TAG`, `vk umount ID` | drivers: an arch is a device this kernel drives — and, for `ollama`, a process it starts and caps |
+| `vk mount mock NAME`, `vk mount claude-code`, `vk mount anthropic`, `vk mount bedrock`, `vk mount ollama --model TAG`, `vk umount ID` | drivers: an arch is a device this kernel drives — and, for `ollama`, a process it starts and caps |
+| `vk secret set NAME` | the credential store: a secret this node's daemon reads, put in this account's OS keyring without ever being echoed or printed |
 | `vk task submit` / `step` / `show` | processes: a task is the unit of work, its register is its address space |
 | `vk stop [SCOPE]`, `vk resume ID` | signals: a STOP halts a scope until a human lifts it |
 | `vk approve ID [--passkey]` | the human ceremony: an approval of a kernel-minted challenge, signed by this node's device key or by a passkey in the browser (invariant I1) |
@@ -106,6 +107,62 @@ Inference happens on Anthropic's servers, so the manifest is honest about it:
 `governed: false`, `locality: cloud`, `jurisdiction: US`, 30-day retention, and
 a clearance that stops at Business and refuses third-party data. I2 will not
 lower anything above that into it. `contracts/tcb.md` says the same in prose.
+
+### Arches: Claude through the API, US and EU
+
+`vk mount claude-code` is the founder's. A **customer** node mounts the API
+arches instead: they carry a key, a per-token price, and — for the EU
+jurisdiction — a different host.
+
+```
+vk secret set anthropic                                 # prompts, no echo, keyring only
+vk mount anthropic                                      # claude-opus-5, US
+vk mount anthropic --model claude-sonnet-5 --ctx 200000 --max-tokens 2048
+vk mount bedrock --region eu-central-1                  # EU-hosted, Frankfurt or Dublin
+```
+
+The key lives in this account's OS keyring under `vk`/`anthropic` and nowhere
+else: not in the mount spec (which is stored unencrypted, and which the kernel
+refuses to build out of anything credential-shaped), not in a manifest, not in
+a log line, not in an error — every message these adapters produce has the key
+scrubbed out of it on the way. The daemon reads it at `vk mount anthropic` and
+again each time it re-creates that arch at boot, so rotating the key is `vk
+secret set anthropic` and a restart. A daemon that finds no key refuses the
+mount and prints the one line that fixes it. (`vkd --anthropic-key-file` reads
+it from a file instead, for CI and for a headless node whose OS has no
+credential store.)
+
+The two differ in exactly the things a manifest exists to say:
+
+| | `vk mount anthropic` | `vk mount bedrock` |
+|---|---|---|
+| host | `api.anthropic.com`, raw HTTPS | Amazon Bedrock `Converse` |
+| `jurisdiction` | `US` | `EU` — `eu-central-1` or `eu-west-1`, and no other |
+| `retention_days` | 30 | none: AWS keeps neither input nor output |
+| price | Anthropic's list price, in the manifest and per call | AWS's, which this node has not read, so none is claimed |
+
+Both are `governed: false`, `locality: cloud`, clearance capped at Business
+with third-party data refused, neither streams, and both bound one answer at
+4096 tokens. The first-party one sends `anthropic-version: 2023-06-01` and
+`thinking: {"type":"adaptive"}`; the Bedrock one sends the smallest `Converse`
+request that works, because it is the one that has never been exercised.
+
+Their **context ceiling is the model's documented window** — 1 000 000 tokens
+for the Claude 5 family — and a prompt past nine tenths of it is refused before
+anything is sent (I4′). The first-party arch counts the prompt with the API's
+own `/v1/messages/count_tokens` and falls back to the `bytes/3 + 64` estimate
+when that call fails; afterwards both check the answer's own
+`usage.input_tokens` against the ceiling. Unlike Ollama, this provider
+*refuses* an oversize prompt rather than truncating it, so the post-check is a
+belt to that suspender rather than the load-bearing one. `--ctx` pins a smaller
+ceiling for a node that wants one.
+
+`vk mount bedrock`'s transport is the AWS SDK, behind the `bedrock` cargo
+feature — **on by default**: it is 83 extra crates and about a minute on a
+clean Windows build (15 s to 1 m 15 s), which was the budget. A node that
+wants neither the SDK nor those crates in its supply chain builds
+`--no-default-features`, and a daemon without them refuses the mount by name
+and says how to get a build that has them.
 
 ### Arches: a model this kernel governs
 

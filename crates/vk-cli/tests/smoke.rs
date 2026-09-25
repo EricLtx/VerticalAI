@@ -2067,3 +2067,63 @@ fn vk_passkey_verbs_print_links_that_open_the_pages_and_approve_waits() {
         "the approval is on the record: {tail}"
     );
 }
+
+/// `vk secret set` is the one verb in this shell that handles a credential,
+/// and its three rules are testable without touching anybody's keyring: a
+/// name that is not one word is refused before anything is read, an empty
+/// value is refused before the keyring is opened at all, and neither refusal
+/// (nor the success line, which is not reached here) prints a value.
+///
+/// Deliberately no round trip through a real keyring. On this machine that
+/// would write to the founder's credential store, and on a headless Linux
+/// runner there is no secret service to write to — so what is pinned is the
+/// half that is this crate's, and the keyring half is `keyring`'s.
+#[test]
+fn vk_secret_set_refuses_a_bad_name_and_an_empty_value_without_touching_a_keyring() {
+    let bad_name = Command::new(vk_exe())
+        .args(["secret", "set", "two words", "--stdin"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vk");
+    assert!(
+        !bad_name.status.success(),
+        "a name with a space is not a name"
+    );
+    let err = String::from_utf8_lossy(&bad_name.stderr);
+    assert!(err.contains("one word"), "{err}");
+
+    // Nothing on stdin: `--stdin` reads end-of-file, which is not a secret.
+    // The service name is a throwaway, and nothing is written under it.
+    let empty = Command::new(vk_exe())
+        .args([
+            "secret",
+            "set",
+            "anthropic",
+            "--stdin",
+            "--service",
+            "vk-test-never-written",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run vk");
+    assert!(!empty.status.success(), "an empty value is not a secret");
+    let err = String::from_utf8_lossy(&empty.stderr);
+    assert!(err.contains("the keyring was not touched"), "{err}");
+}
+
+/// `vk mount bedrock` takes an EU region and no other: the manifest's
+/// `jurisdiction: EU` *is* the region, so naming somewhere else is refused by
+/// the shell before a daemon is even dialled.
+#[test]
+fn vk_mount_bedrock_refuses_a_region_outside_the_union() {
+    let refused = Command::new(vk_exe())
+        .args(["mount", "bedrock", "--region", "us-east-1"])
+        .output()
+        .expect("run vk");
+    assert!(!refused.status.success(), "us-east-1 is not an EU region");
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        err.contains("eu-central-1") && err.contains("eu-west-1"),
+        "{err}"
+    );
+}

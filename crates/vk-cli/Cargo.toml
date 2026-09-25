@@ -12,7 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 vk-contracts = { path = "../vk-contracts" }
-vk-ipc = { path = "../vk-ipc" }
+# The shell speaks to the daemon; it mounts no arch itself, so it has
+# no use for the AWS SDK behind `vk-ipc`'s default feature.
+vk-ipc = { path = "../vk-ipc", default-features = false }
 vk-kernel = { path = "../vk-kernel" }
 vk-store = { path = "../vk-store" }
 clap.workspace = true
@@ -20,6 +22,13 @@ serde_json.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 hex.workspace = true
+# `vk secret set` writes to this account's keyring, directly: no daemon is
+# involved, so the shell needs the same keyring this node's store uses.
+keyring.workspace = true
+# Reading a secret from the terminal with the echo off. Doing it by hand means
+# `SetConsoleMode` on Windows and termios on Unix, in this crate, for one
+# prompt; this is the crate everything else uses for it.
+rpassword = "7"
 
 [dev-dependencies]
 tempfile = "3"

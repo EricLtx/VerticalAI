@@ -33,6 +33,14 @@ pub struct Args {
     /// Node device key file, for tests and CI; without it the OS keyring holds it.
     #[arg(long)]
     pub node_key_file: Option<PathBuf>,
+    /// Anthropic API key file, for tests, CI and a headless node whose OS has
+    /// no credential store; without it the key comes from this account's
+    /// keyring, `vk`/`anthropic`, where `vk secret set anthropic` puts it.
+    /// One line, the key and nothing else. Daemon configuration only — no
+    /// pipe client can name it, because a client that could would be reading
+    /// the daemon's files with the daemon's rights.
+    #[arg(long)]
+    pub anthropic_key_file: Option<PathBuf>,
     /// SP1a convenience: enroll this node's own device key at first start, so
     /// the interactive machine can be the human this node knows. SP1b replaces
     /// it with the passkey enrolment ceremony.
@@ -293,11 +301,18 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
     // after the endpoint is answering, so the order is: lock → bind → boot →
     // serve, with re-creation alongside the serving (Task 1b review,
     // Important 1).
+    // Where an `anthropic` arch's key comes from, at mount and again every
+    // time a persisted one is re-created (SP1b Task 2b). The keyring unless
+    // the operator named a file.
+    let anthropic_keys = match &a.anthropic_key_file {
+        Some(p) => vk_arch_anthropic::KeySource::File(p.clone()),
+        None => vk_arch_anthropic::KeySource::Keyring,
+    };
     let mut kernel = vk_kernel::RealKernel::open_with_factory(
         &state_dir,
         key_source,
         &a.node_id,
-        vk_ipc::server::adapter_factory(state_dir.clone()),
+        vk_ipc::server::adapter_factory(state_dir.clone(), anthropic_keys.clone()),
     )?;
     // The endpoint before the record. Binding is the other way a start can be
     // refused — another daemon is serving this name — and a daemon that will
@@ -439,6 +454,7 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
             timeout: std::time::Duration::from_secs(a.harness_timeout_secs),
         },
         web: Some(Arc::new(LinkMinter(web.links))),
+        anthropic_keys,
     };
     vk_ipc::server::serve_on(kernel, listener, config).await
 }

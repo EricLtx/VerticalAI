@@ -525,6 +525,16 @@ pub fn mounted_roles(v: &Value) -> String {
     table(&["ROLE", "ARCH", "ID"], &rows)
 }
 
+/// `vk secret set`: the name it was stored under, and nothing else. The
+/// value is never rendered — not here, not anywhere.
+pub fn secret_set(v: &Value) -> String {
+    format!(
+        "stored in this account's keyring as {}/{}",
+        text(&v["service"]),
+        text(&v["name"])
+    )
+}
+
 pub fn stopped(v: &Value) -> String {
     format!("stopped; resume with: vk resume {}", text(&v["stop_id"]))
 }

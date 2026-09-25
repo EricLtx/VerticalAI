@@ -6,12 +6,21 @@ license.workspace = true
 repository.workspace = true
 description = "VerticalAI IPC: local transport between vk CLI and vkd"
 
+[features]
+# The EU arch's transport, passed straight through to `vk-arch-anthropic` —
+# whose own default is off here, so that `--no-default-features` on this crate
+# really does leave the AWS SDK out rather than having it arrive anyway
+# through the dependency's defaults.
+default = ["bedrock"]
+bedrock = ["vk-arch-anthropic/bedrock"]
+
 [dependencies]
 vk-contracts = { path = "../vk-contracts" }
 vk-kernel = { path = "../vk-kernel" }
 vk-harness = { path = "../vk-harness" }
 vk-arch-claude-code = { path = "../vk-arch-claude-code" }
 vk-arch-ollama = { path = "../vk-arch-ollama" }
+vk-arch-anthropic = { path = "../vk-arch-anthropic", default-features = false }
 vk-store = { path = "../vk-store" }
 tokio.workspace = true
 serde.workspace = true
@@ -44,3 +53,6 @@ windows = { version = "0.62", features = [
 
 [dev-dependencies]
 tempfile = "3"
+# The roundtrip test opens a kernel with this build's real adapter factory,
+# which needs the store's own key source.
+vk-store = { path = "../vk-store" }

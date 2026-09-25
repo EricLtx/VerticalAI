@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use vk_arch_anthropic::{AnthropicAdapter, AnthropicConfig, SecretString};
 use vk_arch_claude_code::{ClaudeCodeAdapter, ClaudeCodeConfig};
 use vk_arch_ollama::{ContainerSpec, OllamaAdapter, OllamaConfig};
 use vk_contracts::arch::ArchManifest;
@@ -42,6 +43,14 @@ pub struct ServerConfig {
     /// any: what `web.link` mints an addressed link into. `None` on a daemon
     /// started without them, and in every transport test.
     pub web: Option<Arc<dyn WebLinks>>,
+    /// Where the Anthropic API key comes from when an `anthropic` arch is
+    /// mounted (Task 2b): this account's keyring in every ordinary run, and a
+    /// file only under `vkd --anthropic-key-file`, which exists for tests, CI
+    /// and a headless node whose OS has no credential store. Daemon
+    /// configuration, never a request field — a pipe client that could name
+    /// the file the daemon reads a credential out of would be reading the
+    /// daemon's files with the daemon's rights.
+    pub anthropic_keys: vk_arch_anthropic::KeySource,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -50,6 +59,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("endpoint", &self.endpoint)
             .field("harness", &self.harness)
             .field("web", &self.web.as_ref().map(|w| w.origin()))
+            .field("anthropic_keys", &self.anthropic_keys)
             .finish()
     }
 }
@@ -62,6 +72,7 @@ impl ServerConfig {
             endpoint,
             harness: HarnessSettings::default(),
             web: None,
+            anthropic_keys: vk_arch_anthropic::KeySource::Keyring,
         }
     }
 }
@@ -496,6 +507,22 @@ fn dispatch(
         .then(|| ollama_adapter(&req.params["config"]))
         .transpose()
         .map_err(|e| bad(&format!("{e:#}")))?;
+    // And for the two API arches (Task 2b). Reading the key out of the OS
+    // keyring can block — on Linux it is a D-Bus round trip to a keyring that
+    // may still be locked — and resolving AWS credentials can reach the
+    // network for an instance role, so neither happens with the kernel lock
+    // held. The key is loaded here and moved into the adapter; it never goes
+    // near the mount spec, which is stored in the clear.
+    let anthropic_key = (req.method == "arch.mount" && req.params["kind"] == "anthropic")
+        .then(|| {
+            vk_arch_anthropic::load_key(&config.anthropic_keys, vk_arch_anthropic::KEYRING_USER)
+        })
+        .transpose()
+        .map_err(|e| bad(&format!("{e:#}")))?;
+    let bedrock = (req.method == "arch.mount" && req.params["kind"] == "bedrock")
+        .then(|| bedrock_adapter(&req.params["config"]))
+        .transpose()
+        .map_err(|e| bad(&format!("{e:#}")))?;
     // Handled before the general lock, and taking the kernel lock only in short
     // phases of its own: a harness run launches Claude Code and *waits* for it,
     // and the harness calls back over MCP (`harness.*`) while it runs — so a lock
@@ -652,6 +679,17 @@ fn dispatch(
                 // Already mounted, above, before the lock: all that is left
                 // here is to hand the kernel the adapter it produced.
                 "ollama" => Arc::new(ollama.ok_or_else(|| internal("no ollama adapter"))?),
+                // Claude through the API, on a key this daemon read out of
+                // its own keyring — never out of the request (Task 2b).
+                "anthropic" => {
+                    let key = anthropic_key.ok_or_else(|| internal("no anthropic key"))?;
+                    Arc::new(
+                        anthropic_adapter(key, &p["config"]).map_err(|e| bad(&format!("{e:#}")))?,
+                    )
+                }
+                // The EU one, already built above: its credentials were
+                // resolved before the lock.
+                "bedrock" => Arc::from(bedrock.ok_or_else(|| internal("no bedrock adapter"))?),
                 other => return Err(bad(&format!("no arch kind {other}"))),
             };
             let name = adapter.manifest().name.clone();
@@ -945,7 +983,10 @@ fn claude_code_version(config: &Value) -> anyhow::Result<String> {
 /// boot costs at worst one such timeout per arch. An error is an unavailable
 /// arch, never a boot that fails: an engine that is not running is not a
 /// reason for a node to stop serving everything else it has.
-pub fn adapter_factory(state_dir: std::path::PathBuf) -> vk_kernel::AdapterFactory {
+pub fn adapter_factory(
+    state_dir: std::path::PathBuf,
+    anthropic_keys: vk_arch_anthropic::KeySource,
+) -> vk_kernel::AdapterFactory {
     let mock = vk_kernel::mock_factory();
     Arc::new(move |spec: &MountSpec| -> Result<Box<dyn ArchAdapter>> {
         match spec.kind.as_str() {
@@ -959,9 +1000,89 @@ pub fn adapter_factory(state_dir: std::path::PathBuf) -> vk_kernel::AdapterFacto
                 )?))
             }
             "ollama" => Ok(Box::new(ollama_adapter(&spec.config)?)),
+            // The key is read again here rather than remembered from the
+            // mount: a spec is stored in the clear, so the keyring is the
+            // only place an API arch can come back from (Task 2b). A key
+            // rotated or removed since leaves this arch unavailable with a
+            // reason, which is the honest outcome and not a failed boot.
+            "anthropic" => {
+                let key =
+                    vk_arch_anthropic::load_key(&anthropic_keys, vk_arch_anthropic::KEYRING_USER)?;
+                Ok(Box::new(anthropic_adapter(key, &spec.config)?))
+            }
+            "bedrock" => bedrock_adapter(&spec.config),
             other => anyhow::bail!("no arch kind {other}"),
         }
     })
+}
+
+/// Build the first-party Anthropic adapter `arch.mount { kind: "anthropic" }`
+/// asks for. Everything in `config` is optional; the key is not in it and
+/// never can be — [`MountSpec::new`] refuses a config carrying anything
+/// credential-shaped, and this takes the key as its own argument, so there is
+/// no path by which one could arrive in a spec.
+fn anthropic_adapter(key: SecretString, config: &Value) -> anyhow::Result<AnthropicAdapter> {
+    let defaults = AnthropicConfig::default();
+    let cfg = AnthropicConfig {
+        model: string_of(config, "model", &defaults.model),
+        base_url: string_of(config, "base_url", &defaults.base_url),
+        max_tokens: u32_of(config, "max_tokens", defaults.max_tokens)?,
+        context_ceiling: u32_of(config, "context_ceiling", defaults.context_ceiling)?,
+        timeout: Duration::from_secs(u64::from(u32_of(
+            config,
+            "timeout_secs",
+            u32::try_from(defaults.timeout.as_secs()).unwrap_or(u32::MAX),
+        )?)),
+    };
+    Ok(AnthropicAdapter::with_config(key, cfg))
+}
+
+/// Build the EU adapter `arch.mount { kind: "bedrock" }` asks for. Slow: it
+/// resolves the AWS credential chain, which may reach the network for an
+/// instance role, so it is called before the kernel lock is taken.
+#[cfg(feature = "bedrock")]
+fn bedrock_adapter(config: &Value) -> anyhow::Result<Box<dyn ArchAdapter>> {
+    use vk_arch_anthropic::bedrock::{BedrockAdapter, BedrockConfig};
+    let defaults = BedrockConfig::default();
+    let cfg = BedrockConfig {
+        region: string_of(config, "region", &defaults.region),
+        model: string_of(config, "model", &defaults.model),
+        max_tokens: u32_of(config, "max_tokens", defaults.max_tokens)?,
+        context_ceiling: u32_of(config, "context_ceiling", defaults.context_ceiling)?,
+    };
+    Ok(Box::new(BedrockAdapter::with_config(cfg)?))
+}
+
+/// The same door on a build without the AWS SDK: refused by name, saying how
+/// to get a build that has it, rather than "no arch kind bedrock", which
+/// reads like a typo and is not one.
+#[cfg(not(feature = "bedrock"))]
+fn bedrock_adapter(_config: &Value) -> anyhow::Result<Box<dyn ArchAdapter>> {
+    anyhow::bail!(
+        "this build has no Bedrock support: it was built `--no-default-features`, which \
+         leaves out the `bedrock` cargo feature and the AWS SDK behind it. Rebuild with \
+         `--features bedrock`, or use `vk mount anthropic`, which needs no AWS SDK"
+    )
+}
+
+/// A whole number out of an adapter config, or the adapter's own default.
+fn u32_of(config: &Value, name: &str, fallback: u32) -> anyhow::Result<u32> {
+    match config.get(name) {
+        None | Some(Value::Null) => Ok(fallback),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| anyhow::anyhow!("{name} must be a whole number")),
+    }
+}
+
+/// A string out of an adapter config, or the adapter's own default.
+fn string_of(config: &Value, name: &str, fallback: &str) -> String {
+    config
+        .get(name)
+        .and_then(Value::as_str)
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 /// The spec `arch.mount` records for what it just mounted.

@@ -13,7 +13,9 @@ path = "src/main.rs"
 [dependencies]
 # The client half of the syscall transport: the façade is a bridge, MCP on
 # stdin/stdout for Claude Code and a `vk-ipc` client back to the daemon.
-vk-ipc = { path = "../vk-ipc" }
+# The harness's MCP facade dials the endpoint and mounts nothing, so it
+# does not want the AWS SDK behind `vk-ipc`'s default feature.
+vk-ipc = { path = "../vk-ipc", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 # `io-std` for the async stdin/stdout the MCP stdio transport reads and writes;
