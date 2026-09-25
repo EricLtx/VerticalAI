@@ -1,0 +1,20 @@
+{
+    "arches":  [
+                   {
+                       "arch_id":  "sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966",
+                       "name":  "ollama/gemma4:e4b",
+                       "state":  "ready"
+                   },
+                   {
+                       "arch_id":  "sha256:75d79f9198fa3e4db13d28f8b07808e4511728ccd5cb788da291afb5bacefbe8",
+                       "name":  "claude-code/claude-opus-5",
+                       "state":  "ready"
+                   },
+                   {
+                       "arch_id":  "sha256:b33b96ac7545895d7c23486f9691d2793e3c13f7f6de420f99f94ba3c4540049",
+                       "name":  "claude-code/claude-sonnet-5",
+                       "state":  "ready"
+                   }
+               ],
+    "type":  "arches"
+}

@@ -244,7 +244,8 @@ enum MountCmd {
 
 #[derive(Subcommand)]
 enum TaskCmd {
-    /// Submit a task: plan, draft, then optionally wait for a human and release.
+    /// Submit a task: plan, then draft (or a harness), then optionally judge,
+    /// wait for a human and release.
     Submit {
         #[arg(long)]
         goal: String,
@@ -253,8 +254,20 @@ enum TaskCmd {
         artefact: String,
         #[arg(long, value_name = "ARCH")]
         plan: String,
+        /// The arch that drafts the artefact. Either this or `--harness`: a
+        /// task needs exactly one step that produces what is approved.
+        #[arg(long, value_name = "ARCH", required_unless_present = "harness")]
+        draft: Option<String>,
+        /// Draft with a confined agent harness instead of an arch, by name
+        /// (`claude-code`). The step is run by `vk harness run <TASK>`, not by
+        /// `vk task step`, which says so when it reaches one.
+        #[arg(long, value_name = "NAME", conflicts_with = "draft")]
+        harness: Option<String>,
+        /// Have this arch judge the draft. Its verdict is raised into the
+        /// register's open questions, where a later step — or a reader — sees
+        /// it beside the artefact it is about.
         #[arg(long, value_name = "ARCH")]
-        draft: String,
+        judge: Option<String>,
         /// Wait for a human approval of the drafted artefact.
         #[arg(long)]
         approve: bool,
@@ -571,13 +584,23 @@ async fn task(cli: &Cli, c: &Client, what: &TaskCmd) -> Result<()> {
             artefact,
             plan,
             draft,
+            harness,
+            judge,
             approve,
             release,
         } => {
-            let mut steps = vec![
-                json!({ "kind": "plan", "arch_id": plan }),
-                json!({ "kind": "draft", "arch_id": draft }),
-            ];
+            let mut steps = vec![json!({ "kind": "plan", "arch_id": plan })];
+            // Exactly one of the two produces what is approved. Clap already
+            // refuses both and refuses neither; this match is what turns the
+            // one that was given into its step.
+            match (draft, harness) {
+                (Some(arch), _) => steps.push(json!({ "kind": "draft", "arch_id": arch })),
+                (None, Some(name)) => steps.push(json!({ "kind": "harness", "name": name })),
+                (None, None) => return Err(anyhow!("give --draft <ARCH> or --harness <NAME>")),
+            }
+            if let Some(arch) = judge {
+                steps.push(json!({ "kind": "judge", "arch_id": arch }));
+            }
             if *approve {
                 steps.push(json!({ "kind": "approve" }));
             }

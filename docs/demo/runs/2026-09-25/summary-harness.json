@@ -1,0 +1,105 @@
+{
+    "ctx":  16384,
+    "arches":  {
+                   "gemma":  "sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966",
+                   "claude_draft":  "sha256:b33b96ac7545895d7c23486f9691d2793e3c13f7f6de420f99f94ba3c4540049",
+                   "claude_judge":  "sha256:75d79f9198fa3e4db13d28f8b07808e4511728ccd5cb788da291afb5bacefbe8"
+               },
+    "roles":  "harness",
+    "export_root":  "C:\\Users\\ericl\\AppData\\Local\\Temp\\vk-demo-3728f9cf701f\\exports",
+    "approval":  "nodekey",
+    "state_dir":  "C:\\Users\\ericl\\AppData\\Local\\Temp\\vk-demo-3728f9cf701f",
+    "date":  "2026-09-25",
+    "node":  "node-1",
+    "model":  "gemma4:e4b",
+    "tokens_note":  "measured prompt tokens per call: runs[].steps[].tokens_in (vk task show) and *-top.json (vk top, per arch, with tokens_in_measured beside tokens_in). vk dmesg carries the two infer events per call and their payload hashes, not the payloads.",
+    "h1":  [
+
+           ],
+    "runs":  [
+                 {
+                     "label":  "01",
+                     "order":  "harness",
+                     "task":  "task-node-1-2",
+                     "register":  "reg-node-1-1",
+                     "plan_arch":  "sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966",
+                     "draft_arch":  "",
+                     "judge_arch":  "sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966",
+                     "harness":  "claude-code",
+                     "subject_hash":  "sha256:baaab3c4997c3f12eb0c55428e11bcf6a8a9009c7aa279b4c86ac8c434c2ddbf",
+                     "released":  "C:\\Users\\ericl\\AppData\\Local\\Temp\\vk-demo-3728f9cf701f\\exports\\out\\baaab3c4997c.proposal",
+                     "released_name":  "baaab3c4997c.proposal",
+                     "bytes":  7468,
+                     "sha256":  "903149f1583c97e4f255bd6c153e010a3e4cd7e6dcb5da9958058dfbf0e42892",
+                     "seconds_total":  429.9,
+                     "seconds_to_human":  429.8,
+                     "first_seq":  5,
+                     "ledger_len":  24,
+                     "steps":  [
+                                   {
+                                       "tokens_in":  1414,
+                                       "seconds":  200.7,
+                                       "who":  "sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966",
+                                       "kind":  "plan",
+                                       "status":  "done",
+                                       "index":  0
+                                   },
+                                   {
+                                       "tokens_in":  0,
+                                       "seconds":  null,
+                                       "who":  "claude-code",
+                                       "kind":  "harness",
+                                       "status":  "done",
+                                       "index":  1
+                                   },
+                                   {
+                                       "tokens_in":  2452,
+                                       "seconds":  170.6,
+                                       "who":  "sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966",
+                                       "kind":  "judge",
+                                       "status":  "done",
+                                       "index":  2
+                                   },
+                                   {
+                                       "tokens_in":  0,
+                                       "seconds":  null,
+                                       "who":  "",
+                                       "kind":  "approve",
+                                       "status":  "done",
+                                       "index":  3
+                                   },
+                                   {
+                                       "tokens_in":  0,
+                                       "seconds":  null,
+                                       "who":  "out",
+                                       "kind":  "release",
+                                       "status":  "done",
+                                       "index":  4
+                                   }
+                               ],
+                     "arch_counters":  {
+                                           "sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966":  {
+                                                                                                                           "calls":  2,
+                                                                                                                           "cost_list_usd":  0.0,
+                                                                                                                           "projected":  0,
+                                                                                                                           "tokens_in":  3866,
+                                                                                                                           "tokens_in_measured":  3866
+                                                                                                                       },
+                                           "sha256:75d79f9198fa3e4db13d28f8b07808e4511728ccd5cb788da291afb5bacefbe8":  {
+                                                                                                                           "calls":  0,
+                                                                                                                           "cost_list_usd":  0.0,
+                                                                                                                           "projected":  0,
+                                                                                                                           "tokens_in":  0,
+                                                                                                                           "tokens_in_measured":  0
+                                                                                                                       },
+                                           "sha256:b33b96ac7545895d7c23486f9691d2793e3c13f7f6de420f99f94ba3c4540049":  {
+                                                                                                                           "calls":  0,
+                                                                                                                           "cost_list_usd":  0.0,
+                                                                                                                           "projected":  0,
+                                                                                                                           "tokens_in":  0,
+                                                                                                                           "tokens_in_measured":  0
+                                                                                                                       }
+                                       }
+                 }
+             ]
+}

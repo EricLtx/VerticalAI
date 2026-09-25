@@ -1,0 +1,47 @@
+{
+    "arches":  {
+                   "sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966":  {
+                                                                                                   "calls":  1,
+                                                                                                   "cost_list_usd":  0.0,
+                                                                                                   "projected":  0,
+                                                                                                   "tokens_in":  1414,
+                                                                                                   "tokens_in_measured":  1414
+                                                                                               },
+                   "sha256:75d79f9198fa3e4db13d28f8b07808e4511728ccd5cb788da291afb5bacefbe8":  {
+                                                                                                   "calls":  1,
+                                                                                                   "cost_list_usd":  0.127455,
+                                                                                                   "projected":  0,
+                                                                                                   "tokens_in":  5769,
+                                                                                                   "tokens_in_measured":  5769
+                                                                                               },
+                   "sha256:b33b96ac7545895d7c23486f9691d2793e3c13f7f6de420f99f94ba3c4540049":  {
+                                                                                                   "calls":  1,
+                                                                                                   "cost_list_usd":  0.037358,
+                                                                                                   "projected":  0,
+                                                                                                   "tokens_in":  4108,
+                                                                                                   "tokens_in_measured":  4108
+                                                                                               }
+               },
+    "governed":  {
+                     "sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966":  true,
+                     "sha256:75d79f9198fa3e4db13d28f8b07808e4511728ccd5cb788da291afb5bacefbe8":  false,
+                     "sha256:b33b96ac7545895d7c23486f9691d2793e3c13f7f6de420f99f94ba3c4540049":  false
+                 },
+    "liveness":  {
+
+                 },
+    "states":  {
+                   "sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966":  "ready",
+                   "sha256:75d79f9198fa3e4db13d28f8b07808e4511728ccd5cb788da291afb5bacefbe8":  "ready",
+                   "sha256:b33b96ac7545895d7c23486f9691d2793e3c13f7f6de420f99f94ba3c4540049":  "ready"
+               },
+    "stopped_scopes":  [
+
+                       ],
+    "tasks":  {
+                  "task-node-1-2":  "done"
+              },
+    "unavailable":  {
+
+                    }
+}

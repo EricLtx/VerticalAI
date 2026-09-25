@@ -1,0 +1,776 @@
+[
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:bbc4356e3da326fed58f71b1ab22e026a2e4f7e2f13f1a2a5a38280e16ae17e0",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790326746833
+                },
+        "kind":  "device.enrolled",
+        "payload_hash":  "sha256:914fd6c244b785fea925727afe8bae543e975464412ae7b717b664d45d121e0f",
+        "prev_hash":  "sha256:genesis",
+        "retention":  "operational90d",
+        "seq":  0,
+        "wall_ms":  1790326746833
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:9506261e7973645c1a658466424d623673a7aab890cb61731418325e7ccc1802",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790326746834
+                },
+        "kind":  "boot",
+        "payload_hash":  "sha256:b5d835bc39b0175862d791c3cc7cd69c4253cc5c5d72a414a0129f149f22fd41",
+        "prev_hash":  "sha256:bbc4356e3da326fed58f71b1ab22e026a2e4f7e2f13f1a2a5a38280e16ae17e0",
+        "retention":  "operational90d",
+        "seq":  1,
+        "wall_ms":  1790326746834
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:f251e49acede1b78a35afef059733f592fb755d78a8d00ace04b1662f5676ce8",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790326750522
+                },
+        "kind":  "arch.mounted",
+        "payload_hash":  "sha256:0537feadad854ab65cdc147484518d6702fe14b89ef608ef07d42f27415f666e",
+        "prev_hash":  "sha256:9506261e7973645c1a658466424d623673a7aab890cb61731418325e7ccc1802",
+        "retention":  "operational90d",
+        "seq":  2,
+        "wall_ms":  1790326750522
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:ba94829a79ba66310b5d2f80ea6bd651a51e4769f90a045f366cffb866054ce5",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790326750830
+                },
+        "kind":  "arch.mounted",
+        "payload_hash":  "sha256:a137a93a6281f76d9e9ad7d51ec4249ed32c1e234968f73d6eede4105ea3719a",
+        "prev_hash":  "sha256:f251e49acede1b78a35afef059733f592fb755d78a8d00ace04b1662f5676ce8",
+        "retention":  "operational90d",
+        "seq":  3,
+        "wall_ms":  1790326750830
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:2f3e6e8cdaa47441fff4dde7d1193d8959dd8c7a0b2432e7484a69b645c763e0",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790326751152
+                },
+        "kind":  "arch.mounted",
+        "payload_hash":  "sha256:ccfdba0062f95676edc5e4f8397fb19f56df9643e16bd5ca7cd6d67619223f55",
+        "prev_hash":  "sha256:ba94829a79ba66310b5d2f80ea6bd651a51e4769f90a045f366cffb866054ce5",
+        "retention":  "operational90d",
+        "seq":  4,
+        "wall_ms":  1790326751152
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:22c6a7543f9432d4c79885245279b4c845942ce987278db21fd2489485c4fc9d",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790326751482
+                },
+        "kind":  "task.submitted",
+        "payload_hash":  "sha256:b20dacf277907370bc3e47d4034c708251fe439665ada467967fcb8f4cfaece1",
+        "prev_hash":  "sha256:2f3e6e8cdaa47441fff4dde7d1193d8959dd8c7a0b2432e7484a69b645c763e0",
+        "retention":  "operational90d",
+        "seq":  5,
+        "wall_ms":  1790326751482
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:b49ffff11c6fca6293d651db29704022db6c60b2fba14f756eaf384bd77d045c",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790326751543
+                },
+        "kind":  "infer",
+        "payload_hash":  "sha256:630e41c9b19735ce95b0057554d09475b3f46ad57d4cd2a8e646c64a972e48f8",
+        "prev_hash":  "sha256:22c6a7543f9432d4c79885245279b4c845942ce987278db21fd2489485c4fc9d",
+        "retention":  "operational90d",
+        "seq":  6,
+        "wall_ms":  1790326751543
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:8e58240cd9929682143d1035cd1eccce69fd7814bc617380704ef3fd50e20101",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790326896287
+                },
+        "kind":  "infer",
+        "payload_hash":  "sha256:00c7683763dc0ca4084811b1175898825611ad478c738360020122170e82b0e0",
+        "prev_hash":  "sha256:b49ffff11c6fca6293d651db29704022db6c60b2fba14f756eaf384bd77d045c",
+        "retention":  "operational90d",
+        "seq":  7,
+        "wall_ms":  1790326896287
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:dc54b357f9620d1b8985dd0380efd82b02f190494735f1f11cbdbf34a6bb7043",
+        "hlc":  {
+                    "counter":  1,
+                    "node":  "node-1",
+                    "wall_ms":  1790326896287
+                },
+        "kind":  "register.written",
+        "payload_hash":  "sha256:b20dacf277907370bc3e47d4034c708251fe439665ada467967fcb8f4cfaece1",
+        "prev_hash":  "sha256:8e58240cd9929682143d1035cd1eccce69fd7814bc617380704ef3fd50e20101",
+        "retention":  "operational90d",
+        "seq":  8,
+        "wall_ms":  1790326751543
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:9caf32ae70f7b33634d8bf17852b34a487e2e6e9dc658e78d1a93e02ca837b22",
+        "hlc":  {
+                    "counter":  2,
+                    "node":  "node-1",
+                    "wall_ms":  1790326896287
+                },
+        "kind":  "task.step",
+        "payload_hash":  "sha256:b249c9aadc937a438af255405cdfb817006e76ba45b7d0947af3b80b7e64ea9a",
+        "prev_hash":  "sha256:dc54b357f9620d1b8985dd0380efd82b02f190494735f1f11cbdbf34a6bb7043",
+        "retention":  "operational90d",
+        "seq":  9,
+        "wall_ms":  1790326751543
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:7df394fdb1638c522b995933a9c4fc32c68f7e16e02daa9b2b554d97729708f0",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790326896293
+                },
+        "kind":  "infer",
+        "payload_hash":  "sha256:fecece49c41c66ee82861634ad25f36c75d707b89ec12e41d88006c8891540eb",
+        "prev_hash":  "sha256:9caf32ae70f7b33634d8bf17852b34a487e2e6e9dc658e78d1a93e02ca837b22",
+        "retention":  "operational90d",
+        "seq":  10,
+        "wall_ms":  1790326896293
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:cab3cc3bd29f9f0201fe272a55b15aa565fb198229ccb8c7f5359e374956bdc9",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790326926659
+                },
+        "kind":  "infer",
+        "payload_hash":  "sha256:940af08ab99f8a6a4f82fcb7925364d07be47e0380c33a286db17b3b97807de2",
+        "prev_hash":  "sha256:7df394fdb1638c522b995933a9c4fc32c68f7e16e02daa9b2b554d97729708f0",
+        "retention":  "operational90d",
+        "seq":  11,
+        "wall_ms":  1790326926659
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:f4d88c01961620c0b86f6658b6fb5abb443f81f6c4a08a55087b1d8e9b6ab34e",
+        "hlc":  {
+                    "counter":  1,
+                    "node":  "node-1",
+                    "wall_ms":  1790326926659
+                },
+        "kind":  "register.written",
+        "payload_hash":  "sha256:b20dacf277907370bc3e47d4034c708251fe439665ada467967fcb8f4cfaece1",
+        "prev_hash":  "sha256:cab3cc3bd29f9f0201fe272a55b15aa565fb198229ccb8c7f5359e374956bdc9",
+        "retention":  "operational90d",
+        "seq":  12,
+        "wall_ms":  1790326896293
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:36c6e984fc28b1a2359060a92014b48824e7ca25b4bfcc023d1330d729e3e555",
+        "hlc":  {
+                    "counter":  2,
+                    "node":  "node-1",
+                    "wall_ms":  1790326926659
+                },
+        "kind":  "register.written",
+        "payload_hash":  "sha256:b20dacf277907370bc3e47d4034c708251fe439665ada467967fcb8f4cfaece1",
+        "prev_hash":  "sha256:f4d88c01961620c0b86f6658b6fb5abb443f81f6c4a08a55087b1d8e9b6ab34e",
+        "retention":  "operational90d",
+        "seq":  13,
+        "wall_ms":  1790326896293
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:291b86a3ff035f8310d6037717045ba1d3f6659249a417644ac937cc3753c656",
+        "hlc":  {
+                    "counter":  3,
+                    "node":  "node-1",
+                    "wall_ms":  1790326926659
+                },
+        "kind":  "task.step",
+        "payload_hash":  "sha256:68ede8e060a07d684ea717dec67722d72e2c0ada48fd9fe11c97d48d760cfd8b",
+        "prev_hash":  "sha256:36c6e984fc28b1a2359060a92014b48824e7ca25b4bfcc023d1330d729e3e555",
+        "retention":  "operational90d",
+        "seq":  14,
+        "wall_ms":  1790326896293
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:ae6edb1fe7506ee8ddcb487195749cd08425007ebde6cc49ea42cc4dea559c6d",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790326926673
+                },
+        "kind":  "infer",
+        "payload_hash":  "sha256:2925e7dbe323633adb9013755435c55cd0d563319ea5b45ad3afe189738316a6",
+        "prev_hash":  "sha256:291b86a3ff035f8310d6037717045ba1d3f6659249a417644ac937cc3753c656",
+        "retention":  "operational90d",
+        "seq":  15,
+        "wall_ms":  1790326926673
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:bf3bf72b3e6688d5711e813745e6bb2037064b1ad33e8886eaad0425dbea2c13",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790326969083
+                },
+        "kind":  "infer",
+        "payload_hash":  "sha256:01e99769a587e77937f45f5cb65a716720a26196ea4b0226c8decd0c26fd0231",
+        "prev_hash":  "sha256:ae6edb1fe7506ee8ddcb487195749cd08425007ebde6cc49ea42cc4dea559c6d",
+        "retention":  "operational90d",
+        "seq":  16,
+        "wall_ms":  1790326969083
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:1da208292cba42d3306177714f5f50d74251ad1362e77929c95e1af72f3c4427",
+        "hlc":  {
+                    "counter":  1,
+                    "node":  "node-1",
+                    "wall_ms":  1790326969083
+                },
+        "kind":  "register.written",
+        "payload_hash":  "sha256:b20dacf277907370bc3e47d4034c708251fe439665ada467967fcb8f4cfaece1",
+        "prev_hash":  "sha256:bf3bf72b3e6688d5711e813745e6bb2037064b1ad33e8886eaad0425dbea2c13",
+        "retention":  "operational90d",
+        "seq":  17,
+        "wall_ms":  1790326926673
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:ef905a593f8b2b0d2924cddcb61262bd48733bbe19e0a768fa46f3ea935b42ea",
+        "hlc":  {
+                    "counter":  2,
+                    "node":  "node-1",
+                    "wall_ms":  1790326969083
+                },
+        "kind":  "task.step",
+        "payload_hash":  "sha256:49d7bab6ec5029f9866c32775596c8ca4d350c2f308a8404d11e0cc4b179806a",
+        "prev_hash":  "sha256:1da208292cba42d3306177714f5f50d74251ad1362e77929c95e1af72f3c4427",
+        "retention":  "operational90d",
+        "seq":  18,
+        "wall_ms":  1790326926673
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:fc9ad77446709899a7409032991a4b490a08be5accc39074332335eec528ef20",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790326969088
+                },
+        "kind":  "task.step",
+        "payload_hash":  "sha256:3ca39f6b6d3f978cadaa5facb9da0586ae9a5ce94ad9edb3801e06a010e9076f",
+        "prev_hash":  "sha256:ef905a593f8b2b0d2924cddcb61262bd48733bbe19e0a768fa46f3ea935b42ea",
+        "retention":  "operational90d",
+        "seq":  19,
+        "wall_ms":  1790326969088
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:c95d45dfc194909d5e01faa6736c540545cb4ed7fd8116df076835fa8b215123",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790326969173
+                },
+        "kind":  "approval.recorded",
+        "payload_hash":  "sha256:cddd4dda474a9b9ea081ca0b91ab78c4bd899e554555a595321363bf3bb84641",
+        "prev_hash":  "sha256:fc9ad77446709899a7409032991a4b490a08be5accc39074332335eec528ef20",
+        "retention":  "operational90d",
+        "seq":  20,
+        "wall_ms":  1790326969173
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:79d5112960c1e32739bb4d698e36e3f994e6731f786525a2e4918e71470e9e64",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790326969264
+                },
+        "kind":  "task.step",
+        "payload_hash":  "sha256:3ca39f6b6d3f978cadaa5facb9da0586ae9a5ce94ad9edb3801e06a010e9076f",
+        "prev_hash":  "sha256:c95d45dfc194909d5e01faa6736c540545cb4ed7fd8116df076835fa8b215123",
+        "retention":  "operational90d",
+        "seq":  21,
+        "wall_ms":  1790326969264
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:5c4e0637987ce404bdb8bf4002d0141d22474d646d93f0b7360b28d09e475383",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790326969268
+                },
+        "kind":  "artefact.released",
+        "payload_hash":  "sha256:12332bd4cf1f0586b24b91ad35d190626face2eee6544d7ba259defa52c6af57",
+        "prev_hash":  "sha256:79d5112960c1e32739bb4d698e36e3f994e6731f786525a2e4918e71470e9e64",
+        "retention":  "operational90d",
+        "seq":  22,
+        "wall_ms":  1790326969268
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:6f21c6358653af677a93104904943d4b21b66580c8ebe078ce7e8421fce352f0",
+        "hlc":  {
+                    "counter":  1,
+                    "node":  "node-1",
+                    "wall_ms":  1790326969268
+                },
+        "kind":  "task.step",
+        "payload_hash":  "sha256:f737dd736cbf530cf041a72ade518b8a8d5944109d28b514cbda0e8aa94d2279",
+        "prev_hash":  "sha256:5c4e0637987ce404bdb8bf4002d0141d22474d646d93f0b7360b28d09e475383",
+        "retention":  "operational90d",
+        "seq":  23,
+        "wall_ms":  1790326969268
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:fe536392997b240c88c759df44e966109b54528ec3415608d87492744dd01ce1",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790326969832
+                },
+        "kind":  "task.submitted",
+        "payload_hash":  "sha256:135549894bceb9ecde08f7f5c4f363925d94f0687cc394b8084f3a28de3fe4f4",
+        "prev_hash":  "sha256:6f21c6358653af677a93104904943d4b21b66580c8ebe078ce7e8421fce352f0",
+        "retention":  "operational90d",
+        "seq":  24,
+        "wall_ms":  1790326969832
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:f387d85616082bde1ddace2fc289fa2d813143ed435e94836c0c46e7ade88473",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790326969875
+                },
+        "kind":  "infer",
+        "payload_hash":  "sha256:3d126e1fa06d9eca48b8292955de04d8b70aa98aa6b0de8603a32aefd6868c9f",
+        "prev_hash":  "sha256:fe536392997b240c88c759df44e966109b54528ec3415608d87492744dd01ce1",
+        "retention":  "operational90d",
+        "seq":  25,
+        "wall_ms":  1790326969875
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:38aecfb8e6eca32c6bac2f18f521f0c1f5e554216b1decc5393e211c8e03f521",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790327039465
+                },
+        "kind":  "infer",
+        "payload_hash":  "sha256:cb853e1bc95d83e6f9a4be592c97cd81ac59af98ba957b16eefc5ff746e81fb1",
+        "prev_hash":  "sha256:f387d85616082bde1ddace2fc289fa2d813143ed435e94836c0c46e7ade88473",
+        "retention":  "operational90d",
+        "seq":  26,
+        "wall_ms":  1790327039465
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:c03d868ffa549fd446f31b15dc5797b72af8b1d947418cd4ce034604f7fa4256",
+        "hlc":  {
+                    "counter":  1,
+                    "node":  "node-1",
+                    "wall_ms":  1790327039465
+                },
+        "kind":  "register.written",
+        "payload_hash":  "sha256:135549894bceb9ecde08f7f5c4f363925d94f0687cc394b8084f3a28de3fe4f4",
+        "prev_hash":  "sha256:38aecfb8e6eca32c6bac2f18f521f0c1f5e554216b1decc5393e211c8e03f521",
+        "retention":  "operational90d",
+        "seq":  27,
+        "wall_ms":  1790326969875
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:3dbd98f701fdc468875d5e2400565dfd2ad0aad06c1116b329552249c0552a6c",
+        "hlc":  {
+                    "counter":  2,
+                    "node":  "node-1",
+                    "wall_ms":  1790327039465
+                },
+        "kind":  "task.step",
+        "payload_hash":  "sha256:8d5b19ac17f9ac6ad951cda44f9e0c424d2917c121eed3257d880e74785e7197",
+        "prev_hash":  "sha256:c03d868ffa549fd446f31b15dc5797b72af8b1d947418cd4ce034604f7fa4256",
+        "retention":  "operational90d",
+        "seq":  28,
+        "wall_ms":  1790326969875
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:696d3b779f5aeaf5375ea5347be6764e8713c3c70bec5874b4f5b7469b895378",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790327039471
+                },
+        "kind":  "infer",
+        "payload_hash":  "sha256:9064cda434fe035152c9378b7cd0c490afa20605128ba874c0f0dc4eec9eeb35",
+        "prev_hash":  "sha256:3dbd98f701fdc468875d5e2400565dfd2ad0aad06c1116b329552249c0552a6c",
+        "retention":  "operational90d",
+        "seq":  29,
+        "wall_ms":  1790327039471
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:999a425d92eda568898ab1ca7623d0a473f4faf7f8abbf085d2f3b667a1aa6e3",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790327230895
+                },
+        "kind":  "infer",
+        "payload_hash":  "sha256:33e828828243f58c3733c6d1a16f8631fbf9150f489111428a79bd0fca49b67a",
+        "prev_hash":  "sha256:696d3b779f5aeaf5375ea5347be6764e8713c3c70bec5874b4f5b7469b895378",
+        "retention":  "operational90d",
+        "seq":  30,
+        "wall_ms":  1790327230895
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:60bf8f7cfb6a9cf039f16246408c41bc950dae9438749e228849f6e38629e4db",
+        "hlc":  {
+                    "counter":  1,
+                    "node":  "node-1",
+                    "wall_ms":  1790327230895
+                },
+        "kind":  "register.written",
+        "payload_hash":  "sha256:135549894bceb9ecde08f7f5c4f363925d94f0687cc394b8084f3a28de3fe4f4",
+        "prev_hash":  "sha256:999a425d92eda568898ab1ca7623d0a473f4faf7f8abbf085d2f3b667a1aa6e3",
+        "retention":  "operational90d",
+        "seq":  31,
+        "wall_ms":  1790327039471
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:71a99cef0285c41b84a51ffbfb3f2ca12fd0aebafcf9bb70721b1836f3cc09b5",
+        "hlc":  {
+                    "counter":  2,
+                    "node":  "node-1",
+                    "wall_ms":  1790327230895
+                },
+        "kind":  "register.written",
+        "payload_hash":  "sha256:135549894bceb9ecde08f7f5c4f363925d94f0687cc394b8084f3a28de3fe4f4",
+        "prev_hash":  "sha256:60bf8f7cfb6a9cf039f16246408c41bc950dae9438749e228849f6e38629e4db",
+        "retention":  "operational90d",
+        "seq":  32,
+        "wall_ms":  1790327039471
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:4c3bc86f7477742082d22fbe089af9674deca218683e1f277418b3aed5547ea5",
+        "hlc":  {
+                    "counter":  3,
+                    "node":  "node-1",
+                    "wall_ms":  1790327230895
+                },
+        "kind":  "task.step",
+        "payload_hash":  "sha256:4a443cbdcad37fca6e30722664e8d8231cc05ec2b71abfa8c36a05be4d91f428",
+        "prev_hash":  "sha256:71a99cef0285c41b84a51ffbfb3f2ca12fd0aebafcf9bb70721b1836f3cc09b5",
+        "retention":  "operational90d",
+        "seq":  33,
+        "wall_ms":  1790327039471
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:a35aba74e1046ebd6f24ca7075caa4a726127d2945c4bd5fd4402c7f3f06155e",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790327230905
+                },
+        "kind":  "infer",
+        "payload_hash":  "sha256:df79ba514214ee414f64cc5d0b0ee5505fccde0280cbd60cafe37de685565762",
+        "prev_hash":  "sha256:4c3bc86f7477742082d22fbe089af9674deca218683e1f277418b3aed5547ea5",
+        "retention":  "operational90d",
+        "seq":  34,
+        "wall_ms":  1790327230905
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:805b2bd518ab9214eb9d1ead6cd30b0a6af9e88a211c2593982cb644249da69d",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790327454602
+                },
+        "kind":  "infer",
+        "payload_hash":  "sha256:ad44af4d5f77b4a62fedb550da6521e93d4254e4b4ecfa88af897139b4b9a47e",
+        "prev_hash":  "sha256:a35aba74e1046ebd6f24ca7075caa4a726127d2945c4bd5fd4402c7f3f06155e",
+        "retention":  "operational90d",
+        "seq":  35,
+        "wall_ms":  1790327454602
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:a278476875407361459f42feafb975afa3f1f8d23c4306595791dc6160ffc876",
+        "hlc":  {
+                    "counter":  1,
+                    "node":  "node-1",
+                    "wall_ms":  1790327454602
+                },
+        "kind":  "register.written",
+        "payload_hash":  "sha256:135549894bceb9ecde08f7f5c4f363925d94f0687cc394b8084f3a28de3fe4f4",
+        "prev_hash":  "sha256:805b2bd518ab9214eb9d1ead6cd30b0a6af9e88a211c2593982cb644249da69d",
+        "retention":  "operational90d",
+        "seq":  36,
+        "wall_ms":  1790327230905
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:b148ab2e8bbb385d62cba8344fdd06c763b60278ccdf2bd564c7c0357d452ea9",
+        "hlc":  {
+                    "counter":  2,
+                    "node":  "node-1",
+                    "wall_ms":  1790327454602
+                },
+        "kind":  "task.step",
+        "payload_hash":  "sha256:82f417aff43a02a32f99c7d78a30fa443712a30c3196faa5b55f79d570ecde62",
+        "prev_hash":  "sha256:a278476875407361459f42feafb975afa3f1f8d23c4306595791dc6160ffc876",
+        "retention":  "operational90d",
+        "seq":  37,
+        "wall_ms":  1790327230905
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:c0757e0dd0fe0058eb0d5e20274025cbc1ec11ff2ecfda89d291258e31cd711c",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790327454609
+                },
+        "kind":  "task.step",
+        "payload_hash":  "sha256:8c96a24af72c46733edeecbb516e75d3731745e798babacd8ada5a3e4f4b9831",
+        "prev_hash":  "sha256:b148ab2e8bbb385d62cba8344fdd06c763b60278ccdf2bd564c7c0357d452ea9",
+        "retention":  "operational90d",
+        "seq":  38,
+        "wall_ms":  1790327454609
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:459f99d1159bd43742678fbfc61158587cf2ee801333f045e72c84bea0be9077",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790327454674
+                },
+        "kind":  "approval.recorded",
+        "payload_hash":  "sha256:bb3116e5e6a4c980f167d4dcdbd3660e57f80c7f8de54beb7857b3aa2e4106c4",
+        "prev_hash":  "sha256:c0757e0dd0fe0058eb0d5e20274025cbc1ec11ff2ecfda89d291258e31cd711c",
+        "retention":  "operational90d",
+        "seq":  39,
+        "wall_ms":  1790327454674
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:a8fba048d2b648f4213cb3329a7ab0f9520dcd690fb5d16b6636e8dd90e6ec2e",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790327454744
+                },
+        "kind":  "task.step",
+        "payload_hash":  "sha256:8c96a24af72c46733edeecbb516e75d3731745e798babacd8ada5a3e4f4b9831",
+        "prev_hash":  "sha256:459f99d1159bd43742678fbfc61158587cf2ee801333f045e72c84bea0be9077",
+        "retention":  "operational90d",
+        "seq":  40,
+        "wall_ms":  1790327454744
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:87b9a13343c3499e47a956c09d7621484d247dd89945ea7dee17b6f8929a653e",
+        "hlc":  {
+                    "counter":  0,
+                    "node":  "node-1",
+                    "wall_ms":  1790327454750
+                },
+        "kind":  "artefact.released",
+        "payload_hash":  "sha256:fddd61147b0bc86f13b3e83cdacc539cf4599bf2cdcdb1cc30c4b80441610569",
+        "prev_hash":  "sha256:a8fba048d2b648f4213cb3329a7ab0f9520dcd690fb5d16b6636e8dd90e6ec2e",
+        "retention":  "operational90d",
+        "seq":  41,
+        "wall_ms":  1790327454750
+    },
+    {
+        "causal_heads":  [
+
+                         ],
+        "clock_quality":  "synced",
+        "hash":  "sha256:e58c7cf65fbb1796a26172ebbdc2bb114f361ddb53038825fea0acbd3070c903",
+        "hlc":  {
+                    "counter":  1,
+                    "node":  "node-1",
+                    "wall_ms":  1790327454750
+                },
+        "kind":  "task.step",
+        "payload_hash":  "sha256:dfff85f26661f31ec7d4335795c0e2b398445383dfec75be1aad8ae4fb3dee6e",
+        "prev_hash":  "sha256:87b9a13343c3499e47a956c09d7621484d247dd89945ea7dee17b6f8929a653e",
+        "retention":  "operational90d",
+        "seq":  42,
+        "wall_ms":  1790327454750
+    }
+]

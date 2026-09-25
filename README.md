@@ -212,6 +212,26 @@ Serving under `--force` is itself on the record: the daemon appends a
 `boot.forced` event naming the verdict it overrode, and `vk status` marks the
 node `forced boot`, next to the chain line, for as long as that process runs.
 
+### The SP1 demo
+
+`scripts/demo-sp1.ps1` is the milestone end to end, and the shortest way to see
+what this is for: a client proposal written from a two-page brief by **Gemma in
+a container this kernel caps** and **Claude through the installed Claude Code**,
+co-working through one register, approved by a human ceremony and released as a
+file — then the same brief again with the two models' roles swapped, and nine
+checks that the register did not care which was which (H1).
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\demo-sp1.ps1
+```
+
+Twelve minutes, a throwaway state directory, file keys, a private endpoint and
+an OS-chosen web port, so it never touches the node you already have. The
+recorded runs — both orders, the harness variant, the two proposals, the
+ledgers and the H1 verdict — are in `docs/demo/runs/2026-09-25/`, and
+`docs/demo/README.md` says what to expect, what it needs, and how to run the
+Windows Hello variant by hand.
+
 ### Running as a Windows service
 
 A node that belongs to the machine rather than to a logged-in shell:
@@ -356,6 +376,8 @@ vk ls /arches
 
 vk task submit --goal "Draft a proposal for Acme" --artefact proposal \
       --plan $ARCH --draft $ARCH --approve --release out      # TASK=task-node-1-2
+# --judge $ARCH adds a judging step after the draft; --harness claude-code
+# drafts with the confined agent instead of an arch (`vk harness run` runs it).
 vk task step $TASK --all                # runs until it waits: status waiting_human
 vk ps
 vk task show $TASK                      # the same task in full, with where it writes

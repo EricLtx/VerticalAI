@@ -1,0 +1,233 @@
+{
+    "ctx":  16384,
+    "arches":  {
+                   "gemma":  "sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966",
+                   "claude_draft":  "sha256:b33b96ac7545895d7c23486f9691d2793e3c13f7f6de420f99f94ba3c4540049",
+                   "claude_judge":  "sha256:75d79f9198fa3e4db13d28f8b07808e4511728ccd5cb788da291afb5bacefbe8"
+               },
+    "roles":  "gemma-plans",
+    "export_root":  "C:\\Users\\ericl\\AppData\\Local\\Temp\\vk-demo-44a8d3d82801\\exports",
+    "approval":  "nodekey",
+    "state_dir":  "C:\\Users\\ericl\\AppData\\Local\\Temp\\vk-demo-44a8d3d82801",
+    "date":  "2026-09-25",
+    "node":  "node-1",
+    "model":  "gemma4:e4b",
+    "tokens_note":  "measured prompt tokens per call: runs[].steps[].tokens_in (vk task show) and *-top.json (vk top, per arch, with tokens_in_measured beside tokens_in). vk dmesg carries the two infer events per call and their payload hashes, not the payloads.",
+    "h1":  [
+               {
+                   "detail":  "step 0 plan=sha256:b33b96ac7545895d7c23486f9691d2793e3c13f7f6de420f99f94ba3c4540049; step 1 draft=sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966",
+                   "pass":  true,
+                   "check":  "run 2 names both arches on consecutive steps"
+               },
+               {
+                   "detail":  "run 1 plan=sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966 draft=sha256:b33b96ac7545895d7c23486f9691d2793e3c13f7f6de420f99f94ba3c4540049; run 2 plan=sha256:b33b96ac7545895d7c23486f9691d2793e3c13f7f6de420f99f94ba3c4540049 draft=sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966",
+                   "pass":  true,
+                   "check":  "run 2 is the swap of run 1"
+               },
+               {
+                   "detail":  "run 1 done/done/done; run 2 done/done/done",
+                   "pass":  true,
+                   "check":  "every inference step is done"
+               },
+               {
+                   "detail":  "sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966: 1414 prompt tokens planning from the goal alone, 3470 drafting from the goal plus a decision",
+                   "pass":  true,
+                   "check":  "the plan left a decision the drafter read (arch B)"
+               },
+               {
+                   "detail":  "sha256:b33b96ac7545895d7c23486f9691d2793e3c13f7f6de420f99f94ba3c4540049: 2427 prompt tokens planning from the goal alone, 4108 drafting from the goal plus a decision",
+                   "pass":  true,
+                   "check":  "the plan left a decision the drafter read (arch A)"
+               },
+               {
+                   "detail":  "run 1 draft 4108 -\u003e judge 5769; run 2 draft 3470 -\u003e judge 4443",
+                   "pass":  true,
+                   "check":  "the draft left a decision the judge read"
+               },
+               {
+                   "detail":  "4789 bytes and 4417 bytes, each the register\u0027s last decision",
+                   "pass":  true,
+                   "check":  "the draft decision is the file that was released"
+               },
+               {
+                   "detail":  "reg-node-1-1 vs reg-node-1-3",
+                   "pass":  true,
+                   "check":  "run 1\u0027s register is not run 2\u0027s"
+               },
+               {
+                   "detail":  "run 2 released exactly one file, 9b1b29ade477.proposal, and it is not run 1\u0027s 02de32f3cec2.proposal",
+                   "pass":  true,
+                   "check":  "run 1\u0027s decisions are absent from run 2\u0027s register"
+               }
+           ],
+    "runs":  [
+                 {
+                     "label":  "01",
+                     "order":  "gemma-plans",
+                     "task":  "task-node-1-2",
+                     "register":  "reg-node-1-1",
+                     "plan_arch":  "sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966",
+                     "draft_arch":  "sha256:b33b96ac7545895d7c23486f9691d2793e3c13f7f6de420f99f94ba3c4540049",
+                     "judge_arch":  "sha256:75d79f9198fa3e4db13d28f8b07808e4511728ccd5cb788da291afb5bacefbe8",
+                     "harness":  "",
+                     "subject_hash":  "sha256:02de32f3cec20ddf939bb93f34db37225f690e9b086c7ec14ed15d30f7a6c0e6",
+                     "released":  "C:\\Users\\ericl\\AppData\\Local\\Temp\\vk-demo-44a8d3d82801\\exports\\out\\02de32f3cec2.proposal",
+                     "released_name":  "02de32f3cec2.proposal",
+                     "bytes":  4789,
+                     "sha256":  "86973e0b085c379a170d358a5ae15dd8ab7d3c25a74f467dd51e14105941aaf8",
+                     "seconds_total":  217.8,
+                     "seconds_to_human":  217.6,
+                     "first_seq":  5,
+                     "ledger_len":  24,
+                     "steps":  [
+                                   {
+                                       "tokens_in":  1414,
+                                       "seconds":  144.7,
+                                       "who":  "sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966",
+                                       "kind":  "plan",
+                                       "status":  "done",
+                                       "index":  0
+                                   },
+                                   {
+                                       "tokens_in":  4108,
+                                       "seconds":  30.4,
+                                       "who":  "sha256:b33b96ac7545895d7c23486f9691d2793e3c13f7f6de420f99f94ba3c4540049",
+                                       "kind":  "draft",
+                                       "status":  "done",
+                                       "index":  1
+                                   },
+                                   {
+                                       "tokens_in":  5769,
+                                       "seconds":  42.4,
+                                       "who":  "sha256:75d79f9198fa3e4db13d28f8b07808e4511728ccd5cb788da291afb5bacefbe8",
+                                       "kind":  "judge",
+                                       "status":  "done",
+                                       "index":  2
+                                   },
+                                   {
+                                       "tokens_in":  0,
+                                       "seconds":  null,
+                                       "who":  "",
+                                       "kind":  "approve",
+                                       "status":  "done",
+                                       "index":  3
+                                   },
+                                   {
+                                       "tokens_in":  0,
+                                       "seconds":  null,
+                                       "who":  "out",
+                                       "kind":  "release",
+                                       "status":  "done",
+                                       "index":  4
+                                   }
+                               ],
+                     "arch_counters":  {
+                                           "sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966":  {
+                                                                                                                           "calls":  1,
+                                                                                                                           "cost_list_usd":  0.0,
+                                                                                                                           "projected":  0,
+                                                                                                                           "tokens_in":  1414,
+                                                                                                                           "tokens_in_measured":  1414
+                                                                                                                       },
+                                           "sha256:75d79f9198fa3e4db13d28f8b07808e4511728ccd5cb788da291afb5bacefbe8":  {
+                                                                                                                           "calls":  1,
+                                                                                                                           "cost_list_usd":  0.127455,
+                                                                                                                           "projected":  0,
+                                                                                                                           "tokens_in":  5769,
+                                                                                                                           "tokens_in_measured":  5769
+                                                                                                                       },
+                                           "sha256:b33b96ac7545895d7c23486f9691d2793e3c13f7f6de420f99f94ba3c4540049":  {
+                                                                                                                           "calls":  1,
+                                                                                                                           "cost_list_usd":  0.037358,
+                                                                                                                           "projected":  0,
+                                                                                                                           "tokens_in":  4108,
+                                                                                                                           "tokens_in_measured":  4108
+                                                                                                                       }
+                                       }
+                 },
+                 {
+                     "label":  "02",
+                     "order":  "claude-plans",
+                     "task":  "task-node-1-4",
+                     "register":  "reg-node-1-3",
+                     "plan_arch":  "sha256:b33b96ac7545895d7c23486f9691d2793e3c13f7f6de420f99f94ba3c4540049",
+                     "draft_arch":  "sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966",
+                     "judge_arch":  "sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966",
+                     "harness":  "",
+                     "subject_hash":  "sha256:9b1b29ade477dd82e4dd5b0e5cf25fdfff1424f4a8dc878b0a4e8219dddec9b2",
+                     "released":  "C:\\Users\\ericl\\AppData\\Local\\Temp\\vk-demo-44a8d3d82801\\exports\\out\\9b1b29ade477.proposal",
+                     "released_name":  "9b1b29ade477.proposal",
+                     "bytes":  4417,
+                     "sha256":  "8f909e2909faf0c998dd4da2715665e55793d31bf9fc674fc6740476062e3ce7",
+                     "seconds_total":  484.9,
+                     "seconds_to_human":  484.8,
+                     "first_seq":  24,
+                     "ledger_len":  43,
+                     "steps":  [
+                                   {
+                                       "tokens_in":  2427,
+                                       "seconds":  69.6,
+                                       "who":  "sha256:b33b96ac7545895d7c23486f9691d2793e3c13f7f6de420f99f94ba3c4540049",
+                                       "kind":  "plan",
+                                       "status":  "done",
+                                       "index":  0
+                                   },
+                                   {
+                                       "tokens_in":  3470,
+                                       "seconds":  191.4,
+                                       "who":  "sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966",
+                                       "kind":  "draft",
+                                       "status":  "done",
+                                       "index":  1
+                                   },
+                                   {
+                                       "tokens_in":  4443,
+                                       "seconds":  223.7,
+                                       "who":  "sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966",
+                                       "kind":  "judge",
+                                       "status":  "done",
+                                       "index":  2
+                                   },
+                                   {
+                                       "tokens_in":  0,
+                                       "seconds":  null,
+                                       "who":  "",
+                                       "kind":  "approve",
+                                       "status":  "done",
+                                       "index":  3
+                                   },
+                                   {
+                                       "tokens_in":  0,
+                                       "seconds":  null,
+                                       "who":  "out",
+                                       "kind":  "release",
+                                       "status":  "done",
+                                       "index":  4
+                                   }
+                               ],
+                     "arch_counters":  {
+                                           "sha256:1feae34711f87a9a16ed70fc0f480ffa949ca00c52ce007dcea0b1a58c70c966":  {
+                                                                                                                           "calls":  3,
+                                                                                                                           "cost_list_usd":  0.0,
+                                                                                                                           "projected":  0,
+                                                                                                                           "tokens_in":  9327,
+                                                                                                                           "tokens_in_measured":  9327
+                                                                                                                       },
+                                           "sha256:75d79f9198fa3e4db13d28f8b07808e4511728ccd5cb788da291afb5bacefbe8":  {
+                                                                                                                           "calls":  1,
+                                                                                                                           "cost_list_usd":  0.127455,
+                                                                                                                           "projected":  0,
+                                                                                                                           "tokens_in":  5769,
+                                                                                                                           "tokens_in_measured":  5769
+                                                                                                                       },
+                                           "sha256:b33b96ac7545895d7c23486f9691d2793e3c13f7f6de420f99f94ba3c4540049":  {
+                                                                                                                           "calls":  2,
+                                                                                                                           "cost_list_usd":  0.104922,
+                                                                                                                           "projected":  0,
+                                                                                                                           "tokens_in":  6535,
+                                                                                                                           "tokens_in_measured":  6535
+                                                                                                                       }
+                                       }
+                 }
+             ]
+}

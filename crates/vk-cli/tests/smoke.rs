@@ -972,6 +972,105 @@ fn vk_harness_run_drives_a_stand_in_to_an_attached_proposal() {
     assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
 }
 
+/// `vk task submit --judge` and `--harness`: the two step kinds the kernel has
+/// always run but the shell could not ask for (found writing the SP1 demo,
+/// which needs `[Plan, Draft, Judge, Approve, Release]` and, in harness mode,
+/// `[Plan, Harness, Judge, Approve, Release]`).
+///
+/// One daemon, two tasks: the judge step runs on a mock arch and the harness
+/// step is only *reached*, because running it is `vk harness run`'s job — and
+/// that refusal, naming the verb that does run it, is the thing a script
+/// driving `--all` has to be able to rely on.
+#[test]
+fn vk_task_submit_builds_judge_and_harness_steps() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+    let arch = str_of(&sh.json(&["mount", "mock", "m1", "--json"]), "arch_id").to_string();
+
+    // Plan, draft, judge, approve, release — the demo's shape.
+    let judged = sh.json(&[
+        "task",
+        "submit",
+        "--goal",
+        "Draft a proposal for Acme",
+        "--artefact",
+        "proposal",
+        "--plan",
+        &arch,
+        "--draft",
+        &arch,
+        "--judge",
+        &arch,
+        "--approve",
+        "--release",
+        "out",
+        "--json",
+    ]);
+    let kinds: Vec<&str> = judged["steps"]
+        .as_array()
+        .expect("steps")
+        .iter()
+        .map(|s| str_of(&s["kind"], "kind"))
+        .collect();
+    assert_eq!(
+        kinds,
+        ["plan", "draft", "judge", "approve", "release"],
+        "{judged}"
+    );
+    assert_eq!(judged["steps"][2]["kind"]["arch_id"], arch, "{judged}");
+
+    // It runs: the judge step is done before the task waits for its human.
+    let task = str_of(&judged, "id").to_string();
+    let waiting = sh.json(&["task", "step", &task, "--all", "--json"]);
+    assert_eq!(waiting["status"], "waiting_human", "{waiting}");
+    assert_eq!(waiting["steps"][2]["status"], "done", "{waiting}");
+
+    // The harness shape, up to the step the generic scheduler will not run.
+    let harnessed = sh.json(&[
+        "task",
+        "submit",
+        "--goal",
+        "Draft a proposal with the harness",
+        "--artefact",
+        "proposal",
+        "--plan",
+        &arch,
+        "--harness",
+        "claude-code",
+        "--judge",
+        &arch,
+        "--approve",
+        "--release",
+        "out",
+        "--json",
+    ]);
+    assert_eq!(harnessed["steps"][1]["kind"]["kind"], "harness");
+    assert_eq!(harnessed["steps"][1]["kind"]["name"], "claude-code");
+    let task = str_of(&harnessed, "id").to_string();
+    let refused = sh.run(&["task", "step", &task, "--all"]);
+    assert!(!refused.status.success(), "a harness step is not stepped");
+    let why = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        why.contains(&format!("vk harness run {task}")),
+        "the refusal names the verb that does run it: {why}"
+    );
+    // Refused before the row was touched: the plan ran, nothing failed.
+    let shown = sh.json(&["task", "show", &task, "--json"]);
+    assert_eq!(shown["steps"][0]["status"], "done", "{shown}");
+    assert_eq!(shown["steps"][1]["status"], "pending", "{shown}");
+    assert_ne!(shown["status"], "failed", "{shown}");
+}
+
 fn path_of(p: &std::path::Path) -> String {
     p.to_str().expect("utf-8 path").to_string()
 }
