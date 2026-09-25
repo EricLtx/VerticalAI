@@ -419,6 +419,7 @@ pub fn task(v: &Value) -> String {
         return head;
     }
     let mut releases = array(v, "release_paths").iter();
+    let decisions = array(v, "decisions");
     let rows = steps
         .iter()
         .enumerate()
@@ -438,14 +439,31 @@ pub fn task(v: &Value) -> String {
                 text(&kind["kind"]),
                 step_status(&s["status"]),
                 text(&s["tokens"]),
+                decisions_cell(decisions, i),
                 detail,
             ]
         })
         .collect::<Vec<_>>();
     format!(
         "{head}\n\n{}",
-        table(&["#", "STEP", "STATUS", "TOKENS", "DETAIL"], &rows)
+        table(
+            &["#", "STEP", "STATUS", "TOKENS", "DECISIONS", "DETAIL"],
+            &rows
+        )
     )
+}
+
+/// What the register's `decisions` held once step `i` had run: `<count> (<n> B)`
+/// — how many there were and how long the newest one is (Ruling 28). Never the
+/// decision itself: `task.show` reports a count, a length and a hash, and the
+/// text stays behind the register's label. A step that raises no decision, or a
+/// step that has not run, gets a dash.
+fn decisions_cell(decisions: &[Value], i: usize) -> String {
+    decisions
+        .iter()
+        .find(|d| d["after_step"].as_u64() == Some(i as u64))
+        .map(|d| format!("{} ({} B)", text(&d["count"]), text(&d["last_len_bytes"])))
+        .unwrap_or_else(|| "-".into())
 }
 
 /// Where a task's release steps write, resolved under the kernel's export root.
@@ -838,6 +856,41 @@ mod tests {
         assert!(rendered.contains(&paths[0]), "{rendered}");
         // Without them, the step still says where it was asked to write.
         assert!(super::task(&task).contains("out"));
+    }
+
+    /// Ruling 28: the per-step `decisions` summary is on the screen a person
+    /// reads, not only in `--json`. A count and a length, never the text, and a
+    /// dash for the steps that raised nothing.
+    #[test]
+    fn a_step_shows_what_it_left_in_the_register() {
+        let task = json!({
+            "id": "task-1", "goal": "g", "artefact_type": "proposal",
+            "status": "waiting_human", "register": "reg-1",
+            "steps": [
+                {"kind": {"kind": "plan", "arch_id": "arch-a"}, "status": "done", "tokens": 1414},
+                {"kind": {"kind": "draft", "arch_id": "arch-b"}, "status": "done", "tokens": 4108},
+                {"kind": {"kind": "approve"}, "status": "waiting_human", "tokens": 0},
+            ],
+            "decisions": [
+                {"after_step": 0, "count": 1, "last_len_bytes": 1847, "last_hash": "sha256:aa"},
+                {"after_step": 1, "count": 2, "last_len_bytes": 4772, "last_hash": "sha256:bb"},
+            ],
+        });
+        let rendered = super::task(&task);
+        assert!(rendered.contains("DECISIONS"), "{rendered}");
+        assert!(rendered.contains("1 (1847 B)"), "{rendered}");
+        assert!(rendered.contains("2 (4772 B)"), "{rendered}");
+        // The approve step raised nothing, so it claims nothing.
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l.contains("approve") && l.contains('-')),
+            "{rendered}"
+        );
+        // A task from a daemon that does not send the field still renders.
+        let mut bare = task.clone();
+        bare.as_object_mut().unwrap().remove("decisions");
+        assert!(super::task(&bare).contains("arch-a"));
     }
 
     /// An unavailable arch is on every screen an operator reads, with its

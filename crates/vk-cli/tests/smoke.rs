@@ -1035,6 +1035,39 @@ fn vk_task_submit_builds_judge_and_harness_steps() {
     assert_eq!(waiting["status"], "waiting_human", "{waiting}");
     assert_eq!(waiting["steps"][2]["status"], "done", "{waiting}");
 
+    // Ruling 28: `vk task show --json` carries, per step, what that step left
+    // in the register's `decisions` — which is H1's own check, asserted rather
+    // than inferred from prompt-token growth. The plan left one, the draft left
+    // a second, and the judge raised an open question so it left none. Metadata
+    // only: a count, a byte length and a hash, never a decision's text.
+    let shown = sh.json(&["task", "show", &task, "--json"]);
+    let decisions = shown["decisions"].as_array().expect("decisions").clone();
+    assert_eq!(
+        decisions
+            .iter()
+            .map(|d| d["after_step"].as_u64().expect("after_step"))
+            .collect::<Vec<_>>(),
+        vec![0, 1],
+        "the plan and the draft raise decisions; the judge does not: {shown}"
+    );
+    for (i, d) in decisions.iter().enumerate() {
+        assert_eq!(d["count"], i as u64 + 1, "{shown}");
+        assert!(
+            d["last_len_bytes"].as_u64().expect("last_len_bytes") > 0,
+            "a non-empty decision after step {i}: {shown}"
+        );
+        let hash = str_of(d, "last_hash");
+        assert!(hash.starts_with("sha256:"), "{shown}");
+        assert_eq!(hash.len(), 7 + 64, "{shown}");
+    }
+    assert_ne!(
+        decisions[0]["last_hash"], decisions[1]["last_hash"],
+        "the draft's decision is not the plan's: {shown}"
+    );
+    // And the human screen says it too, without saying what was decided.
+    let table = sh.ok(&["task", "show", &task]);
+    assert!(table.contains("DECISIONS"), "{table}");
+
     // The harness shape, up to the step the generic scheduler will not run.
     let harnessed = sh.json(&[
         "task",

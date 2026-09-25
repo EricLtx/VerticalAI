@@ -51,6 +51,34 @@ pub enum StepKind {
     Release { to_dir: String },
 }
 
+impl StepKind {
+    /// Does running this step push a decision onto the register? The other side
+    /// of `arch::raise`: `plan` and `draft` do, `judge` raises an open question
+    /// instead, and the three non-inference kinds raise nothing. A harness may
+    /// write one of its own through `harness.write_decision`, but that is the
+    /// agent's act inside the step, not the step's own, so it does not count
+    /// here — `task_decisions` stops rather than misattribute one.
+    fn raises_decision(&self) -> bool {
+        matches!(self, StepKind::Plan { .. } | StepKind::Draft { .. })
+    }
+}
+
+/// How the register's `decisions` stood once one step had finished: how many
+/// there were, and the length and hash of the newest. **Metadata only, never a
+/// decision's text** (Ruling 28) — the text is the register's, under the
+/// register's label, and `task.show` is a task read surface, not a register
+/// one. A non-zero `count` with a non-zero `last_len_bytes` is what "the plan
+/// left a decision the drafter read" means when it is asserted rather than
+/// inferred.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DecisionsAfterStep {
+    /// The index into `Task::steps` of the step this state was reached by.
+    pub after_step: usize,
+    pub count: usize,
+    pub last_len_bytes: usize,
+    pub last_hash: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StepStatus {
@@ -342,6 +370,56 @@ impl RealKernel {
     /// for one whose label the caller is not cleared for, indistinguishably.
     pub fn task(&self, ctx: &Ctx, id: &str) -> Option<Task> {
         self.task_row(id).filter(|t| self.visible_to(ctx, t))
+    }
+
+    /// What each of a task's steps left in its register's `decisions` — and
+    /// nothing of what any of them says (Ruling 28).
+    ///
+    /// A task read surface could not answer "did the plan leave the drafter
+    /// something to read?" at all before this: `decisions` is a field of
+    /// `Register`, and the only verb that reads a register is the lease-gated
+    /// `harness.read_register`. So H1's own check had to be inferred from
+    /// prompt-token growth. This answers it directly, in metadata only — a
+    /// count, a byte length and a hash. The text stays behind the register's
+    /// label, because that is what the label is for.
+    ///
+    /// Read through `read_register`, so the register's label must flow to the
+    /// caller's clearance (I2) exactly as for a register read: a count and a
+    /// hash are smaller facts about a register, not lesser ones.
+    ///
+    /// Attribution is `arch::raise`'s rule read back: `plan` pushes one
+    /// decision, every other inference role but `judge` pushes one, and
+    /// `judge` pushes an open question instead — so the n-th finished step that
+    /// raises a decision owns the n-th decision. Steps that raise none get no
+    /// entry. A register holding fewer decisions than its finished steps
+    /// account for — a harness that wrote its own through
+    /// `harness.write_decision`, a register some later verb edits — ends the
+    /// walk instead of guessing, so an entry here is never about a decision
+    /// some other step made.
+    pub fn task_decisions(
+        &mut self,
+        ctx: &Ctx,
+        task: &Task,
+    ) -> Result<Vec<DecisionsAfterStep>, KernelError> {
+        let reg = <Self as Kernel>::read_register(self, ctx, &task.register)?;
+        let mut out = Vec::new();
+        let mut count = 0usize;
+        for (i, step) in task.steps.iter().enumerate() {
+            if step.status != StepStatus::Done || !step.kind.raises_decision() {
+                continue;
+            }
+            count += 1;
+            let Some(decision) = reg.decisions.get(count - 1) else {
+                break;
+            };
+            out.push(DecisionsAfterStep {
+                after_step: i,
+                count,
+                last_len_bytes: decision.len(),
+                last_hash: vk_contracts::hash_bytes(decision.as_bytes()),
+            });
+        }
+        Ok(out)
     }
 
     /// What a human approval of this task has to name as its subject: the
@@ -1370,6 +1448,123 @@ mod tests {
         );
         let path = k.export_root().join("out").join(&name);
         assert!(path.exists(), "{}", path.display());
+    }
+
+    /// Ruling 28: `task_decisions` is the task read surface that answers H1's
+    /// own question — did this step leave the next one something to read? — in
+    /// metadata only.
+    ///
+    /// The shape the SP1 demo submits, `[Plan(A), Draft(B), Judge(B)]`: the
+    /// plan's decision is there after step 0, the draft's after step 1, and the
+    /// judge raises an *open question*, not a decision, so it gets no entry. A
+    /// step that has not run gets none either — a count is a fact about work
+    /// that happened.
+    #[test]
+    fn task_decisions_reports_a_count_a_length_and_a_hash_per_step_and_never_the_text() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let arch = k.register_arch(crate::tests::local(personal()));
+        let t = k
+            .create_task(
+                &machine(1),
+                "Draft a proposal for Acme",
+                "proposal",
+                Label::bottom(),
+                vec![
+                    StepKind::Plan {
+                        arch_id: arch.clone(),
+                    },
+                    StepKind::Draft {
+                        arch_id: arch.clone(),
+                    },
+                    StepKind::Judge { arch_id: arch },
+                ],
+            )
+            .unwrap();
+
+        // Nothing has run: nothing to report, and no error either.
+        assert!(k.task_decisions(&machine(2), &t).unwrap().is_empty());
+
+        // The plan.
+        let t = k.run_task_step(&machine(3), &t.id).unwrap();
+        let after_plan = k.task_decisions(&machine(4), &t).unwrap();
+        assert_eq!(after_plan.len(), 1, "{after_plan:?}");
+        assert_eq!(after_plan[0].after_step, 0);
+        assert_eq!(after_plan[0].count, 1);
+        assert!(after_plan[0].last_len_bytes > 0, "{after_plan:?}");
+        assert!(
+            after_plan[0].last_hash.starts_with("sha256:"),
+            "{after_plan:?}"
+        );
+
+        // The draft, then the judge. Two decisions, growing; the judge's
+        // verdict is an open question and adds no entry.
+        let t = k.run_task_step(&machine(5), &t.id).unwrap();
+        let t = k.run_task_step(&machine(6), &t.id).unwrap();
+        assert!(matches!(t.steps[2].status, StepStatus::Done));
+        let all = k.task_decisions(&machine(7), &t).unwrap();
+        assert_eq!(
+            all.iter().map(|d| d.after_step).collect::<Vec<_>>(),
+            vec![0, 1],
+            "the judge raises an open question, not a decision: {all:?}"
+        );
+        assert_eq!(all[1].count, 2, "{all:?}");
+        assert_ne!(all[0].last_hash, all[1].last_hash, "{all:?}");
+
+        // The hashes and lengths are of the real decisions, and the summary
+        // carries neither their text nor anything derived from it but a digest.
+        let reg = k.read_register(&machine(8), &t.register).unwrap();
+        assert_eq!(reg.decisions.len(), 2);
+        assert_eq!(all[0].last_len_bytes, reg.decisions[0].len());
+        assert_eq!(all[1].last_len_bytes, reg.decisions[1].len());
+        assert_eq!(
+            all[1].last_hash,
+            vk_contracts::hash_bytes(reg.decisions[1].as_bytes())
+        );
+        let json = serde_json::to_string(&all).unwrap();
+        for decision in &reg.decisions {
+            assert!(
+                !json.contains(decision.trim()),
+                "a decision's text reached the summary: {json}"
+            );
+        }
+    }
+
+    /// I2 on the summary, as on every other register read: a count and a hash
+    /// are smaller facts about a register, not lesser ones, so a caller who
+    /// cannot read the register learns neither.
+    #[test]
+    fn task_decisions_refuses_a_register_above_the_callers_clearance() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let arch = k.register_arch(crate::tests::local(personal()));
+        let t = k
+            .create_task(
+                &machine(1),
+                "the confidential goal",
+                "note",
+                Label {
+                    scope: Scope::Business,
+                    data_class: DataClass::Own,
+                    origins: Default::default(),
+                },
+                vec![StepKind::Plan { arch_id: arch }],
+            )
+            .unwrap();
+        let t = k.run_task_step(&machine(2), &t.id).unwrap();
+        assert_eq!(k.task_decisions(&machine(3), &t).unwrap().len(), 1);
+
+        let low = Ctx {
+            clearance: Clearance {
+                max_scope: Scope::Public,
+                third_party_allowed: true,
+            },
+            ..machine(4)
+        };
+        assert!(matches!(
+            k.task_decisions(&low, &t),
+            Err(KernelError::I2(_))
+        ));
     }
 
     /// A subject answered before the task is at its `Approve` step would name a

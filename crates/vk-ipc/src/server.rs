@@ -812,12 +812,24 @@ fn dispatch(
                 .map_err(kerr)
                 .and_then(to_value)
         }
+        // A task, plus what each of its steps left in the register's
+        // `decisions` — a count, a length and a hash per step, never the text
+        // (Ruling 28). `decisions` is a field of `Register`, so this is the one
+        // place a caller with no lease learns that a step left the next one
+        // something to read; the summary is computed through `read_register`,
+        // under the same I2 check, so a register the caller is not cleared for
+        // yields no counts either. It rides on the task object rather than
+        // beside it because it is per step, and the steps are there.
         "task.show" => {
             let ctx = ctx_for(&k, presence, now)?;
             let id = p["task_id"].as_str().ok_or_else(|| bad("task_id"))?;
-            k.task(&ctx, id)
-                .ok_or_else(|| not_found(id))
-                .and_then(to_value)
+            let task = k.task(&ctx, id).ok_or_else(|| not_found(id))?;
+            let decisions = k.task_decisions(&ctx, &task).map_err(kerr)?;
+            let mut out = to_value(task)?;
+            if let Some(o) = out.as_object_mut() {
+                o.insert("decisions".into(), to_value(decisions)?);
+            }
+            Ok(out)
         }
         "task.ls" => {
             let ctx = ctx_for(&k, presence, now)?;

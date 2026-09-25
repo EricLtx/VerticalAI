@@ -218,7 +218,7 @@ node `forced boot`, next to the chain line, for as long as that process runs.
 what this is for: a client proposal written from a two-page brief by **Gemma in
 a container this kernel caps** and **Claude through the installed Claude Code**,
 co-working through one register, approved by a human ceremony and released as a
-file — then the same brief again with the two models' roles swapped, and nine
+file — then the same brief again with the two models' roles swapped, and ten
 checks that the register did not care which was which (H1).
 
 ```

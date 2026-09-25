@@ -29,34 +29,51 @@ read what it does before you spend the twelve minutes.
 | **The file** | `<export_root>/out/<hash12>.proposal`, owner-only, plaintext, outside the encrypted tier. |
 
 Then the same brief again, as a **new task with a new register**, with A and B
-exchanged. Nine checks then ask whether H1 holds.
+exchanged. Ten checks then ask whether H1 holds.
 
 ### H1: one register, either model in either role
 
 The script does not take H1 on trust. It checks, from the shell alone:
 
 1. Run 2 names both arches on **consecutive** steps (`plan`, then `draft`).
-2. Run 2's roles are the **swap** of run 1's.
-3. Every inference step in both runs is `done`.
-4. **The plan left a decision the drafter read (arch B).** This is the
+2. **Each of those two steps left a non-empty `decision` in the register**, and
+   the draft's is not the plan's — and the same in run 1. This is the brief's
+   own H1 check, and it is asserted, not inferred: `vk task show` reports per
+   step how many decisions the register held once that step had run, how long
+   the newest one is and its hash (Ruling 28). Metadata only — the text of a
+   decision stays behind the register's label, where `harness.read_register` is
+   the only verb that reaches it. Checks 4 and 5 then say the same thing a
+   second way, from the other side, in the two models' own tokenizers.
+3. Run 2's roles are the **swap** of run 1's.
+4. Every inference step in both runs is `done`.
+5. **The plan left a decision the drafter read (arch B).** This is the
    load-bearing one, and it is measured rather than asserted. Run 2's draft and
    run 1's plan are *the same arch* over *the same goal*; the only difference
    between the two prompts is the plan decision run 2's register carried into
    it. Prompt tokens are the arch's own count, so
    `run2.draft.tokens_in > run1.plan.tokens_in` is the local model saying, in
    its own tokenizer, that it read what the cloud model wrote into the IR.
-5. **The plan left a decision the drafter read (arch A)** — the same claim in
+6. **The plan left a decision the drafter read (arch A)** — the same claim in
    the other direction, in the cloud model's tokenizer:
    `run1.draft.tokens_in > run2.plan.tokens_in`.
-6. **The draft left a decision the judge read**, the same way, in both runs.
-7. **The draft decision is the file that was released.** A `Draft` step
+7. **The draft left a decision the judge read**, the same way, in both runs.
+8. **The draft decision is the file that was released.** A `Draft` step
    attaches `decisions.last()` byte for byte, which is why every released
    proposal begins `draft:`. A non-empty file is a non-empty decision.
-8. **Run 1's register is not run 2's** — two ids.
-9. **Run 1's decisions are absent from run 2's register.** A `Release` step
-   writes *every* artefact its register holds, so "run 2 released exactly one
-   new file, and it is not run 1's" is the check: had anything of run 1's
-   register been in run 2's, run 2 would have released two files.
+9. **Run 1's register is not run 2's** — two ids.
+10. **Run 1's decisions are absent from run 2's register** — two different
+    artefacts, neither containing the other. The stronger statement, that each
+    run released *exactly one new file*, is asserted per run as it happens
+    rather than here: a `Release` step writes every artefact its register holds,
+    so had anything of run 1's register been in run 2's, run 2 would have
+    released two files and failed on the spot.
+
+**On the recorded runs and check 2.** The runs in `runs/2026-09-25/` were made
+before `task.show` reported `decisions`, so their `*-task.json` carries no such
+field and their H1 block has nine checks, not ten. For those runs the claim rests
+on checks 5–8 — the token deltas and the `draft:` prefix — which is the same
+substance by a longer route. Every run from here carries the field, and the
+per-step table prints it.
 
 ## Before you run it
 
@@ -125,13 +142,14 @@ pulled), 2026-09-25:
 
 Three Claude calls over the pair, USD 0.23 at list price and nothing billed
 (`cost_list_usd` in `*-top.json`). Nothing at all for the Gemma calls: a model
-on this machine has no list price, and the record says `null` rather than
-zero.
+on this machine has no list price, so the record says `0.0` — the field is an
+`f64`, not an optional — and the `vk top` *table* leaves the cell blank rather
+than print a zero a reader could mistake for a measurement.
 
 Each run prints its ledger tail, the file it released with its size and
 SHA-256, and a per-step table: which arch ran it, the prompt tokens **the arch
-itself counted**, and how long the call took. Then the nine H1 checks, then a
-summary. A failed H1 check fails the script.
+itself counted**, what it left in the register, and how long the call took.
+Then the ten H1 checks, then a summary. A failed H1 check fails the script.
 
 ## What this demo shows, and what it does not
 
@@ -182,7 +200,7 @@ Under `docs/demo/runs/<date>/`, one set per run:
 
 | file | what it is |
 |---|---|
-| `<n>-<order>-task.json` | `vk task show --json`: every step, its status, and its **measured** `tokens` — the prompt as the arch counted it |
+| `<n>-<order>-task.json` | `vk task show --json`: every step, its status, its **measured** `tokens` — the prompt as the arch counted it — and `decisions`, what each step left in the register (count, byte length, hash; never the text) |
 | `<n>-<order>-top.json` | `vk top --json`: per arch, `calls`, `tokens_in`, `tokens_in_measured` and `cost_list_usd` |
 | `<n>-<order>-dmesg.json` | `vk dmesg --json`: the whole chain, every event, with its hash and its payload hash |
 | `<n>-<order>-dmesg.txt` | the last 40 events as `vk dmesg` prints them |
@@ -190,16 +208,18 @@ Under `docs/demo/runs/<date>/`, one set per run:
 | `arches.json` | `vk ls /arches --json` after both mounts |
 | `summary-<roles>.json` | the invocation's runs side by side: timings, tokens, hashes, the H1 verdict |
 
-**On token counts in `vk dmesg`.** Two `infer` events go on the chain per model
-call — one when the prompt leaves the kernel, one when the answer comes back —
-and the second's payload carries `tokens_in`, `measured`, `cost_list_usd` and
-the arch's own `details` (for Ollama: `prompt_eval_count`, `eval_count`, the
-container image and both caps; for Claude Code: the input/cache/output token
-breakdown and the API duration). But **the ledger commits to the hash of that
-payload, never to the payload** — `payload_hash`, spec §3.9, "commits to
-ciphertext, never to plaintext". So the numbers are *committed to* in `dmesg`
-and *reported* by `vk task show` (per call) and `vk top` (per arch), which is
-where the saved records carry them. Output tokens (`eval_count`,
+**Where the measured token counts live: `vk task show` and `vk top`, not
+`vk dmesg`.** Two `infer` events go on the chain per model call — one when the
+prompt leaves the kernel, one when the answer comes back — and the second's
+payload carries `tokens_in`, `measured`, `cost_list_usd` and the arch's own
+`details` (for Ollama: `prompt_eval_count`, `eval_count`, the container image
+and both caps; for Claude Code: the input/cache/output token breakdown and the
+API duration). But **the ledger commits to the hash of that payload, never to
+the payload** — `payload_hash`, spec §3.9, "commits to ciphertext, never to
+plaintext". So no number appears in `vk dmesg` and none can: what `dmesg` holds
+is the *commitment* to it. The numbers themselves are read from
+`vk task show` (per call) and `vk top` (per arch), which is where the saved
+records carry them. Output tokens (`eval_count`,
 `output_tokens`) are inside that hashed payload and are not on any read
 surface today; if they should be, that is a kernel change and not a script's
 to make.

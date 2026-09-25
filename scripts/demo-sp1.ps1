@@ -127,7 +127,13 @@ function Invoke-Native {
         # Let the child write straight to this console instead of capturing it:
         # for `vk approve --passkey`, whose whole output is a link a person has
         # to see while it is still waiting.
-        [switch] $Interactive
+        [switch] $Interactive,
+        # Capture stdout, but leave stderr on this console. `vk approve
+        # --passkey --json` puts the link on stderr and its answer on stdout
+        # exactly so that a script can have both: the person sees the link the
+        # moment it is minted, and the script still reads back the subject hash
+        # the kernel signed.
+        [switch] $PassStdErr
     )
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $FilePath
@@ -143,9 +149,11 @@ function Invoke-Native {
     }
     if (-not $Interactive) {
         $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError = $true
         $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
-        $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+        if (-not $PassStdErr) {
+            $psi.RedirectStandardError = $true
+            $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+        }
     }
     $p = New-Object System.Diagnostics.Process
     $p.StartInfo = $psi
@@ -156,13 +164,14 @@ function Invoke-Native {
         $p.WaitForExit()
     }
     else {
-        # Both streams at once: a child that fills a pipe nobody is reading
+        # Read before waiting: a child that fills a pipe nobody is reading
         # blocks for ever, and `vk dmesg --json` is long enough to.
         $outTask = $p.StandardOutput.ReadToEndAsync()
-        $errTask = $p.StandardError.ReadToEndAsync()
+        $errTask = $null
+        if (-not $PassStdErr) { $errTask = $p.StandardError.ReadToEndAsync() }
         $p.WaitForExit()
         $out = $outTask.Result
-        $err = $errTask.Result
+        if ($null -ne $errTask) { $err = $errTask.Result }
     }
     $code = $p.ExitCode
     $p.Dispose()
@@ -170,8 +179,9 @@ function Invoke-Native {
 }
 
 function Invoke-Vk {
-    param([string[]] $Arguments, [switch] $Interactive)
-    return Invoke-Native -FilePath $script:Vk -Arguments $Arguments -Interactive:$Interactive
+    param([string[]] $Arguments, [switch] $Interactive, [switch] $PassStdErr)
+    return Invoke-Native -FilePath $script:Vk -Arguments $Arguments `
+        -Interactive:$Interactive -PassStdErr:$PassStdErr
 }
 
 # `vk …`, which must succeed. The refusal, not a stack trace: a syscall this
@@ -203,6 +213,19 @@ function Write-Utf8 {
 function Write-Json {
     param([string] $Path, $Value)
     Write-Utf8 -Path $Path -Text (ConvertTo-Json -InputObject $Value -Depth 24)
+}
+
+# The state directory, out of a path that is about to be written down. The
+# records are committed to a public repository and the throwaway node lives
+# under `%TEMP%`, so every path in them would otherwise publish the account
+# name and the machine's layout. The file names stay: they are the evidence —
+# a released artefact is named for the first twelve hex of the hash that was
+# approved. A literal .NET replace, not `-replace`: the needle is full of
+# backslashes.
+function Hide-StateDir {
+    param([string] $Path)
+    if (-not $Path) { return $Path }
+    return $Path.Replace($StateDir, '<state_dir>')
 }
 
 function Write-Head {
@@ -277,6 +300,7 @@ Write-Fact 'state dir' $StateDir
 Write-Fact 'endpoint' $Endpoint
 
 $BootPid = 0
+$MountedOllama = $false
 $Ok = $false
 
 # ------------------------------------------------------------- the two runs --
@@ -343,17 +367,23 @@ function Invoke-DemoRun {
     # The ceremony. Either way what is signed is a challenge this kernel minted
     # for this task — never one the shell chose (invariant I1).
     Write-Head ("run {0}: the human ceremony ({1})" -f $Label, $Approval)
+    # Either way the subject is read back and recorded, so the variant with a
+    # human in it does not record *less* than the scripted one: the released
+    # file is checked against the hash that was actually signed, below.
     $subject = ''
     if ($Approval -eq 'passkey') {
         Write-Host '   open the link below and confirm with Windows Hello.' -ForegroundColor Yellow
-        $r = Invoke-Vk -Arguments @('approve', $task, '--passkey', '--timeout', '900') -Interactive
+        $r = Invoke-Vk -PassStdErr -Arguments @(
+            'approve', $task, '--passkey', '--timeout', '900', '--json')
         if ($r.ExitCode -ne 0) { throw "the passkey approval of $task did not land" }
+        $approved = $r.StdOut | ConvertFrom-Json
     }
     else {
         $approved = Use-VkJson -Arguments @('approve', $task)
-        $subject = $approved.subject_hash
-        Write-Fact 'approved' $subject
     }
+    $subject = $approved.subject_hash
+    if (-not $subject) { throw "the approval of $task named no subject" }
+    Write-Fact 'approved' $subject
 
     Write-Host '   stepping to done...'
     $done = Use-VkJson -Arguments @('task', 'step', $task, '--all')
@@ -374,16 +404,24 @@ function Invoke-DemoRun {
     $bytes = (Get-Item -LiteralPath $releasedPath).Length
     if ($bytes -le 0) { throw "the released artefact $releasedPath is empty" }
     if ($releasedName -notlike '*.proposal') { throw "not a .proposal: $releasedName" }
-    if ($subject) {
-        $expected = ($subject -replace '^sha256:', '').Substring(0, 12) + '.proposal'
-        if ($releasedName -ne $expected) {
-            throw ("the released file {0} is not the artefact that was approved ({1})" -f $releasedName, $subject)
-        }
+    # The strongest per-run check, and it now runs under both ceremonies: the
+    # file on disk is named for the first twelve hex of the hash the human
+    # signed, so a release of anything else fails here rather than being
+    # recorded as evidence.
+    $expected = ($subject -replace '^sha256:', '').Substring(0, 12) + '.proposal'
+    if ($releasedName -ne $expected) {
+        throw ("the released file {0} is not the artefact that was approved ({1})" -f $releasedName, $subject)
     }
     $text = [System.IO.File]::ReadAllText($releasedPath)
     $sha = (Get-FileHash -LiteralPath $releasedPath -Algorithm SHA256).Hash.ToLowerInvariant()
 
     $shown = Use-VkJson -Arguments @('task', 'show', $task)
+    # The one path a task answer carries: where each release step wrote, which
+    # `vk task show` resolves under this node's export root — inside the state
+    # directory, and so out of the record before it is written.
+    if ($null -ne (Get-Prop $shown 'release_paths')) {
+        $shown.release_paths = @($shown.release_paths | ForEach-Object { Hide-StateDir $_ })
+    }
     $top = Use-VkJson -Arguments @('top')
     $tailText = Use-Vk -Arguments @('dmesg', '-n', '40')
     $tailJson = Use-VkJson -Arguments @('dmesg', '-n', '1000')
@@ -414,9 +452,14 @@ function Invoke-DemoRun {
     Write-Fact 'sha256' $sha
     Write-Fact 'wall (s)' ([Math]::Round($clock.Elapsed.TotalSeconds, 1))
 
-    # Per step: what ran it, what the arch counted the prompt at, and — for the
-    # steps that called a model — how long the call took, in the order the
-    # `infer` pairs went onto the chain.
+    # Per step: what ran it, what the arch counted the prompt at, what it left
+    # in the register, and — for the steps that called a model — how long the
+    # call took, in the order the `infer` pairs went onto the chain.
+    #
+    # A daemon older than Ruling 28 sends no `decisions`, and then the array is
+    # empty rather than missing: the per-step columns read `$null` and the H1
+    # check below says so instead of throwing.
+    $decisionsOf = @(Get-Prop $shown 'decisions')
     $steps = @()
     $i = 0
     $call = 0
@@ -431,14 +474,29 @@ function Invoke-DemoRun {
             if ($call -lt @($calls).Count) { $secs = $calls[$call] }
             $call++
         }
+        # What this step left in the register's `decisions`, as `task.show`
+        # reports it (Ruling 28): a count and the newest decision's length and
+        # hash, never its text. All three stay `$null` for the steps that raise
+        # none — a judge raises an open question, and approve and release raise
+        # nothing at all.
+        $count = $null
+        $dBytes = $null
+        $dHash = $null
+        $d = @($decisionsOf | Where-Object { $_.after_step -eq $i })
+        if ($d.Count -eq 1) {
+            $count = $d[0].count
+            $dBytes = $d[0].last_len_bytes
+            $dHash = $d[0].last_hash
+        }
         $steps += New-Object psobject -Property @{
             index = $i; kind = $s.kind.kind; who = $who; status = $s.status
             tokens_in = $s.tokens; seconds = $secs
+            decisions = $count; decision_bytes = $dBytes; decision_hash = $dHash
         }
         $i++
     }
     Write-Host ''
-    Write-Host (($steps | Format-Table index, kind, status, tokens_in, seconds, who -AutoSize | Out-String).TrimEnd())
+    Write-Host (($steps | Format-Table index, kind, status, tokens_in, decisions, decision_bytes, seconds, who -AutoSize | Out-String).TrimEnd())
 
     $prefix = Join-Path $RunDir ('{0}-{1}' -f $Label, $Order)
     Write-Json ($prefix + '-task.json') $shown
@@ -458,7 +516,7 @@ function Invoke-DemoRun {
         harness          = $HarnessName
         steps            = $steps
         subject_hash     = $subject
-        released         = $releasedPath
+        released         = (Hide-StateDir $releasedPath)
         released_name    = $releasedName
         bytes            = $bytes
         sha256           = $sha
@@ -489,6 +547,22 @@ function Test-H1 {
     $pass = ($p2.kind -eq 'plan') -and ($d2.kind -eq 'draft') -and ($p2.who -ne $d2.who) -and (($p2.index + 1) -eq $d2.index)
     $out += New-Check 'run 2 names both arches on consecutive steps' $pass (
         "step {0} plan={1}; step {2} draft={3}" -f $p2.index, $p2.who, $d2.index, $d2.who)
+
+    # The brief's own H1 check, asserted rather than inferred: `vk task show`
+    # lists both arch ids on consecutive steps *with a non-empty `decisions`
+    # after each*. `task.show` reports, per step, how many decisions the
+    # register held once that step had run and how long the newest one is
+    # (Ruling 28) — metadata, never the text. Checks 3-5 below then say the same
+    # thing a second way, in the models' own tokenizers.
+    $pass = ($null -ne $p2.decisions) -and ($p2.decisions -ge 1) -and ($p2.decision_bytes -gt 0) -and
+            ($null -ne $d2.decisions) -and ($d2.decisions -gt $p2.decisions) -and ($d2.decision_bytes -gt 0) -and
+            ($null -ne $p1.decisions) -and ($p1.decisions -ge 1) -and ($p1.decision_bytes -gt 0) -and
+            ($null -ne $d1.decisions) -and ($d1.decisions -gt $p1.decisions) -and ($d1.decision_bytes -gt 0) -and
+            ($p1.decision_hash -ne $d1.decision_hash) -and ($p2.decision_hash -ne $d2.decision_hash)
+    $out += New-Check 'each of run 2''s two arch steps left a non-empty decision (and run 1''s)' $pass (
+        "run 1 plan {0} decision(s), newest {1} B -> draft {2}, newest {3} B; run 2 plan {4}/{5} B -> draft {6}/{7} B" -f
+            $p1.decisions, $p1.decision_bytes, $d1.decisions, $d1.decision_bytes,
+            $p2.decisions, $p2.decision_bytes, $d2.decisions, $d2.decision_bytes)
 
     $pass = ($p2.who -eq $d1.who) -and ($d2.who -eq $p1.who)
     $out += New-Check 'run 2 is the swap of run 1' $pass (
@@ -530,10 +604,15 @@ function Test-H1 {
     $pass = $One.register -ne $Two.register
     $out += New-Check "run 1's register is not run 2's" $pass ("{0} vs {1}" -f $One.register, $Two.register)
 
+    # What *this* check gathers, and no more: two different artefacts, neither
+    # containing the other. That run 2 released exactly one new file — the
+    # stronger statement, because a Release writes every artefact its register
+    # holds — is asserted for each run as it happens, above, not here.
     $pass = ($One.sha256 -ne $Two.sha256) -and (-not $Two.text.Contains($One.text.Trim())) -and
             (-not $One.text.Contains($Two.text.Trim()))
     $out += New-Check "run 1's decisions are absent from run 2's register" $pass (
-        "run 2 released exactly one file, {0}, and it is not run 1's {1}" -f $Two.released_name, $One.released_name)
+        "{0} and {1} are different artefacts ({2} vs {3} bytes) and neither contains the other" -f
+            $One.released_name, $Two.released_name, $One.bytes, $Two.bytes)
 
     return $out
 }
@@ -563,6 +642,11 @@ try {
     Write-Head 'mount'
     Write-Host ("   starting the Ollama container and loading {0} (a cold load is ~25 s)..." -f $Model)
     $ollama = Use-VkJson -Arguments @('mount', 'ollama', '--model', $Model, '--ctx', "$Ctx")
+    # Only from here may the teardown stop `vk-ollama`. The container's name is
+    # the adapter's, fixed, and shared with any other node on this machine, so a
+    # throw before this line — a bad -Bin, Docker down, a refused boot — must
+    # not reach out and stop a container this run never touched.
+    $MountedOllama = $true
     $GemmaArch = $ollama.arch_id
     Write-Fact ('ollama/' + $Model) ("{0}  governed={1}" -f $GemmaArch, $ollama.governed)
 
@@ -636,8 +720,8 @@ try {
         ctx         = $Ctx
         approval    = $Approval
         node        = $status.node_id
-        state_dir   = $StateDir
-        export_root = $ExportRoot
+        state_dir   = (Hide-StateDir $StateDir)
+        export_root = (Hide-StateDir $ExportRoot)
         arches      = New-Object psobject -Property @{
             gemma = $GemmaArch; claude_draft = $ClaudeDraft; claude_judge = $ClaudeJudge
         }
@@ -677,19 +761,35 @@ finally {
     }
     else {
         if ($BootPid -gt 0) {
-            # The daemon holds the Ollama adapter and dropping that is a
-            # `docker stop`: stop the node first and the container second.
+            # The node first. Dropping the Ollama adapter is itself a
+            # `docker stop`, so a daemon asked to exit cleanly would take the
+            # container with it — but `Stop-Process -Force` runs no destructor,
+            # nothing is dropped, and that is exactly why the explicit stop
+            # below is needed and not a belt-and-braces repeat of it.
             Stop-Process -Id $BootPid -Force -ErrorAction SilentlyContinue
             Write-Fact 'stopped vkd' $BootPid
         }
-        $stop = Invoke-Native -FilePath 'docker' -Arguments @('stop', 'vk-ollama')
-        if ($stop.ExitCode -eq 0) { Write-Fact 'stopped container' 'vk-ollama' }
+        # Only the container this run brought up. `vk-ollama` is a name shared
+        # with every other node on this machine, and the mount may in fact have
+        # adopted a container that was already running (`vk mount` does not say
+        # which), so this is the narrowest honest rule the shell can apply: stop
+        # it if we mounted it, and never otherwise.
+        if ($MountedOllama) {
+            $stop = Invoke-Native -FilePath 'docker' -Arguments @('stop', 'vk-ollama')
+            if ($stop.ExitCode -eq 0) { Write-Fact 'stopped container' 'vk-ollama' }
+        }
         if ($Temporary -and (Test-Path -LiteralPath $StateDir)) {
             Start-Sleep -Milliseconds 500
             Remove-Item -LiteralPath $StateDir -Recurse -Force -ErrorAction SilentlyContinue
             if (Test-Path -LiteralPath $StateDir) { Write-Fact 'state dir' ('left behind: ' + $StateDir) }
             else { Write-Fact 'removed' $StateDir }
         }
+        # The endpoint and the key file this run set are now names of things
+        # that no longer exist. Under the documented `powershell -File` call
+        # they die with the process; dot-sourced, or run from a prompt, they
+        # would leave the founder's next `vk` dialling a removed pipe.
+        Remove-Item Env:VK_ENDPOINT -ErrorAction SilentlyContinue
+        Remove-Item Env:VK_NODE_KEY_FILE -ErrorAction SilentlyContinue
     }
 }
 
