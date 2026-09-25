@@ -3,8 +3,11 @@
 //! `0700` directory on Unix; on Windows the default pipe DACL, which SP1b
 //! hardens with an explicit one — and everything above this module assumes a
 //! peer that could open it.
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tokio::io::{AsyncRead, AsyncWrite};
+/// One rule for what may be written into a Windows access list, shared with
+/// the state directory's own DACL (`vk_store::win_acl`).
+use vk_store::sid::ensure_string_sid;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoint(pub String);
@@ -47,6 +50,16 @@ pub fn service_endpoint() -> Endpoint {
     Endpoint(r"\\.\pipe\vk".into())
 }
 
+/// The SID of `NT SERVICE\vkd`, the virtual account the service runs as.
+///
+/// A service's virtual account SID is a pure function of the service's name
+/// (SHA-1 of the uppercased name in UTF-16LE), so this is a constant, not a
+/// lookup — which is what lets a *client* know, before it trusts anything on
+/// the wire, which account is allowed to be serving the machine-wide pipe.
+/// `vk-service` derives the same value from the name and asserts they agree,
+/// so the two can never drift; `sc.exe showsid vkd` prints it too.
+pub const VKD_SERVICE_SID: &str = "S-1-5-80-2321736676-1855261038-2536180385-746309522-2788627728";
+
 /// The pipe's DACL, as SDDL: `GENERIC_ALL` to each of `sids`, and — because a
 /// DACL that is written out in full is the whole of the access check — to
 /// nobody else. No `S:`, no owner, no group: what `CreateNamedPipe` is handed
@@ -70,24 +83,6 @@ pub fn pipe_dacl(sids: &[&str]) -> Result<String> {
         sddl.push(')');
     }
     Ok(sddl)
-}
-
-/// `S-1-<authority>-<sub>-…`, every part a decimal number. Deliberately
-/// narrower than SDDL allows: no two-letter aliases (`BA`, `IU`), no hex
-/// authorities. Everything this daemon puts in a DACL is a SID somebody read
-/// off `whoami /user` or `sc showsid`, and a string that is not one is a
-/// mistake worth refusing.
-fn ensure_string_sid(sid: &str) -> Result<()> {
-    let parts = sid
-        .strip_prefix("S-1-")
-        .with_context(|| format!("{sid:?} is not a string SID: it does not start with S-1-"))?;
-    anyhow::ensure!(
-        parts
-            .split('-')
-            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
-        "{sid:?} is not a string SID: every part after S-1- must be a decimal number"
-    );
-    Ok(())
 }
 
 /// A fresh, unique endpoint: tests run in parallel and each needs its own.
@@ -170,6 +165,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 #[cfg(windows)]
 pub mod os {
     use super::*;
+    use anyhow::Context;
     use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions};
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
@@ -215,15 +211,78 @@ pub mod os {
     /// each instance of a named pipe carries its own, and a client is checked
     /// against the instance it lands on.
     pub async fn bind_with_descriptor(ep: &Endpoint, sddl: Option<&str>) -> Result<Listener> {
+        // `FILE_FLAG_FIRST_PIPE_INSTANCE`. The named-pipe namespace has no
+        // create-time permission: any local account can claim `\\.\pipe\vk`
+        // before this node does. There is no way to take a name back, so the
+        // only safe answer is to refuse to start — loudly, naming whoever has
+        // it, rather than joining somebody else's pipe as a second instance
+        // and serving syscalls on it.
         let mut first = ServerOptions::new();
         first.first_pipe_instance(true);
-        let first = create_instance(&first, &ep.0, sddl)?;
+        let first = create_instance(&first, &ep.0, sddl).map_err(|e| squatted(&ep.0, e))?;
         Ok(Listener {
             name: ep.0.clone(),
             sddl: sddl.map(str::to_owned),
             next: Some(first),
             arm_failures: 0,
         })
+    }
+
+    /// Turn a refused first instance into an error that says who has the name.
+    /// `ERROR_ACCESS_DENIED` is what `FILE_FLAG_FIRST_PIPE_INSTANCE` returns
+    /// when the pipe already exists, and it is indistinguishable from any
+    /// other denial until somebody looks.
+    fn squatted(name: &str, e: std::io::Error) -> anyhow::Error {
+        let Some(holder) = pipe_holder(name) else {
+            return anyhow::Error::new(e);
+        };
+        anyhow::anyhow!(
+            "{name} is already served by process {} ({}); this node will not take a second \
+             instance of somebody else's pipe. Stop that process — or, if it is not ours, treat \
+             it as a squatter: it is receiving whatever `vk` sends to this endpoint.",
+            holder.0,
+            holder
+                .1
+                .as_deref()
+                .unwrap_or("its account could not be read"),
+        )
+    }
+
+    /// The pid, and the account if it can be read, of whoever is serving
+    /// `name`. Best effort: a pipe we may not even open gives nothing.
+    fn pipe_holder(name: &str) -> Option<(u32, Option<String>)> {
+        let client = ClientOptions::new().open(name).ok()?;
+        let pid = server_pid(&client).ok()?;
+        Some((pid, process_user_sid(pid).ok()))
+    }
+
+    /// The account a connected pipe's server runs as, or an explanation. Used
+    /// by `connect` to refuse a squatter and by `squatted` to name one.
+    fn server_pid(pipe: &tokio::net::windows::named_pipe::NamedPipeClient) -> Result<u32> {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
+        let mut pid = 0u32;
+        // SAFETY: `pipe` owns the handle for the whole call.
+        unsafe { GetNamedPipeServerProcessId(HANDLE(pipe.as_raw_handle()), &mut pid) }
+            .context("read the pipe server's process id")?;
+        Ok(pid)
+    }
+
+    /// The token user of a process, by id. `PROCESS_QUERY_LIMITED_INFORMATION`
+    /// is the least that answers it and is granted across accounts far more
+    /// often than `PROCESS_QUERY_INFORMATION`.
+    fn process_user_sid(pid: u32) -> Result<String> {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        // SAFETY: both handles are closed on every path; the buffer is sized
+        // by the OS and its length checked before the cast.
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+                .context("open the pipe server's process")?;
+            let sid = token_user_sid(process);
+            let _ = CloseHandle(process);
+            sid
+        }
     }
 
     /// One pipe instance, with the descriptor when there is one.
@@ -292,18 +351,27 @@ pub mod os {
     /// than derived from a service name, so it stays right whatever account
     /// the service is later configured to use.
     pub fn current_process_sid() -> Result<String> {
+        use windows::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: `GetCurrentProcess` is a pseudo-handle that needs no close.
+        unsafe { token_user_sid(GetCurrentProcess()) }
+    }
+
+    /// The token user of an open process handle, as a string SID.
+    ///
+    /// SAFETY: `process` must be a live process handle with at least
+    /// `PROCESS_QUERY_LIMITED_INFORMATION`.
+    unsafe fn token_user_sid(process: HANDLE) -> Result<String> {
         use windows::core::PWSTR;
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
         use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
-        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        use windows::Win32::System::Threading::OpenProcessToken;
 
-        // SAFETY: each call below is given live out-parameters and a buffer
-        // the OS itself sized; the token handle is closed on every path.
+        // SAFETY: each call is given live out-parameters and a buffer the OS
+        // itself sized; the token handle is closed on every path.
         unsafe {
             let mut token = HANDLE::default();
-            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
-                .context("open this process's token")?;
+            OpenProcessToken(process, TOKEN_QUERY, &mut token).context("open the process token")?;
             let mut needed = 0u32;
             // The first call is expected to fail with ERROR_INSUFFICIENT_BUFFER;
             // what is wanted from it is `needed`.
@@ -317,7 +385,7 @@ pub mod os {
                 &mut needed,
             );
             let _ = CloseHandle(token);
-            read.context("read this process's token user")?;
+            read.context("read the token user")?;
             anyhow::ensure!(
                 buf.len() >= std::mem::size_of::<TOKEN_USER>(),
                 "the token user is shorter than a TOKEN_USER"
@@ -328,6 +396,78 @@ pub mod os {
             let sid = text.to_string().context("the token's SID is not UTF-16");
             LocalFree(Some(HLOCAL(text.0 as *mut std::ffi::c_void)));
             sid
+        }
+    }
+
+    /// Refuse anything but a real user account. A SID's *shape* says nothing
+    /// about what it names: `S-1-1-0` (Everyone), `S-1-5-11` (Authenticated
+    /// Users) and `S-1-5-32-544` (Administrators) are all well-formed, and any
+    /// of them pasted into `--user-sid` would open the endpoint to a group
+    /// while every printed string still looked right. So the SID is resolved
+    /// and its account type checked: `SidTypeUser`, nothing else.
+    ///
+    /// A SID that resolves to nothing is refused too. On a machine whose node
+    /// serves one human, a `--user-sid` naming no account is a typo, and a
+    /// pipe with an unresolvable ACE admits nobody.
+    pub fn ensure_user_sid(sid: &str) -> Result<()> {
+        use windows::core::{PCWSTR, PWSTR};
+        use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+        use windows::Win32::Security::{
+            LookupAccountSidW, SidTypeDeletedAccount, SidTypeUnknown, SidTypeUser, PSID,
+            SID_NAME_USE,
+        };
+
+        super::ensure_string_sid(sid)?;
+        let wide: Vec<u16> = sid.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: the string is NUL-terminated and outlives the call; the SID
+        // the conversion allocates is freed once, and the name buffers are
+        // sized by the OS in the first, deliberately failing call.
+        unsafe {
+            let mut psid = PSID::default();
+            ConvertStringSidToSidW(PCWSTR(wide.as_ptr()), &mut psid)
+                .with_context(|| format!("{sid:?} is not a SID Windows can read"))?;
+            let (mut name_len, mut domain_len) = (0u32, 0u32);
+            let mut kind = SID_NAME_USE::default();
+            let _ = LookupAccountSidW(
+                PCWSTR::null(),
+                psid,
+                None,
+                &mut name_len,
+                None,
+                &mut domain_len,
+                &mut kind,
+            );
+            let mut name = vec![0u16; name_len.max(1) as usize];
+            let mut domain = vec![0u16; domain_len.max(1) as usize];
+            let looked_up = LookupAccountSidW(
+                PCWSTR::null(),
+                psid,
+                Some(PWSTR(name.as_mut_ptr())),
+                &mut name_len,
+                Some(PWSTR(domain.as_mut_ptr())),
+                &mut domain_len,
+                &mut kind,
+            );
+            LocalFree(Some(HLOCAL(psid.0)));
+            looked_up.with_context(|| {
+                format!(
+                    "{sid} does not name an account on this machine; `whoami /user` prints the \
+                     one you are logged in as"
+                )
+            })?;
+            anyhow::ensure!(
+                kind == SidTypeUser,
+                "{sid} names {}, which is {} — the endpoint admits one *user*, and a group or an \
+                 alias here would hand it to everybody in that group. `whoami /user` prints the \
+                 SID of the account you are logged in as.",
+                String::from_utf16_lossy(&name[..name_len as usize]),
+                match kind {
+                    k if k == SidTypeUnknown => "an account of unknown type".to_string(),
+                    k if k == SidTypeDeletedAccount => "a deleted account".to_string(),
+                    k => format!("not a user account (SID_NAME_USE {})", k.0),
+                }
+            );
+            Ok(())
         }
     }
 
@@ -422,7 +562,10 @@ pub mod os {
     pub async fn connect(ep: &Endpoint) -> Result<Box<dyn Stream>> {
         for _ in 0..50 {
             match ClientOptions::new().open(&ep.0) {
-                Ok(c) => return Ok(Box::new(c)),
+                Ok(c) => {
+                    ensure_expected_server(&c, &ep.0)?;
+                    return Ok(Box::new(c));
+                }
                 Err(e) if e.raw_os_error() == Some(PIPE_BUSY) => {
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await
                 }
@@ -430,6 +573,45 @@ pub mod os {
             }
         }
         anyhow::bail!("pipe {} busy", ep.0)
+    }
+
+    /// Who is on the other end. A DACL decides who may *open* the pipe; it
+    /// says nothing about who *created* it, and any local account can claim a
+    /// name this node has not taken yet. So after connecting, the server's
+    /// account is read and required to be one of two: this client's own (a
+    /// daemon the person started themselves) or `NT SERVICE\vkd` (the service).
+    /// Anything else is a process pretending to be the kernel — it would
+    /// receive the syscalls and could answer "chain verified" to all of them.
+    ///
+    /// When the server's account cannot be read the connection is allowed:
+    /// `OpenProcess` across accounts is not guaranteed, and refusing there
+    /// would make the shell unusable rather than safer. That residual is
+    /// written down in `contracts/tcb.md`.
+    fn ensure_expected_server(
+        pipe: &tokio::net::windows::named_pipe::NamedPipeClient,
+        name: &str,
+    ) -> Result<()> {
+        let Ok(pid) = server_pid(pipe) else {
+            tracing::debug!(endpoint = %name, "the pipe server's process id could not be read");
+            return Ok(());
+        };
+        let Ok(server) = process_user_sid(pid) else {
+            tracing::debug!(
+                endpoint = %name,
+                pid,
+                "the pipe server's account could not be read; connecting anyway (contracts/tcb.md)"
+            );
+            return Ok(());
+        };
+        let mine = current_process_sid()?;
+        anyhow::ensure!(
+            server.eq_ignore_ascii_case(&mine) || server.eq_ignore_ascii_case(VKD_SERVICE_SID),
+            "{name} is served by process {pid}, running as {server} — not this account ({mine}) \
+             and not the vkd service account ({VKD_SERVICE_SID}). Refusing to speak to it: a \
+             process that claimed this name before the node did would receive every syscall and \
+             could answer anything it liked."
+        );
+        Ok(())
     }
 
     #[cfg(test)]
@@ -528,6 +710,82 @@ pub mod os {
             assert!(sid.starts_with("S-1-"), "{sid}");
             // It round-trips through the DACL builder's own validation.
             pipe_dacl(&[&sid]).unwrap();
+        }
+
+        /// A SID's shape says nothing about what it names. These four are all
+        /// well-formed and all wrong: `--user-sid S-1-1-0` would have put
+        /// Everyone in the endpoint's DACL and printed a correct-looking line
+        /// while doing it.
+        #[test]
+        fn only_a_real_user_account_may_be_admitted() {
+            ensure_user_sid(&current_process_sid().unwrap())
+                .expect("this process runs as a user account");
+            for (sid, what) in [
+                ("S-1-1-0", "Everyone"),
+                ("S-1-5-11", "Authenticated Users"),
+                ("S-1-5-32-544", "Administrators"),
+                ("S-1-5-18", "SYSTEM"),
+                // A well-formed SID that names nothing on this machine.
+                ("S-1-5-21-1111111111-2222222222-3333333333-1001", "nobody"),
+            ] {
+                let err = ensure_user_sid(sid).unwrap_err().to_string();
+                assert!(err.contains(sid), "{what} ({sid}) must be refused: {err}");
+            }
+            assert!(ensure_user_sid("BA").is_err());
+        }
+
+        /// The squatter case, in one process: a name somebody else is already
+        /// serving is not a name this node joins as a second instance.
+        #[tokio::test]
+        async fn a_name_already_served_refuses_the_bind_and_names_the_holder() {
+            let ep = test_endpoint();
+            let _squatter = bind(&ep).await.unwrap();
+            let Err(err) = bind(&ep).await else {
+                panic!("a pipe name somebody else holds must not be bound");
+            };
+            let err = format!("{err:#}");
+            assert!(err.contains(&ep.0), "{err}");
+            assert!(
+                err.contains(&format!("process {}", std::process::id())),
+                "the refusal must name whoever holds the name: {err}"
+            );
+        }
+
+        /// …and the other half: a client that connects to a server of its own
+        /// account is content, and the check it runs is the one that would
+        /// refuse a stranger.
+        #[tokio::test]
+        async fn a_client_accepts_a_server_running_as_itself() {
+            let ep = test_endpoint();
+            let mut listener = bind(&ep).await.unwrap();
+            let dialling = tokio::spawn({
+                let ep = ep.clone();
+                async move { connect(&ep).await }
+            });
+            let _server = listener.accept().await.unwrap();
+            let client = dialling.await.unwrap();
+            assert!(
+                client.is_ok(),
+                "{:?}",
+                client.err().map(|e| format!("{e:#}"))
+            );
+        }
+
+        /// The pid and account lookups the two checks above rest on really do
+        /// answer for a pipe of our own.
+        #[tokio::test]
+        async fn the_server_behind_a_pipe_can_be_identified() {
+            let ep = test_endpoint();
+            let mut listener = bind(&ep).await.unwrap();
+            let name = ep.0.clone();
+            let holder = tokio::task::spawn_blocking(move || pipe_holder(&name));
+            let _server = listener.accept().await.unwrap();
+            let (pid, account) = holder.await.unwrap().expect("our own pipe has a server");
+            assert_eq!(pid, std::process::id());
+            assert_eq!(
+                account.as_deref(),
+                Some(current_process_sid().unwrap().as_str())
+            );
         }
 
         #[tokio::test]

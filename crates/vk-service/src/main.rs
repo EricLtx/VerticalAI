@@ -214,6 +214,8 @@ mod scm {
 
     /// `ERROR_SERVICE_DOES_NOT_EXIST`.
     const NO_SUCH_SERVICE: i32 = 1060;
+    /// `ERROR_SERVICE_EXISTS`.
+    const SERVICE_EXISTS: i32 = 1073;
     /// `ERROR_FAILED_SERVICE_CONTROLLER_CONNECT`: `run` outside the SCM.
     const NOT_THE_SCM: i32 = 1063;
     /// How long a control verb waits for the SCM to report the new state.
@@ -233,14 +235,16 @@ mod scm {
             None => pipe_acl::interactive_user_sid()
                 .context("read this account's SID for --user-sid")?,
         };
-        // Built before the service exists, so a bad `--user-sid` is refused
-        // here rather than by a service that will not start.
+        // Both before the service exists, so a `--user-sid` that is not a user
+        // account — `S-1-1-0` is Everyone and is perfectly well-formed — is
+        // refused here rather than by a service that admits a whole group.
+        vk_ipc::transport::os::ensure_user_sid(&user_sid).context("--user-sid")?;
         let dacl = pipe_acl::pipe_sddl(pipe_acl::SERVICE_NAME, &user_sid)?;
         let binary = match a.binary {
             Some(p) => p,
             None => std::env::current_exe().context("find this executable")?,
         };
-        let binary = absolute_existing(&binary)?;
+        let binary = registrable_binary(&binary)?;
         let mut launch: Vec<OsString> =
             vec!["run".into(), "--user-sid".into(), OsString::from(&user_sid)];
         if a.probe_docker {
@@ -278,7 +282,19 @@ mod scm {
         };
         let service = manager
             .create_service(&info, ServiceAccess::CHANGE_CONFIG)
-            .context("create the service")?;
+            .map_err(|e| {
+                if is_winapi(&e, SERVICE_EXISTS) {
+                    anyhow::anyhow!(
+                        "a service called {} is already installed. `vkd-service uninstall` removes \
+                         it — but look at it first (`sc qc {0}`): an existing one may have \
+                         configuration of yours, and removing it takes that with it. The state \
+                         directory is never touched either way.",
+                        pipe_acl::SERVICE_NAME
+                    )
+                } else {
+                    anyhow::Error::new(e).context("create the service")
+                }
+            })?;
         service
             .set_description(DESCRIPTION)
             .context("set the service description")?;
@@ -307,10 +323,20 @@ mod scm {
         Ok(())
     }
 
-    /// An absolute path to a file that is there. The SCM stores the
-    /// `ImagePath` and runs it from `C:\Windows\System32`, so a relative path
-    /// would start something else — or nothing.
-    fn absolute_existing(p: &Path) -> Result<PathBuf> {
+    /// An absolute path to a file that is there, and that the service account
+    /// can be asked to run.
+    ///
+    /// The SCM stores the `ImagePath` and runs it from `C:\Windows\System32`,
+    /// so a relative path would start something else — or nothing. And the
+    /// file itself runs as `NT SERVICE\vkd` at every start: registering one
+    /// that lives under a user profile means anything running as that user can
+    /// replace it and inherit the service account's Credential Manager on the
+    /// next start, which makes the whole account separation nominal. A synced
+    /// folder is refused for the same reason plus a duller one — OneDrive may
+    /// replace the file, or leave a placeholder the SCM cannot start
+    /// (fix round 1, Important 5). Put it somewhere only administrators may
+    /// write: `%ProgramFiles%\VerticalAI\`.
+    fn registrable_binary(p: &Path) -> Result<PathBuf> {
         let abs = if p.is_absolute() {
             p.to_path_buf()
         } else {
@@ -321,7 +347,61 @@ mod scm {
             "{} is not a file; --binary must name the vkd-service.exe to register",
             abs.display()
         );
+        vk_store::paths::refuse_sync_folder(&abs).context("--binary")?;
+        anyhow::ensure!(
+            !under_a_user_profile(&abs),
+            "{} is inside a user profile, and the service would run it as {} at every start: \
+             anything running as that user could replace it and take the service account's \
+             keyring with it. Copy the binaries somewhere only administrators may write — \
+             `%ProgramFiles%\\VerticalAI\\` — and install from there.",
+            abs.display(),
+            pipe_acl::SERVICE_ACCOUNT
+        );
         Ok(abs)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_binary_under_a_user_profile_is_not_registrable() {
+            let home = std::env::var("USERPROFILE").expect("Windows has one");
+            for inside in [
+                format!(r"{home}\build\release\vkd-service.exe"),
+                r"C:\Users\someone\.cargo-target\release\vkd-service.exe".into(),
+                r"c:\users\someone\vkd-service.exe".into(),
+                r"C:/Users/someone/vkd-service.exe".into(),
+            ] {
+                assert!(under_a_user_profile(Path::new(&inside)), "{inside}");
+            }
+            for outside in [
+                r"C:\Program Files\VerticalAI\vkd-service.exe",
+                r"C:\vk\vkd-service.exe",
+                r"D:\opt\vk\vkd-service.exe",
+                // Not a profile: a directory that merely starts the same way.
+                r"C:\UsersBackup\vkd-service.exe",
+            ] {
+                assert!(!under_a_user_profile(Path::new(outside)), "{outside}");
+            }
+        }
+    }
+
+    /// `C:\Users\…`, by either name the machine knows it under.
+    fn under_a_user_profile(p: &Path) -> bool {
+        let lower = p.to_string_lossy().to_lowercase().replace('/', "\\");
+        let roots = [
+            std::env::var("USERPROFILE").ok(),
+            std::env::var("PUBLIC").ok(),
+            std::env::var("SystemDrive")
+                .ok()
+                .map(|d| format!("{d}\\Users")),
+            Some(r"c:\users".into()),
+        ];
+        roots.into_iter().flatten().any(|root| {
+            let root = root.to_lowercase().replace('/', "\\");
+            !root.is_empty() && lower.starts_with(&format!("{}\\", root.trim_end_matches('\\')))
+        })
     }
 
     // -------------------------------------------------------------- uninstall
@@ -488,8 +568,10 @@ mod scm {
     /// rest of the run has somewhere to speak.
     fn service_main(_scm_arguments: Vec<OsString>) {
         let state_dir = vkd::program_data_state_dir();
-        let logging = std::fs::create_dir_all(&state_dir)
-            .with_context(|| format!("create {}", state_dir.display()))
+        // Made private as it is made, and refused if somebody else made it
+        // first: this is the very first thing to touch `%ProgramData%`, before
+        // even the log file goes in (fix round 1, Critical 1).
+        let logging = vkd::protect_service_state_dir(&state_dir)
             .and_then(|()| log_to(&state_dir.join("vkd.log")));
         if let Err(e) = &logging {
             // Nowhere to write it; `serve` still reports the SCM statuses, so
@@ -534,9 +616,6 @@ mod scm {
             ServiceExitCode::NO_ERROR,
             Duration::from_secs(30),
         ))?;
-        if args.probe_docker {
-            probe_docker(&vkd::program_data_state_dir());
-        }
         let argv = args.daemon_argv();
         tracing::info!(argv = %argv.join(" "), "starting the daemon in this process");
         std::thread::spawn(move || {
@@ -555,6 +634,17 @@ mod scm {
             Duration::default(),
         ))?;
         tracing::info!("running");
+        // The Docker probe runs **after** the service is running, on a thread
+        // of its own (fix round 1, Important 4). It used to sit between
+        // `StartPending` and `Running`, where its 30-second deadline could eat
+        // the whole wait hint — and the case spike 6a exists to measure, an
+        // engine the virtual account cannot reach, is exactly the slow one. A
+        // measurement must not be able to make a healthy node look like a
+        // failed start.
+        if args.probe_docker {
+            let dir = vkd::program_data_state_dir();
+            std::thread::spawn(move || probe_docker(&dir));
+        }
         match rx.recv() {
             Ok(Wake::Stop) => {
                 tracing::info!("the service control manager asked this node to stop");

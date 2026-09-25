@@ -100,6 +100,54 @@ pub fn program_data_state_dir() -> PathBuf {
         .join("vk")
 }
 
+/// The state directory of a daemon that is not any one person's, made private
+/// before anything is written into it: Full Control to this account, SYSTEM
+/// and the local administrators, protected so nothing is inherited from
+/// `%ProgramData%` and inheritable so nothing underneath is reachable either
+/// (fix round 1, Critical 1). A directory somebody else created first is
+/// refused rather than adopted.
+///
+/// The service host calls this too, because it opens the log there before the
+/// daemon runs — whichever of the two gets there first, the directory is born
+/// private.
+#[cfg(windows)]
+pub fn protect_service_state_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    let own = vk_store::win_acl::current_process_sid()?;
+    vk_store::win_acl::create_protected_dir(
+        dir,
+        &[
+            &own,
+            vk_store::win_acl::LOCAL_SYSTEM_SID,
+            vk_store::win_acl::ADMINISTRATORS_SID,
+        ],
+    )
+}
+
+/// `%ProgramData%\VerticalAI\vk`, made private, for the service host.
+#[cfg(windows)]
+pub fn service_state_dir() -> anyhow::Result<PathBuf> {
+    let dir = program_data_state_dir();
+    protect_service_state_dir(&dir)?;
+    Ok(dir)
+}
+
+/// The endpoint's access list. **Every** pipe this daemon creates carries an
+/// explicit one (Ruling 26): under the service, the account it runs as and the
+/// one interactive user the installer named; started by a person, the account
+/// that started it and nobody else — including on an explicit `--endpoint`,
+/// which is the name `vk boot` uses. The alternative is the OS default, which
+/// grants Everyone and Anonymous read.
+#[cfg(windows)]
+pub fn pipe_descriptor(service: Option<&ServiceProfile>) -> anyhow::Result<String> {
+    // Read off this process's own token, so it is right whatever account the
+    // service is configured to run as.
+    let own = vk_ipc::transport::os::current_process_sid()?;
+    match service {
+        Some(s) => vk_ipc::transport::pipe_dacl(&[&own, &s.user_sid]),
+        None => vk_ipc::transport::pipe_dacl(&[&own]),
+    }
+}
+
 /// Read `--as-service`, `--user-sid` and `--state-dir` together, or refuse.
 #[cfg(windows)]
 pub fn service_profile(
@@ -175,6 +223,17 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
     #[cfg(windows)]
     let service = service_profile(a.as_service, a.user_sid.as_deref(), a.state_dir.as_deref())?;
     #[cfg(windows)]
+    if let Some(s) = &service {
+        // A SID's shape is not what it names: `S-1-1-0` is well-formed and is
+        // Everyone. Resolved and required to be a user account before it
+        // becomes an entry in the endpoint's DACL (fix round 1, Important 1).
+        vk_ipc::transport::os::ensure_user_sid(&s.user_sid).context("--user-sid")?;
+        // And the store's own directory is made private before the store
+        // opens it — not after, by which time a directory somebody else
+        // created would already be theirs (Critical 1).
+        protect_service_state_dir(&s.state_dir)?;
+    }
+    #[cfg(windows)]
     let state_dir_arg = service
         .as_ref()
         .map(|s| s.state_dir.clone())
@@ -223,25 +282,22 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
         #[cfg(not(windows))]
         None => vk_ipc::transport::default_endpoint(),
     };
-    // Under the service the pipe carries an explicit DACL: `GENERIC_ALL` to
-    // the account this process runs as — read off its own token, so it is
-    // right whatever the service is configured to use — and to the one
-    // interactive user the installer named. Nobody else, not even the local
-    // administrators the default DACL would have admitted.
+    // The pipe always carries an explicit DACL (Ruling 26): under the service
+    // the account this process runs as plus the one interactive user the
+    // installer named, and otherwise the account that started it alone.
+    // Nobody else — not the local administrators, and not the Everyone and
+    // Anonymous read the OS default hands out.
     #[cfg(windows)]
-    let pipe_dacl = match &service {
-        Some(s) => {
-            let own = vk_ipc::transport::os::current_process_sid()?;
-            let dacl = vk_ipc::transport::pipe_dacl(&[&own, &s.user_sid])?;
-            tracing::info!(
-                account_sid = %own,
-                user_sid = %s.user_sid,
-                pipe_dacl = %dacl,
-                "running as a service account; the endpoint admits these two accounts only"
-            );
-            Some(dacl)
-        }
-        None => None,
+    let pipe_dacl = {
+        let own = vk_ipc::transport::os::current_process_sid()?;
+        let dacl = pipe_descriptor(service.as_ref())?;
+        tracing::info!(
+            account_sid = %own,
+            user_sid = service.as_ref().map(|s| s.user_sid.as_str()).unwrap_or("-"),
+            pipe_dacl = %dacl,
+            "the endpoint admits these accounts and no others"
+        );
+        Some(dacl)
     };
     #[cfg(not(windows))]
     let pipe_dacl: Option<String> = None;
@@ -424,5 +480,30 @@ mod service_tests {
             service_profile(a.as_service, None, None).unwrap().is_none(),
             "an ordinary daemon has no service profile"
         );
+    }
+
+    /// Ruling 26: a daemon a person started binds a pipe only that person may
+    /// open — one entry, theirs — instead of the OS default, which grants
+    /// Everyone and Anonymous read. This is the path `vk boot` takes, on the
+    /// default endpoint and on an explicit `--endpoint` alike.
+    #[test]
+    fn an_interactive_daemon_admits_its_own_account_and_nobody_else() {
+        let me = vk_ipc::transport::os::current_process_sid().unwrap();
+        let dacl = pipe_descriptor(None).unwrap();
+        assert_eq!(dacl, format!("D:(A;;GA;;;{me})"));
+        assert_eq!(dacl.matches("(A;").count(), 1, "{dacl}");
+    }
+
+    #[test]
+    fn a_service_daemon_admits_itself_and_the_interactive_user() {
+        let me = vk_ipc::transport::os::current_process_sid().unwrap();
+        let profile = ServiceProfile {
+            state_dir: program_data_state_dir(),
+            user_sid: USER.to_string(),
+            endpoint: vk_ipc::transport::service_endpoint(),
+        };
+        let dacl = pipe_descriptor(Some(&profile)).unwrap();
+        assert_eq!(dacl, format!("D:(A;;GA;;;{me})(A;;GA;;;{USER})"));
+        assert_eq!(dacl.matches("(A;").count(), 2, "{dacl}");
     }
 }

@@ -335,10 +335,18 @@ Installing, starting or controlling a Windows service needs an elevated prompt, 
 - **The pages are not behind the pipe's DACL.** `--as-service` still serves the passkey pages on `127.0.0.1:7734`, and loopback has no ACL: any local account can reach them. What protects them is unchanged (single-use link tokens minted only over the endpoint, `contracts/tcb.md`), but under a service account "any local account" is a larger set than it was. Worth a line in `contracts/tcb.md` when Task 9 revisits it.
 - **Restart safety, by construction.** The store's lock is an OS handle and the SCM's Stop ends the process, so the lock and the pipe are released by the OS; the ledger's unterminated last line is dropped and the head re-verified at the next boot (SP1a fix wave). There is no graceful-shutdown call to make, and the host does not pretend to make one.
 
-*Pending the founder's elevated run* — one command, from an elevated PowerShell, after `cargo build --release`:
+*Fix round 1 (2026-09-25, review Ruling 27 + Ruling 26).* The review found the *pipe* half closed and the *store* half open, and four adjacent holes. All fixed in the same task:
+
+- **The state directory's own ACL (Critical).** `%ProgramData%` hands every local account inheritable read *and* create rights, so `create_dir_all` gave the service a store any second logon could read, plant a ledger segment or a `shredded/` tombstone into, or **create first and own**. `vk_store::win_acl` now creates it with a protected, inheritable DACL (service account + SYSTEM + administrators, `D:P…OICI`) and audits an existing one by owner and by every ACE, refusing to start and naming the stranger. Both the daemon and the service host go through it, so whichever touches `%ProgramData%` first, the directory is born private.
+- **`--user-sid` is resolved, not just parsed.** `S-1-1-0` is Everyone and is a perfectly well-formed SID; it would have put Everyone in the DACL and printed a correct-looking line. `LookupAccountSid` → `SidTypeUser` only, at install and at start.
+- **Ruling 26: every pipe gets an explicit DACL**, not only the service's — a daemon a person starts binds `D:(A;;GA;;;<their SID>)`, on the default endpoint and on an explicit `--endpoint` alike. Without that, the README's own `VK_ENDPOINT=\\.\pipe\vk` would have had `vk boot` re-bind the documented name with the OS default (Everyone + Anonymous read).
+- **Squatting.** Any local account can claim a pipe name nobody serves yet. The server refuses a name already held (naming the holder's pid and account) and the client, after connecting, refuses a server that is neither its own account nor `NT SERVICE\vkd`. Residual — a server whose account cannot be read — recorded in `contracts/tcb.md`.
+- **The Docker probe left the start path** (it sat inside the SCM's wait hint with a 30 s deadline, so the very case the spike measures could make a healthy node look like a failed start), and **the `ImagePath` may not be user-writable**: `install` refuses a binary under a user profile or a synced folder, and the script stages the three binaries into `%ProgramFiles%\VerticalAI` and removes them in a `finally`.
+
+*Pending the founder's elevated run* — one command, from an elevated PowerShell, after building with `CARGO_TARGET_DIR` set outside the repository (`$env:CARGO_TARGET_DIR = "$env:USERPROFILE\.cargo-target\verticalai-sp1"; cargo build --release`):
 
 ```
-.\scripts\spike-6a.ps1 -ServiceBinary <repo>\target\release\vkd-service.exe
+.\scripts\spike-6a.ps1
 ```
 
 - [ ] the service installs under `NT SERVICE\vkd` and `sc.exe showsid vkd` agrees with the derived SID;
@@ -348,6 +356,7 @@ Installing, starting or controlling a Windows service needs an elevated prompt, 
 - [ ] stop + start, and `vk ledger verify` still passes (review recommendation 4);
 - [ ] **FOUNDER CHECKPOINT — Docker from the service account.** The service is installed with `--probe-docker`, which runs `docker info` as `NT SERVICE\vkd` before the daemon starts and records the verdict (`docker_probe=…`) in `vkd.log`, with the output in `docker-probe.log`. A virtual account is not a member of `docker-users`, so the expected answer is *unreachable* — in which case the Ollama container must be started by the interactive user and mounted `--external`, and Task 7's demo script says so;
 - [ ] **the second-user refusal.** It cannot be shown from one logon: the unit test proves only that a pipe whose DACL names this account admits this account, and that the DACL on the object is exactly the one that was asked for. The script attempts it with `-SecondUser <name>` (prompting for that account's password) and otherwise prints the two `net user` lines that make one. Expected: `Access is denied. (os error 5)`;
+- [ ] **the state directory's DACL as the service created it** — the script prints `icacls %ProgramData%\VerticalAI\vk`; expected: three entries (the service SID, SYSTEM, the administrators), nothing for `BUILTIN\Users`, and `(OI)(CI)` on each;
 - [ ] uninstall leaves no service behind.
 
 ---

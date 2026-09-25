@@ -5,6 +5,12 @@ pub mod keys;
 pub mod ledger_fs;
 pub mod lock;
 pub mod paths;
+pub mod sid;
+/// The state directory's own ACL, for a daemon that is not any one person's
+/// (SP1b Task 6). Windows only: on Unix `paths::private_dir`'s `0700` is the
+/// same rule, and it is already applied to every state directory.
+#[cfg(windows)]
+pub mod win_acl;
 
 use anyhow::{Context, Result};
 use vk_contracts::ledger::{ClockQuality, Hlc, LedgerEvent, RetentionClass};

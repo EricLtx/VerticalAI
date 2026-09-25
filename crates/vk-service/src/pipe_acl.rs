@@ -87,6 +87,18 @@ mod tests {
     /// The published SID of `NT SERVICE\TrustedInstaller`: a value Microsoft
     /// documents, so a test that passes it is testing the algorithm rather
     /// than this implementation's own output.
+    /// `vk-ipc` carries the same SID as a constant, because a *client* must
+    /// know which account may be serving the machine-wide pipe before it
+    /// trusts anything on it, and `vk-ipc` cannot call this crate. The two may
+    /// never drift.
+    #[test]
+    fn the_constant_the_client_checks_against_is_this_same_sid() {
+        assert_eq!(
+            service_account_sid(SERVICE_NAME),
+            vk_ipc::transport::VKD_SERVICE_SID
+        );
+    }
+
     #[test]
     fn the_derivation_matches_a_service_sid_microsoft_publishes() {
         assert_eq!(

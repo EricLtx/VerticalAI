@@ -36,6 +36,10 @@ windows = { version = "0.62", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_System_Threading",
+    # `GetNamedPipeServerProcessId`: who is on the other end of a pipe this
+    # client just opened, so a squatter on a well-known name is refused
+    # rather than served (fix round 1, Important 3).
+    "Win32_System_Pipes",
 ] }
 
 [dev-dependencies]

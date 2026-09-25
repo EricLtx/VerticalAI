@@ -221,14 +221,30 @@ store, no password to rotate, and a Credential Manager of its own, so the
 master key and the node's device key are not in the founder's.
 
 ```
+# build somewhere the synced repository is not, then put the binaries
+# where only administrators may write
+$env:CARGO_TARGET_DIR = "$env:USERPROFILE\.cargo-target\verticalai-sp1"
+cargo build --release
+mkdir "$env:ProgramFiles\VerticalAI"                       # elevated
+copy "$env:CARGO_TARGET_DIR\release\vk*.exe" "$env:ProgramFiles\VerticalAI\"
+
 # from an elevated PowerShell, once
-vkd-service install                 # --user-sid defaults to the account running this
-vkd-service start
+& "$env:ProgramFiles\VerticalAI\vkd-service.exe" install   # --user-sid defaults to you
+& "$env:ProgramFiles\VerticalAI\vkd-service.exe" start
 
 # from an ordinary shell, from then on
 $env:VK_ENDPOINT = '\\.\pipe\vk'
 vk status
 ```
+
+**Where the binary lives is part of the trust boundary.** The registered
+`ImagePath` runs as `NT SERVICE\vkd` at every start, so a binary under a user
+profile — or inside OneDrive — is one that account can replace, and the next
+start would hand it the service account's keyring. `vkd-service install`
+refuses such a path outright; `%ProgramFiles%\VerticalAI\` is the answer,
+because an elevated `mkdir` there is owned by the administrators. (Signing is
+the SP1 gate's job; until then nothing verifies *what* is at that path, only
+who may change it.)
 
 The endpoint is the machine-wide `\\.\pipe\vk`, not the per-user
 `\\.\pipe\vk-<user>` a `vk boot` daemon takes, and the state directory is
@@ -238,13 +254,12 @@ unchanged. Stopping the service is `vkd-service stop`, and `vkd-service
 uninstall` removes it — leaving the state directory and the service account's
 keyring entries behind, which is where the node's whole record still is.
 
-**The endpoint's ACL is the first authentication factor, and here it is
-written out.** The default DACL of a named pipe grants SYSTEM, the
-administrators and the creator full access *and Everyone and Anonymous read
-access*; for a daemon a person started in their own session that hardly
-matters, and for one running as a service account on a machine with other
-logons it matters a great deal. So the service's pipe is created with an
-explicit DACL naming two accounts and nobody else:
+**The endpoint's ACL is the first authentication factor, and it is written
+out — for every daemon, not only the service.** The default DACL of a named
+pipe grants SYSTEM, the administrators and the creator full access *and
+Everyone and Anonymous read access*. So `vkd` never takes it: a daemon a person
+started binds `D:(A;;GA;;;<that person's SID>)`, and the service binds two
+accounts and nobody else:
 
 ```
 D:(A;;GA;;;<the NT SERVICE\vkd SID>)(A;;GA;;;<the interactive user's SID>)
@@ -253,9 +268,26 @@ D:(A;;GA;;;<the NT SERVICE\vkd SID>)(A;;GA;;;<the interactive user's SID>)
 The daemon reads its own half off its process token at bind time and logs the
 whole list; the other half is `--user-sid`, which `vkd-service install` fills
 in from whoever ran it (an elevated shell has the same user SID as the desktop
-that raised it) and which `whoami /user` prints if you want to name another.
-`vkd-service install` prints the SIDs, the endpoint, the DACL and the
-`ImagePath` before the service has ever run.
+that raised it) and which `whoami /user` prints if you want to name another. It
+must be a **user** account: `S-1-1-0` is Everyone and is a perfectly
+well-formed SID, so the string is resolved and its type checked before it
+becomes an entry. `vkd-service install` prints the SIDs, the endpoint, the DACL
+and the `ImagePath` before the service has ever run.
+
+**The store's directory carries its own ACL too.** `%ProgramData%` hands
+inheritable read *and* create rights to every local account, so the service
+creates `%ProgramData%\VerticalAI\vk` with a protected list — Full Control to
+the service account, SYSTEM and the administrators, inherited by everything
+underneath — and **refuses to start** on a directory whose owner or entries
+name anybody else, naming the one that stopped it. A store somebody else
+created first is not adopted: they would own the ledger.
+
+**Who is on the other end.** Windows lets any local account claim a pipe name
+nobody is serving yet, so `vkd` refuses to start on a name already taken
+(naming the holder's pid and account), and `vk`, after connecting, checks that
+the server runs as the caller's own account or as `NT SERVICE\vkd` and refuses
+to speak to anything else. The residual — a server whose account cannot be read
+— is in `contracts/tcb.md`.
 
 Two things the DACL does **not** cover. The passkey pages are still served on
 `127.0.0.1:7734`, and loopback has no ACL — what protects them is the
@@ -263,14 +295,15 @@ single-use link tokens minted only over the endpoint (`contracts/tcb.md`).
 And the service has no console: its log is `%ProgramData%\VerticalAI\vk\vkd.log`,
 the same `vkd.log` a detached `vk boot` daemon writes.
 
-`scripts/spike-6a.ps1` is the whole thing end to end — install, start, `vk
-status`, `vk ls /arches`, `vk ledger verify`, a restart and the same checks
-again, the DACL the daemon actually bound, whether Docker's engine is reachable
-from the service account, a second local account's attempt, uninstall — and it
-prints a summary block. It needs an elevated PowerShell and builds nothing:
+`scripts/spike-6a.ps1` is the whole thing end to end — stage the binaries,
+install, start, `vk status`, `vk ls /arches`, `vk ledger verify`, a restart and
+the same checks again, the DACL the daemon actually bound, whether Docker's
+engine is reachable from the service account, a second local account's attempt,
+uninstall and tidy up after itself — and it prints a summary block. It needs an
+elevated PowerShell and builds nothing:
 
 ```
-.\scripts\spike-6a.ps1 -ServiceBinary .\target\release\vkd-service.exe
+.\scripts\spike-6a.ps1            # binaries from %USERPROFILE%\.cargo-target\verticalai-sp1\release
 ```
 
 | `vkd-service` verb | what it does |
@@ -293,7 +326,8 @@ serve nobody.
 | master key | OS keyring, service `vk`, user `master` | `--master-key-file FILE` (tests and CI) |
 | node device key | OS keyring | `--node-key-file FILE`, or `$VK_NODE_KEY_FILE` |
 | endpoint | `\\.\pipe\vk-<user>` (Windows), `\\.\pipe\vk` under `--as-service`; `$XDG_RUNTIME_DIR/vk.sock`, else `/tmp/vk-<user>/vk.sock` (Unix) | `--endpoint EP`, or `$VK_ENDPOINT` |
-| endpoint ACL | the creating account's (Unix: `0600` in a `0700` directory; Windows: the pipe's default DACL) | `--as-service`: `D:(A;;GA;;;<service SID>)(A;;GA;;;<--user-sid>)` |
+| endpoint ACL | the creating account's — Unix: `0600` in a `0700` directory; Windows: `D:(A;;GA;;;<that account>)` | `--as-service`: `D:(A;;GA;;;<service SID>)(A;;GA;;;<--user-sid>)` |
+| state directory ACL | Unix `0700`; Windows, the parent's (per user under `%LOCALAPPDATA%`) | `--as-service`: the service account, SYSTEM and the administrators, protected and inherited |
 | passkey pages | `http://localhost:7734`, on loopback only | `--web-port PORT` (`0`: one the OS picks) |
 
 `$VK_ENDPOINT` and `$VK_NODE_KEY_FILE` are read by `vk` only: a daemon on a

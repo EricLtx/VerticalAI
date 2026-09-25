@@ -16,8 +16,11 @@ path = "src/main.rs"
 # there is one process for the SCM to stop and one store lock to release.
 vkd = { path = "../vkd" }
 # `transport::pipe_dacl` — the SDDL is built once, in the crate that hands it
-# to `CreateNamedPipe`, and this crate decides *whose* SIDs go in it.
+# to `CreateNamedPipe`, and this crate decides *whose* SIDs go in it — plus
+# `os::ensure_user_sid`, which resolves `--user-sid` to a real user account.
 vk-ipc = { path = "../vk-ipc" }
+# `paths::refuse_sync_folder`, so an `ImagePath` inside OneDrive is refused.
+vk-store = { path = "../vk-store" }
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

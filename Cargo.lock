@@ -2994,6 +2994,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vk-ipc",
+ "vk-store",
  "vkd",
  "windows-service",
 ]
@@ -3017,6 +3018,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "vk-contracts",
+ "windows",
 ]
 
 [[package]]

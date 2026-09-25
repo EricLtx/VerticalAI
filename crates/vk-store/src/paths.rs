@@ -97,7 +97,10 @@ pub fn resolve_override(raw: &Path, cwd: &Path) -> PathBuf {
     }
 }
 
-pub(crate) fn refuse_sync_folder(dir: &Path) -> Result<()> {
+/// Public because it is not only the state directory that must not live in a
+/// synced folder: `vkd-service install` refuses to register a binary from one
+/// too, since OneDrive may replace or dehydrate the file a service starts from.
+pub fn refuse_sync_folder(dir: &Path) -> Result<()> {
     let lower = dir.to_string_lossy().to_lowercase().replace('\\', "/");
     if let Some(m) = SYNC_MARKERS.iter().find(|m| lower.contains(*m)) {
         bail!("state directory {} is inside a synced folder ({m}); use --state-dir to choose a local path", dir.display());

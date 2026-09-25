@@ -26,5 +26,18 @@ thiserror.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# The state directory's DACL under a service account (SP1b Task 6 fix round 1):
+# creating it with a protected descriptor and auditing one that is already
+# there. Same 0.62 line as `vk-harness` and `vk-ipc`, so the workspace builds
+# one version of the Win32 bindings.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tempfile = "3"
