@@ -313,6 +313,43 @@ Unchanged from rev. 1. The single-writer lock and the ledger head commitment fro
 - [ ] **Step 1: Test** (manual, recorded in the gate checklist): install, start, `vk status` works, `vk ls /arches` works, service restart survives (ledger and head verified at boot), uninstall clean.
 - [ ] **Step 2: Implement**; **Step 3: Commit** — `feat(service): vkd as a Windows service under a virtual account; pipe DACL admits the interactive user only`.
 
+**Spike 6a findings (2026-09-25):**
+
+Installing, starting or controlling a Windows service needs an elevated prompt, which the implementing session could not answer. What follows is split accordingly: what was **established without elevation** (measured, compiled, unit-tested on this machine), and what is **pending the founder's elevated run** of `scripts/spike-6a.ps1`.
+
+*Established without elevation.*
+
+- **Crate versions.** `windows-service` **0.8.1** (Mullvad; MSRV 1.71; its own Win32 bindings are `windows-sys` 0.61, so nothing new is added to the `windows` 0.62 tree `vk-harness` already builds). API used: `service_manager::{ServiceManager, ServiceManagerAccess}`, `service::{ServiceInfo, ServiceType::OWN_PROCESS, ServiceStartType::OnDemand, ServiceErrorControl::Normal, ServiceAccess, ServiceState, ServiceStatus, ServiceControl, ServiceControlAccept, ServiceExitCode}`, `service_control_handler::{register, ServiceControlHandlerResult}`, `service_dispatcher::start`, `define_windows_service!`. A **virtual account** is `ServiceInfo { account_name: Some("NT SERVICE\\vkd"), account_password: None }` — nothing else is needed; Windows creates and manages the account from the service's own name.
+- **The Win32 surface, compiled.** `windows` **0.62.2** with `Win32_Foundation`, `Win32_Security`, `Win32_Security_Authorization`, `Win32_System_Threading` compiles every name the DACL needs: `ConvertStringSecurityDescriptorToSecurityDescriptorW` + `SDDL_REVISION_1`, `SECURITY_ATTRIBUTES`, `PSECURITY_DESCRIPTOR`, `LocalFree`/`HLOCAL`, and, for the daemon's own half of the list, `OpenProcessToken` → `GetTokenInformation(TokenUser)` → `ConvertSidToStringSidW`. The tests additionally read the descriptor back off the handle with `GetSecurityInfo(SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION)` + `ConvertSecurityDescriptorToStringSecurityDescriptorW`. The hook into the transport is tokio 1.53.1's `ServerOptions::create_with_security_attributes_raw`, which takes a raw `*mut SECURITY_ATTRIBUTES`.
+- **The exact SDDL.** `NT SERVICE\vkd` has the SID `S-1-5-80-2321736676-1855261038-2536180385-746309522-2788627728` — SHA-1 of `"VKD"` in UTF-16LE read as five little-endian sub-authorities, confirmed against `sc.exe showsid vkd` (which needs neither elevation nor an installed service) and, as a control, against Microsoft's published `NT SERVICE\TrustedInstaller` SID. So the pipe is created with
+
+  ```
+  D:(A;;GA;;;S-1-5-80-2321736676-1855261038-2536180385-746309522-2788627728)(A;;GA;;;<interactive user SID>)
+  ```
+
+  The daemon does not derive its own half: it reads the SID off its process token at bind time, so the list stays right whatever account the service is later configured to run as, and `vkd-service install` prints the predicted string for the two to be compared.
+- **`--as-service` driven end to end short of the SCM.** `vkd --as-service --user-sid <SID> --state-dir <temp> --master-key-file <temp> --endpoint <test pipe> --web-port 0` boots, logs `pipe_dacl=D:(A;;GA;;;…)(A;;GA;;;…)`, binds the pipe with that descriptor and answers `vk status` over it. Everything in the flag but the virtual account and the SCM is therefore exercised without elevation; `vkd-service run` typed at a prompt refuses with the SCM's `1063` and creates nothing.
+- **Why an explicit DACL at all, measured.** The *default* named-pipe DACL on this machine (read back off a pipe created the ordinary way) is `D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;<creator>)(A;;FR;;;WD)(A;;FR;;;AN)` — SYSTEM and Administrators full, the creator full, and **Everyone and Anonymous `FILE_GENERIC_READ`**. A daemon on the default DACL is one every local logon may open for reading. That is the finding that makes this task load-bearing rather than cosmetic.
+- **The ProgramData layout.** `%ProgramData%\VerticalAI\vk` (`C:\ProgramData\VerticalAI\vk`), created by the service at first start and holding exactly what a user state directory holds: `lock` (the single-writer lock), `ledger`, `vk.sqlite`, `blobs/`, `keys/`, `shredded/`, `harness/`, `exports/`, plus `vkd.log` (the service has no console, so the host writes the daemon's tracing there) and `docker-probe.log`. `vk_store::paths::state_dir` still refuses it if `%ProgramData%` has been moved into a synced folder. Uninstalling the service does **not** remove it.
+- **The endpoint is `\\.\pipe\vk`, not `vk-<user>` (decision, needs the founder's blessing).** A service account's `%USERNAME%` is not a name the founder can write down in advance, and the whole point of this task is a DACL and an endpoint that can be. So `--as-service` binds the machine-wide `\\.\pipe\vk` and `vk` reaches it with `VK_ENDPOINT=\\.\pipe\vk` (the variable already exists). The alternative — resolving the interactive user's account name from `--user-sid` and binding *their* `vk-<user>` pipe, so `vk` needs no configuration — is one lookup away and would be nicer for Task 7's demo. **Founder decision before Task 9.**
+- **The pages are not behind the pipe's DACL.** `--as-service` still serves the passkey pages on `127.0.0.1:7734`, and loopback has no ACL: any local account can reach them. What protects them is unchanged (single-use link tokens minted only over the endpoint, `contracts/tcb.md`), but under a service account "any local account" is a larger set than it was. Worth a line in `contracts/tcb.md` when Task 9 revisits it.
+- **Restart safety, by construction.** The store's lock is an OS handle and the SCM's Stop ends the process, so the lock and the pipe are released by the OS; the ledger's unterminated last line is dropped and the head re-verified at the next boot (SP1a fix wave). There is no graceful-shutdown call to make, and the host does not pretend to make one.
+
+*Pending the founder's elevated run* — one command, from an elevated PowerShell, after `cargo build --release`:
+
+```
+.\scripts\spike-6a.ps1 -ServiceBinary <repo>\target\release\vkd-service.exe
+```
+
+- [ ] the service installs under `NT SERVICE\vkd` and `sc.exe showsid vkd` agrees with the derived SID;
+- [ ] it starts, and the DACL the daemon logs is the one `install` predicted;
+- [ ] **the keyring (Credential Manager) works for a virtual account** — the daemon logs a master-key fingerprint only if it does. If it does not, re-run with `-MasterKeyFile`, and the master key moves to a file the service alone can read (a TCB change worth its own note);
+- [ ] `vk status`, `vk ls /arches`, `vk ledger verify` answer from the founder's shell with `VK_ENDPOINT=\\.\pipe\vk`;
+- [ ] stop + start, and `vk ledger verify` still passes (review recommendation 4);
+- [ ] **FOUNDER CHECKPOINT — Docker from the service account.** The service is installed with `--probe-docker`, which runs `docker info` as `NT SERVICE\vkd` before the daemon starts and records the verdict (`docker_probe=…`) in `vkd.log`, with the output in `docker-probe.log`. A virtual account is not a member of `docker-users`, so the expected answer is *unreachable* — in which case the Ollama container must be started by the interactive user and mounted `--external`, and Task 7's demo script says so;
+- [ ] **the second-user refusal.** It cannot be shown from one logon: the unit test proves only that a pipe whose DACL names this account admits this account, and that the DACL on the object is exactly the one that was asked for. The script attempts it with `-SecondUser <name>` (prompting for that account's password) and otherwise prints the two `net user` lines that make one. Expected: `Access is denied. (os error 5)`;
+- [ ] uninstall leaves no service behind.
+
 ---
 
 ### Task 7: The demo, both role orders (H1), scripted

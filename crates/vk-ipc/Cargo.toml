@@ -24,5 +24,19 @@ rand.workspace = true
 hex.workspace = true
 uuid.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# The pipe's DACL (SP1b Task 6): turning the SDDL a caller hands `bind` into a
+# `SECURITY_ATTRIBUTES` for `CreateNamedPipe`, reading the token user's SID
+# back out for the service's own half of that DACL, and — in the tests — the
+# descriptor the object ended up with. Pinned to the same 0.62 line as
+# `vk-harness`, so one version of the Win32 bindings is built for the
+# workspace.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tempfile = "3"

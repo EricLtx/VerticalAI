@@ -1,0 +1,36 @@
+[package]
+name = "vk-service"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "VerticalAI service host: vkd as a Windows service under a virtual account"
+
+[[bin]]
+name = "vkd-service"
+path = "src/main.rs"
+
+[dependencies]
+# The daemon itself. `vkd-service run` is the SCM's entry point and runs the
+# very same boot sequence in its own process — never a spawned `vkd.exe`, so
+# there is one process for the SCM to stop and one store lock to release.
+vkd = { path = "../vkd" }
+# `transport::pipe_dacl` — the SDDL is built once, in the crate that hands it
+# to `CreateNamedPipe`, and this crate decides *whose* SIDs go in it.
+vk-ipc = { path = "../vk-ipc" }
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# The service account's SID is SHA-1 over the uppercased service name (the
+# `S-1-5-80-…` derivation `sc.exe showsid` prints), which is how `install` can
+# print the pipe's DACL before the service has ever been created. 0.10 rather
+# than 0.11 so it shares the `digest` 0.10 already built for `sha2`.
+sha1 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+# Service control manager: create, delete, start, stop, and the dispatcher
+# that answers the SCM inside `run`. 0.8.1 was the newest line when spike 6a
+# (2026-09-25) read its API; its own Win32 bindings are `windows-sys` 0.61.
+windows-service = "0.8"

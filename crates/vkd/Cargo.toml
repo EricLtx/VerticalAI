@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "VerticalAI kernel daemon: the vkd binary"
 
+[lib]
+name = "vkd"
+path = "src/lib.rs"
+
 [[bin]]
 name = "vkd"
 path = "src/main.rs"
