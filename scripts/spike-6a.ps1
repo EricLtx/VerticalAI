@@ -68,9 +68,15 @@
     key from a file instead. Put it somewhere only SYSTEM and the service can
     read.
 
+.PARAMETER Overwrite
+    Replace binaries already staged in %ProgramFiles%\VerticalAI. Without it a
+    stale one stops the run, because measuring a previous build and calling the
+    result this one's is the worst answer this script could give.
+
 .PARAMETER KeepInstalled
     Leave the service installed, running, and the binaries in place, to poke
-    at. `vkd-service uninstall` (elevated) removes it afterwards.
+    at. `vkd-service uninstall` (elevated) removes it afterwards. A run whose
+    *install* failed still has its staged binaries removed.
 
 .EXAMPLE
     # From an elevated PowerShell:
@@ -90,6 +96,7 @@ param(
     [string]$UserSid,
     [string]$SecondUser,
     [string]$MasterKeyFile,
+    [switch]$Overwrite,
     [switch]$KeepInstalled
 )
 
@@ -252,6 +259,7 @@ Record 'preflight' 'ok'
 
 # Everything from here is undone in the `finally` at the bottom.
 $Installed    = $false
+$Failed       = $false
 $CopiedFiles  = @()
 $CreatedDirs  = @()
 $SharedDir    = $null
@@ -273,14 +281,31 @@ try {
         New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
         $CreatedDirs += $InstallDir
     }
+    # A binary already there is *not* quietly reused: this is the run that
+    # produces the attestation, and measuring a previous build while
+    # attributing the result to this one would be the worst kind of wrong
+    # answer. -Overwrite says "yes, replace it" (and then the run owns it, so
+    # the cleanup removes it).
+    $stale = @()
     foreach ($src in @($ServiceBinary, $VkBinary, $VkdBinary)) {
         $dst = Join-Path $InstallDir (Split-Path $src -Leaf)
-        if (Test-Path -LiteralPath $dst) {
-            Warn "$dst already exists and will be left alone; it may be an older build"
-        } else {
-            Copy-Item -LiteralPath $src -Destination $dst -Force
-            $CopiedFiles += $dst
-        }
+        if ((Test-Path -LiteralPath $dst) -and -not $Overwrite) { $stale += $dst }
+    }
+    if ($stale.Count -gt 0) {
+        Write-Host ''
+        Write-Host 'These are already in the staging directory and may be an older build:' -ForegroundColor Red
+        $stale | ForEach-Object { Write-Host "    $_" }
+        Write-Host 'Re-run with -Overwrite to replace them, or remove them yourself:'
+        Write-Host ("    Remove-Item -LiteralPath '{0}' -Recurse -Force" -f $InstallDir)
+        Record 'stage' ('refused: already present, and -Overwrite was not given: ' + ($stale -join ', '))
+        $Failed = $true
+        return
+    }
+    Record 'stage' 'ok'
+    foreach ($src in @($ServiceBinary, $VkBinary, $VkdBinary)) {
+        $dst = Join-Path $InstallDir (Split-Path $src -Leaf)
+        Copy-Item -LiteralPath $src -Destination $dst -Force
+        $CopiedFiles += $dst
     }
     $SvcExe = Join-Path $InstallDir 'vkd-service.exe'
     $VkExe  = Join-Path $InstallDir 'vk.exe'
@@ -296,6 +321,7 @@ try {
     if ($install.Code -ne 0) {
         Record 'install_error' $install.Err
         Write-Host $install.Err -ForegroundColor Red
+        $Failed = $true
     } else {
         $Installed = $true
         $InstalledSvc = $SvcExe
@@ -414,6 +440,32 @@ try {
     foreach ($m in [regex]::Matches($log, 'account_sid=("?)(S-1-[0-9\-]+)\1')) { $accountSid = $m.Groups[2].Value }
     Record 'daemon_account_sid' $accountSid
 
+    # The client identity check, from this side of the pipe. `vk` reads the
+    # pipe object's OWNER off its own connected handle and refuses anything
+    # that is neither this account nor NT SERVICE\vkd; the same read is done
+    # here so the summary records that it *answered* against a service-owned
+    # pipe. (The server process's token is not readable by an ordinary user --
+    # that is why the check reads the object and not the process.)
+    $pipeOwner = ''
+    try {
+        $client = New-Object System.IO.Pipes.NamedPipeClientStream(
+            '.', 'vk', [System.IO.Pipes.PipeDirection]::InOut)
+        $client.Connect(5000)
+        $pipeOwner = $client.GetAccessControl().GetOwner(
+            [System.Security.Principal.SecurityIdentifier]).Value
+        $client.Dispose()
+    } catch {
+        $pipeOwner = "could not be read: $($_.Exception.Message)"
+    }
+    Record 'pipe_owner_from_client' $pipeOwner
+    if ($installed['service_sid'] -and $pipeOwner -eq $installed['service_sid']) {
+        Record 'pipe_owner_is_the_service' 'yes -- the owner read answered, and it is NT SERVICE\vkd'
+    } elseif ($pipeOwner -like 'S-1-*') {
+        Record 'pipe_owner_is_the_service' "NO -- the owner read answered, but it is $pipeOwner"
+    } else {
+        Record 'pipe_owner_is_the_service' 'the owner could not be read; vk would take the residual branch'
+    }
+
     # The state directory's own ACL, which the daemon now sets when it makes it.
     $acl = Try-Run 'icacls.exe' @($StateDir)
     Record 'state_dir_acl' $acl.Out
@@ -522,9 +574,10 @@ try {
         Record 'service_gone' $gone
     }
 
-    if (-not $KeepInstalled) {
-        # Only what this run put there: an older build already in the
-        # directory was warned about and left alone.
+    # Only what this run put there, and only while something still needs it:
+    # -KeepInstalled keeps the binaries for the service it left running, but a
+    # run whose install failed has nothing to keep them for.
+    if (-not ($KeepInstalled -and $Installed)) {
         foreach ($f in $CopiedFiles) {
             Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
         }
@@ -540,4 +593,5 @@ try {
     Record 'state_dir_left_behind' $StateDir
 
     Print-Summary
+    if ($Failed) { exit 1 }
 }

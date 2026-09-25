@@ -276,18 +276,20 @@ and the `ImagePath` before the service has ever run.
 
 **The store's directory carries its own ACL too.** `%ProgramData%` hands
 inheritable read *and* create rights to every local account, so the service
-creates `%ProgramData%\VerticalAI\vk` with a protected list — Full Control to
-the service account, SYSTEM and the administrators, inherited by everything
-underneath — and **refuses to start** on a directory whose owner or entries
-name anybody else, naming the one that stopped it. A store somebody else
+creates `%ProgramData%\VerticalAI\vk` — and its parent — with a protected
+list, Full Control to the service account, SYSTEM and the administrators,
+inherited by everything underneath, and **refuses to start** on a directory
+whose owner or entries name anybody else, naming the one that stopped it. A store somebody else
 created first is not adopted: they would own the ledger.
 
 **Who is on the other end.** Windows lets any local account claim a pipe name
 nobody is serving yet, so `vkd` refuses to start on a name already taken
-(naming the holder's pid and account), and `vk`, after connecting, checks that
-the server runs as the caller's own account or as `NT SERVICE\vkd` and refuses
-to speak to anything else. The residual — a server whose account cannot be read
-— is in `contracts/tcb.md`.
+(naming the holder's pid and account), and `vk`, after connecting, reads the
+pipe object's **owner** off its own handle and refuses to speak to anything that
+is neither the caller's own account nor `NT SERVICE\vkd`. The owner rather than
+the server's process, because an ordinary account may not open a service's
+process at all. The residual — a pipe whose owner cannot be read — is in
+`contracts/tcb.md`.
 
 Two things the DACL does **not** cover. The passkey pages are still served on
 `127.0.0.1:7734`, and loopback has no ACL — what protects them is the

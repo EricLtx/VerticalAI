@@ -177,10 +177,14 @@ fn owner_and_ace_sids(path: &Path) -> Result<(String, Vec<String>)> {
         for i in 0..size.AceCount {
             let mut ace: *mut c_void = std::ptr::null_mut();
             GetAce(d.dacl, i, &mut ace).with_context(|| format!("read entry {i} of its DACL"))?;
-            // Every entry that names a principal — allow or deny — carries the
-            // SID straight after the header and the mask. A deny entry for
-            // somebody else is as much of a surprise as an allow one, so both
-            // are collected.
+            // Every entry that names a principal — allow, deny, or their
+            // callback forms — carries the SID straight after the header and
+            // the mask, which is what `ACCESS_ALLOWED_ACE` lays out; a deny
+            // entry for somebody else is as much of a surprise as an allow
+            // one, so both are collected. The *object* ACE forms put a GUID
+            // there instead, and this cast would misread one — but they exist
+            // only in directory-service DACLs, never on an `SE_FILE_OBJECT`,
+            // which is the only kind of object this module looks at.
             let ace = &*(ace as *const ACCESS_ALLOWED_ACE);
             sids.push(sid_to_string(PSID(
                 &ace.SidStart as *const u32 as *mut c_void,

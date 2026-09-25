@@ -237,23 +237,76 @@ pub mod os {
             return anyhow::Error::new(e);
         };
         anyhow::anyhow!(
-            "{name} is already served by process {} ({}); this node will not take a second \
-             instance of somebody else's pipe. Stop that process — or, if it is not ours, treat \
-             it as a squatter: it is receiving whatever `vk` sends to this endpoint.",
+            "{name} is already served by process {} (account: {}); this node will not take a \
+             second instance of somebody else's pipe. Stop that process — or, if it is not ours, \
+             treat it as a squatter: it is receiving whatever `vk` sends to this endpoint.",
             holder.0,
-            holder
-                .1
-                .as_deref()
-                .unwrap_or("its account could not be read"),
+            holder.1.as_deref().unwrap_or("could not be read"),
         )
     }
 
     /// The pid, and the account if it can be read, of whoever is serving
-    /// `name`. Best effort: a pipe we may not even open gives nothing.
+    /// `name`. Best effort: a pipe we may not even open gives nothing. The
+    /// account is read off the *object's owner* first — that answers across
+    /// accounts — and only then, as a fallback, off the server process, which
+    /// does not.
     fn pipe_holder(name: &str) -> Option<(u32, Option<String>)> {
         let client = ClientOptions::new().open(name).ok()?;
         let pid = server_pid(&client).ok()?;
-        Some((pid, process_user_sid(pid).ok()))
+        let account = pipe_owner(&client)
+            .ok()
+            .or_else(|| process_user_sid(pid).ok());
+        Some((pid, account))
+    }
+
+    /// The owner of the pipe *object*, read off this client's own handle.
+    ///
+    /// This is the identity check that works. `READ_CONTROL` rides in both
+    /// `GENERIC_ALL` (what the service's own DACL grants the interactive user)
+    /// and `FILE_GENERIC_READ` (what the OS default grants everybody), so the
+    /// owner answers in precisely the cases the server *process* does not: a
+    /// service's process, and a second standard user's, are both denied to an
+    /// ordinary `OpenProcess`, and those are exactly the two this check exists
+    /// for.
+    fn pipe_owner(pipe: &tokio::net::windows::named_pipe::NamedPipeClient) -> Result<String> {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+        use windows::Win32::Security::{OWNER_SECURITY_INFORMATION, PSID};
+
+        // SAFETY: `pipe` owns the handle for the whole call; the descriptor
+        // `GetSecurityInfo` allocates is freed once, after the owner — which
+        // points into it — has been read out.
+        unsafe {
+            let mut owner = PSID::default();
+            let mut psd = PSECURITY_DESCRIPTOR::default();
+            let rc = GetSecurityInfo(
+                HANDLE(pipe.as_raw_handle()),
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                Some(&mut owner),
+                None,
+                None,
+                None,
+                Some(&mut psd),
+            );
+            anyhow::ensure!(rc.is_ok(), "read the pipe's owner: {rc:?}");
+            let sid = sid_to_string(owner);
+            LocalFree(Some(HLOCAL(psd.0)));
+            sid
+        }
+    }
+
+    /// SAFETY: `sid` must point at a valid SID that outlives the call.
+    unsafe fn sid_to_string(sid: windows::Win32::Security::PSID) -> Result<String> {
+        use windows::core::PWSTR;
+        use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+        unsafe {
+            let mut text = PWSTR::null();
+            ConvertSidToStringSidW(sid, &mut text).context("format a SID")?;
+            let s = text.to_string().context("a SID is not UTF-16");
+            LocalFree(Some(HLOCAL(text.0 as *mut std::ffi::c_void)));
+            s
+        }
     }
 
     /// The account a connected pipe's server runs as, or an explanation. Used
@@ -575,41 +628,61 @@ pub mod os {
         anyhow::bail!("pipe {} busy", ep.0)
     }
 
+    /// Whether a pipe owned by `owner` is one this client will speak to: a
+    /// daemon of its own account, or the `vkd` service. Split out from the
+    /// call below because it is the half that can be tested — a pipe owned by
+    /// somebody else cannot be staged from a single logon, so the decision is
+    /// checked here and the live cross-account case belongs to
+    /// `scripts/spike-6a.ps1`.
+    fn owner_is_expected(owner: &str, mine: &str) -> bool {
+        owner.eq_ignore_ascii_case(mine) || owner.eq_ignore_ascii_case(VKD_SERVICE_SID)
+    }
+
     /// Who is on the other end. A DACL decides who may *open* the pipe; it
     /// says nothing about who *created* it, and any local account can claim a
-    /// name this node has not taken yet. So after connecting, the server's
-    /// account is read and required to be one of two: this client's own (a
-    /// daemon the person started themselves) or `NT SERVICE\vkd` (the service).
-    /// Anything else is a process pretending to be the kernel — it would
-    /// receive the syscalls and could answer "chain verified" to all of them.
+    /// name this node has not taken yet. So after connecting, the pipe
+    /// object's **owner** is read off this client's own handle and required to
+    /// be one of two: this client's account (a daemon the person started
+    /// themselves) or `NT SERVICE\vkd`. Anything else is a process pretending
+    /// to be the kernel — it would receive the syscalls and could answer
+    /// "chain verified" to all of them.
     ///
-    /// When the server's account cannot be read the connection is allowed:
-    /// `OpenProcess` across accounts is not guaranteed, and refusing there
-    /// would make the shell unusable rather than safer. That residual is
-    /// written down in `contracts/tcb.md`.
+    /// The owner, not the server *process*: an ordinary `OpenProcess` on a
+    /// service is denied (`ERROR_ACCESS_DENIED`), and so is one on a second
+    /// standard user's process, which would have put both cases this check
+    /// exists for permanently on the permissive branch. `READ_CONTROL` on the
+    /// handle is what the owner needs, and it rides in every access mask a
+    /// client can open a pipe with.
+    ///
+    /// When the owner cannot be read the connection is allowed — a squatter
+    /// that strips `READ_CONTROL` from its own pipe is the residual, and it is
+    /// written down in `contracts/tcb.md`; refusing on an unreadable owner
+    /// would make the shell unusable rather than safer.
     fn ensure_expected_server(
         pipe: &tokio::net::windows::named_pipe::NamedPipeClient,
         name: &str,
     ) -> Result<()> {
-        let Ok(pid) = server_pid(pipe) else {
-            tracing::debug!(endpoint = %name, "the pipe server's process id could not be read");
-            return Ok(());
-        };
-        let Ok(server) = process_user_sid(pid) else {
-            tracing::debug!(
-                endpoint = %name,
-                pid,
-                "the pipe server's account could not be read; connecting anyway (contracts/tcb.md)"
-            );
-            return Ok(());
+        let owner = match pipe_owner(pipe) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::debug!(
+                    endpoint = %name,
+                    error = %e,
+                    "the pipe's owner could not be read; connecting anyway (contracts/tcb.md)"
+                );
+                return Ok(());
+            }
         };
         let mine = current_process_sid()?;
         anyhow::ensure!(
-            server.eq_ignore_ascii_case(&mine) || server.eq_ignore_ascii_case(VKD_SERVICE_SID),
-            "{name} is served by process {pid}, running as {server} — not this account ({mine}) \
-             and not the vkd service account ({VKD_SERVICE_SID}). Refusing to speak to it: a \
-             process that claimed this name before the node did would receive every syscall and \
-             could answer anything it liked."
+            owner_is_expected(&owner, &mine),
+            "{name} is served by a pipe owned by {owner} — not this account ({mine}) and not the \
+             vkd service account ({VKD_SERVICE_SID}){}. Refusing to speak to it: a process that \
+             claimed this name before the node did would receive every syscall and could answer \
+             anything it liked.",
+            server_pid(pipe)
+                .map(|pid| format!(", process {pid}"))
+                .unwrap_or_default()
         );
         Ok(())
     }
@@ -749,6 +822,49 @@ pub mod os {
                 err.contains(&format!("process {}", std::process::id())),
                 "the refusal must name whoever holds the name: {err}"
             );
+        }
+
+        /// The decision the client makes about a server, without a second
+        /// account to stage one with: its own and the service's pass, anything
+        /// else — including SYSTEM, the administrators, and another user —
+        /// does not. A pipe owned by a stranger cannot be created from one
+        /// logon, so this is where the rule is checked and
+        /// `scripts/spike-6a.ps1` is where it is seen.
+        #[test]
+        fn a_client_speaks_only_to_its_own_daemon_or_the_service() {
+            let mine = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+            assert!(owner_is_expected(mine, mine));
+            assert!(owner_is_expected(VKD_SERVICE_SID, mine));
+            // SDDL and Win32 both fold SID case; the comparison must too.
+            assert!(owner_is_expected(&VKD_SERVICE_SID.to_lowercase(), mine));
+            for stranger in [
+                "S-1-5-21-1111111111-2222222222-3333333333-1002", // the second logon
+                "S-1-5-18",                                       // SYSTEM
+                "S-1-5-32-544",                                   // the administrators
+                "S-1-5-80-0-0-0-0-0",                             // another service account
+                "",
+            ] {
+                assert!(
+                    !owner_is_expected(stranger, mine),
+                    "{stranger} must not pass for {mine}"
+                );
+            }
+        }
+
+        /// And the measurement the rule rests on: the owner of a pipe **is**
+        /// readable off the client's own handle, which is the whole reason
+        /// this check reads the object rather than the server's process.
+        #[tokio::test]
+        async fn the_owner_of_a_pipe_is_readable_from_the_client_handle() {
+            let ep = test_endpoint();
+            let mut listener = bind(&ep).await.unwrap();
+            let name = ep.0.clone();
+            let read = tokio::task::spawn_blocking(move || {
+                let client = ClientOptions::new().open(&name).unwrap();
+                pipe_owner(&client)
+            });
+            let _server = listener.accept().await.unwrap();
+            assert_eq!(read.await.unwrap().unwrap(), current_process_sid().unwrap());
         }
 
         /// …and the other half: a client that connects to a server of its own

@@ -100,27 +100,58 @@ pub fn program_data_state_dir() -> PathBuf {
         .join("vk")
 }
 
+/// Who may reach a service's state directory: the `vkd` service account, SYSTEM,
+/// the local administrators, and — when it is not one of those already — the
+/// account making the call.
+///
+/// The service account is named **explicitly** rather than only being whoever
+/// happens to be running (fix round 2, Minor 2). Without it, an elevated
+/// `vkd --as-service` run by hand and the SCM-started service would make
+/// mutually incompatible directories and each refuse the other's, with the
+/// refusal pointing at `S-1-5-80-…` — the service's own account — as the
+/// stranger, which reads as alarming and is not.
+#[cfg(windows)]
+pub fn service_dir_owners() -> anyhow::Result<Vec<String>> {
+    let mut owners = vec![
+        vk_ipc::transport::VKD_SERVICE_SID.to_string(),
+        vk_store::win_acl::LOCAL_SYSTEM_SID.to_string(),
+        vk_store::win_acl::ADMINISTRATORS_SID.to_string(),
+    ];
+    let own = vk_store::win_acl::current_process_sid()?;
+    if !owners.iter().any(|s| s.eq_ignore_ascii_case(&own)) {
+        owners.push(own);
+    }
+    Ok(owners)
+}
+
 /// The state directory of a daemon that is not any one person's, made private
-/// before anything is written into it: Full Control to this account, SYSTEM
-/// and the local administrators, protected so nothing is inherited from
-/// `%ProgramData%` and inheritable so nothing underneath is reachable either
-/// (fix round 1, Critical 1). A directory somebody else created first is
-/// refused rather than adopted.
+/// before anything is written into it: Full Control to `service_dir_owners`,
+/// protected so nothing is inherited from `%ProgramData%` and inheritable so
+/// nothing underneath is reachable either (fix round 1, Critical 1). A
+/// directory somebody else created first is refused rather than adopted.
+///
+/// The **parent** gets the same treatment when the directory is the
+/// `%ProgramData%` default (fix round 2, Minor 1): a `VerticalAI` left on
+/// `%ProgramData%`'s inherited ACL is one any local account can create first,
+/// and the `CREATOR OWNER` entry it inherits carries `FILE_DELETE_CHILD` — so
+/// they could rename the protected `vk` leaf out of the way without ever being
+/// able to read it. Denial of service rather than disclosure, but a confusing
+/// one. An explicit `--state-dir` is the operator's own path and only the leaf
+/// is touched: this code has no business writing a descriptor onto `D:\`.
 ///
 /// The service host calls this too, because it opens the log there before the
 /// daemon runs — whichever of the two gets there first, the directory is born
 /// private.
 #[cfg(windows)]
 pub fn protect_service_state_dir(dir: &std::path::Path) -> anyhow::Result<()> {
-    let own = vk_store::win_acl::current_process_sid()?;
-    vk_store::win_acl::create_protected_dir(
-        dir,
-        &[
-            &own,
-            vk_store::win_acl::LOCAL_SYSTEM_SID,
-            vk_store::win_acl::ADMINISTRATORS_SID,
-        ],
-    )
+    let owners = service_dir_owners()?;
+    let allowed: Vec<&str> = owners.iter().map(String::as_str).collect();
+    if dir == program_data_state_dir() {
+        if let Some(parent) = dir.parent() {
+            vk_store::win_acl::create_protected_dir(parent, &allowed)?;
+        }
+    }
+    vk_store::win_acl::create_protected_dir(dir, &allowed)
 }
 
 /// `%ProgramData%\VerticalAI\vk`, made private, for the service host.
@@ -492,6 +523,36 @@ mod service_tests {
         let dacl = pipe_descriptor(None).unwrap();
         assert_eq!(dacl, format!("D:(A;;GA;;;{me})"));
         assert_eq!(dacl.matches("(A;").count(), 1, "{dacl}");
+    }
+
+    /// The state directory's list names the service account whoever is
+    /// running, so an elevated hand-run `vkd --as-service` and the SCM-started
+    /// service accept each other's directory instead of each calling the other
+    /// a stranger.
+    #[test]
+    fn the_state_directory_admits_the_service_account_by_name() {
+        let owners = service_dir_owners().unwrap();
+        let me = vk_store::win_acl::current_process_sid().unwrap();
+        for expected in [
+            vk_ipc::transport::VKD_SERVICE_SID,
+            vk_store::win_acl::LOCAL_SYSTEM_SID,
+            vk_store::win_acl::ADMINISTRATORS_SID,
+            &me,
+        ] {
+            assert!(
+                owners.iter().any(|o| o.eq_ignore_ascii_case(expected)),
+                "{expected} must be on the list: {owners:?}"
+            );
+        }
+        // No duplicate when the caller *is* one of the three — which is what
+        // the service itself will be.
+        let mut sorted = owners.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), owners.len(), "{owners:?}");
+        // And the list is one the descriptor builder will take.
+        vk_store::win_acl::protected_sddl(&owners.iter().map(String::as_str).collect::<Vec<_>>())
+            .unwrap();
     }
 
     #[test]
