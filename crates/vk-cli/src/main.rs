@@ -837,8 +837,12 @@ async fn approve_with_passkey(
 async fn passkey(cli: &Cli, c: &Client, what: &PasskeyCmd) -> Result<()> {
     match what {
         PasskeyCmd::Enroll { open } => {
+            // Enrolling a passkey is a human act: the link is minted only
+            // under a presence proof by this node's device key (review
+            // Important 2), so a process with the pipe and no key gets none.
+            let proof = presence(c).await?;
             let linked = c
-                .call("web.link", json!({ "page": "enroll" }), None)
+                .call("web.link", json!({ "page": "enroll" }), Some(proof))
                 .await?;
             let url = field(&linked, "url")?;
             if *open {

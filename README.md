@@ -156,14 +156,18 @@ vk approve $TASK --passkey              # prints the approval link, waits for Wi
 vk approve $TASK --passkey --open --timeout 120
 ```
 
-`vkd` serves the two pages on loopback (`--web-port`, default 7734; `0` lets
-the OS pick, and `vk status` shows the `web` origin). The pages open only from
-a link the daemon minted over its endpoint — the pipe's ACL carried over to
-HTTP — and a link is good for ten minutes, for one page and one task. On the
-approval page the daemon mints the task's challenge, keeps it beside the
-WebAuthn request state, verifies the assertion in-process with `webauthn-rs`
-against the enrolled passkey, records the approval with `proof: webauthn`, and
-runs the step that was waiting; `vk approve --passkey` sees the task leave
+`vkd` serves the two pages on both loopback addresses, `127.0.0.1` and `[::1]`
+(`--web-port`, default 7734; `0` lets the OS pick, and `vk status` shows the
+`web` origin), and refuses to start if either is taken. The pages open only
+from a link the daemon minted over its endpoint, good for ten minutes, for one
+page and one task; `vk passkey enroll` signs a presence proof with the node's
+device key to get its link, because enrolling a passkey is a human act. On the
+approval page the daemon mints the task's challenge with the WebAuthn challenge
+as its nonce — so what Windows Hello signs is the challenge the kernel minted —
+verifies the assertion in-process with `webauthn-rs` against the enrolled
+passkey, records the approval with `proof: webauthn` and the signed bytes
+beside it (so the signature can be checked again from the record), and runs
+the step that was waiting; `vk approve --passkey` sees the task leave
 `waiting_human` and prints the result. `contracts/tcb.md` says what is and is
 not claimed of it.
 

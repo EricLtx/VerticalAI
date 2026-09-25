@@ -112,14 +112,37 @@ pub struct PendingApproval {
     pub challenge: Challenge,
 }
 
-/// The `approval.recorded` payload (SP1b Task 5): the approval and which
+/// What a passkey assertion signed, as the record keeps it (SP1b Task 5 fix
+/// round 1, review Important 1). The authenticator signs
+/// `authenticator_data || SHA-256(client_data_json)`; `client_data_json`
+/// carries the challenge, which is the minted `Challenge`'s nonce, and the
+/// origin. With the enrolled passkey's public key (the `devices` row) and the
+/// approval's `signature_hex`, an auditor re-verifies the approval from the
+/// store and the ledger alone — the same standing a node-key approval has.
+/// Stored in the `assertions` table under the approval's own key, and hashed
+/// into the `approval.recorded` payload. Not a contract type.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AssertionRecord {
+    /// The credential id, base64url — the same value `passkey:<id>` names.
+    pub credential_id: String,
+    /// The authenticator data, base64url.
+    pub authenticator_data: String,
+    /// The client data JSON, base64url: `{type, challenge, origin, …}`.
+    pub client_data_json: String,
+}
+
+/// The `approval.recorded` payload (SP1b Task 5): the approval, which
 /// ceremony verified it — `device-key` for an ed25519 signature checked
 /// against the device registry, `webauthn` for a passkey assertion checked by
-/// `vk-web`'s verifier. Not a contract type; the ledger keeps its hash.
+/// `vk-web`'s verifier — and, for the latter, what the authenticator signed.
+/// Not a contract type; the ledger keeps its hash. The device-key payload
+/// has no `assertion` field at all, so its hash is unchanged.
 #[derive(serde::Serialize)]
 struct ApprovalRecord<'a> {
     approval: &'a Approval,
     proof: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assertion: Option<&'a AssertionRecord>,
 }
 
 /// What this node came up with: the verdict on its own record, what it had to
@@ -1306,6 +1329,50 @@ impl RealKernel {
         task_id: &str,
         ttl_ms: u64,
     ) -> Result<Challenge, KernelError> {
+        let nonce = {
+            use base64::Engine;
+            let bytes: [u8; 32] = rand::random();
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        };
+        self.mint(ctx, task_id, nonce, ttl_ms)
+    }
+
+    /// Mint with a nonce the caller made — the passkey path (SP1b Task 5 fix
+    /// round 1, review Important 1). In-process only, never a syscall: the
+    /// caller is `vk-web`, and the nonce is the WebAuthn challenge its
+    /// verifier just generated (32 random bytes, base64url), so the value the
+    /// authenticator signs inside `clientDataJSON` **is** the minted
+    /// challenge's nonce — one value, made by the verifier, bound here to the
+    /// task's subject, resource and expiry, spent here on first use. A nonce
+    /// that is short, or already open, is refused: the map is keyed by it.
+    pub fn mint_approval_challenge_with_nonce(
+        &mut self,
+        ctx: &Ctx,
+        task_id: &str,
+        nonce: String,
+    ) -> Result<Challenge, KernelError> {
+        if nonce.len() < 32 {
+            return Err(KernelError::I1(
+                "an approval nonce is at least 32 characters of base64url".into(),
+            ));
+        }
+        if self.approval_challenges.contains_key(&nonce) {
+            return Err(KernelError::I1(
+                "an approval challenge with this nonce is already open".into(),
+            ));
+        }
+        self.mint(ctx, task_id, nonce, APPROVAL_CHALLENGE_TTL_MS)
+    }
+
+    /// Both mints: the subject from the scheduler's rule (a task that is not
+    /// waiting gets nothing), the resource, the expiry, the bounded map.
+    fn mint(
+        &mut self,
+        ctx: &Ctx,
+        task_id: &str,
+        nonce: String,
+        ttl_ms: u64,
+    ) -> Result<Challenge, KernelError> {
         let subject = self.approval_subject(ctx, task_id)?;
         let now = ctx.now_ms;
         self.approval_challenges
@@ -1320,11 +1387,6 @@ impl RealKernel {
                 self.approval_challenges.remove(&soonest);
             }
         }
-        let nonce = {
-            use base64::Engine;
-            let bytes: [u8; 32] = rand::random();
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-        };
         let challenge = Challenge {
             resource: format!("task:{task_id}"),
             action_digest: subject,
@@ -1404,12 +1466,16 @@ impl RealKernel {
     /// *challenge* is checked here to be one this kernel minted, unspent and
     /// unexpired, never one a client supplied. What a client sends over the
     /// loopback page is an assertion; what becomes an approval is decided on
-    /// this side of it. `proof` names the ceremony on the ledger.
+    /// this side of it. `proof` names the ceremony on the ledger, and
+    /// `assertion` is what the authenticator signed — kept beside the
+    /// approval so the recorded signature can be checked again by anyone
+    /// with the record and the enrolled public key (review Important 1).
     pub fn record_verified_human_approval(
         &mut self,
         now_ms: u64,
         approval: Approval,
         proof: &str,
+        assertion: Option<AssertionRecord>,
     ) -> Result<(), KernelError> {
         if approval.kind != ApprovalKind::Human {
             return Err(KernelError::I1(
@@ -1440,27 +1506,57 @@ impl RealKernel {
             ));
         }
         self.spend_approval_challenge(challenge, now_ms)?;
-        self.record_approval(now_ms, &approval, proof)
+        self.record_approval(now_ms, &approval, proof, assertion.as_ref())
+    }
+
+    /// The row key an approval and its assertion share.
+    fn approval_key(approval: &Approval) -> String {
+        format!("{}:{}", approval.subject_hash, hash_canonical(approval))
     }
 
     /// The approval onto the record, ledger first: an approval that is stored
     /// but reported as failed would still satisfy a later promote's
-    /// human-approval gate and the scheduler's waiting step.
+    /// human-approval gate and the scheduler's waiting step. The approval row
+    /// and its assertion row land together or not at all.
     fn record_approval(
         &mut self,
         now_ms: u64,
         approval: &Approval,
         proof: &str,
+        assertion: Option<&AssertionRecord>,
     ) -> Result<(), KernelError> {
-        let key = format!("{}:{}", approval.subject_hash, hash_canonical(approval));
+        let key = Self::approval_key(approval);
         self.log(
             "approval.recorded",
             now_ms,
-            &ApprovalRecord { approval, proof },
+            &ApprovalRecord {
+                approval,
+                proof,
+                assertion,
+            },
         )?;
         self.store
             .db
-            .put_json("approvals", &key, approval)
+            .transaction(|| {
+                self.store.db.put_json("approvals", &key, approval)?;
+                if let Some(a) = assertion {
+                    self.store.db.put_json("assertions", &key, a)?;
+                }
+                Ok(())
+            })
+            .map_err(store_failed)
+    }
+
+    /// What the authenticator signed for `approval`, if it was a passkey
+    /// approval: what `vk`'s auditor, or a test, re-verifies the recorded
+    /// signature against.
+    pub fn assertion_for(
+        &self,
+        approval: &Approval,
+    ) -> Result<Option<AssertionRecord>, KernelError> {
+        self.store
+            .db
+            .get_json("assertions", &Self::approval_key(approval))
             .map_err(store_failed)
     }
 
@@ -2033,7 +2129,7 @@ impl Kernel for RealKernel {
             self.spend_approval_challenge(challenge, ctx.now_ms)?;
         }
         interceptors::i1_approval(&ctx.principal, &approval, &self.devices, ctx.now_ms)?;
-        self.record_approval(ctx.now_ms, &approval, "device-key")
+        self.record_approval(ctx.now_ms, &approval, "device-key", None)
     }
 
     fn stop(&mut self, ctx: &Ctx, scope: &str) -> Result<String, KernelError> {
@@ -3441,6 +3537,9 @@ mod tests {
         let minted = k.mint_approval_challenge(&machine(11), &task).unwrap();
         k.approve(&human(12), signed(&key, &minted)).unwrap();
         assert_eq!(k.approvals_for(&subject).len(), 1);
+        // A device-key approval has no assertion row, and its payload has no
+        // `assertion` field at all.
+        assert_eq!(k.assertion_for(&signed(&key, &minted)).unwrap(), None);
         let last = k.ledger().events().last().unwrap();
         assert_eq!(last.kind, "approval.recorded");
         assert_eq!(
@@ -3448,6 +3547,7 @@ mod tests {
             hash_canonical(&ApprovalRecord {
                 approval: &signed(&key, &minted),
                 proof: "device-key",
+                assertion: None,
             })
         );
         // Presented again: spent.
@@ -3492,7 +3592,7 @@ mod tests {
             expires_at_ms: 1_000_000,
         };
         let err = k
-            .record_verified_human_approval(5, approval(&unminted), "webauthn")
+            .record_verified_human_approval(5, approval(&unminted), "webauthn", None)
             .unwrap_err();
         assert!(
             matches!(&err, KernelError::I1(m) if m.contains("minted")),
@@ -3508,19 +3608,19 @@ mod tests {
             lease_id: "web".into(),
         };
         assert!(matches!(
-            k.record_verified_human_approval(6, machine_made, "webauthn"),
+            k.record_verified_human_approval(6, machine_made, "webauthn", None),
             Err(KernelError::I1(_))
         ));
         let mut unsigned = approval(&minted);
         unsigned.signature_hex = None;
         assert!(matches!(
-            k.record_verified_human_approval(6, unsigned, "webauthn"),
+            k.record_verified_human_approval(6, unsigned, "webauthn", None),
             Err(KernelError::I1(_))
         ));
         let mut other = approval(&minted);
         other.subject_hash = "sha256:other".into();
         assert!(matches!(
-            k.record_verified_human_approval(6, other, "webauthn"),
+            k.record_verified_human_approval(6, other, "webauthn", None),
             Err(KernelError::I1(_))
         ));
         assert_eq!(k.pending_approvals(6).len(), 1, "still unspent");
@@ -3528,9 +3628,19 @@ mod tests {
         assert_eq!(k.ledger().events().len(), before);
 
         // The genuine one: recorded, named, spent.
-        k.record_verified_human_approval(7, approval(&minted), "webauthn")
+        let assertion = AssertionRecord {
+            credential_id: "abc".into(),
+            authenticator_data: "YXV0aA".into(),
+            client_data_json: "eyJjaGFsbGVuZ2UiOiJuIn0".into(),
+        };
+        k.record_verified_human_approval(7, approval(&minted), "webauthn", Some(assertion.clone()))
             .unwrap();
         assert_eq!(k.approvals_for(&subject), vec![approval(&minted)]);
+        // The assertion is stored beside the approval, under its key.
+        assert_eq!(
+            k.assertion_for(&approval(&minted)).unwrap(),
+            Some(assertion.clone())
+        );
         let last = k.ledger().events().last().unwrap();
         assert_eq!(last.kind, "approval.recorded");
         assert_eq!(
@@ -3538,11 +3648,12 @@ mod tests {
             hash_canonical(&ApprovalRecord {
                 approval: &approval(&minted),
                 proof: "webauthn",
+                assertion: Some(&assertion),
             })
         );
         assert!(k.pending_approvals(7).is_empty());
         let err = k
-            .record_verified_human_approval(8, approval(&minted), "webauthn")
+            .record_verified_human_approval(8, approval(&minted), "webauthn", None)
             .unwrap_err();
         assert!(
             matches!(&err, KernelError::I1(m) if m.contains("minted")),
@@ -3553,6 +3664,79 @@ mod tests {
             k.run_task_step(&machine(9), &task).unwrap().status,
             crate::tasks::TaskStatus::Done
         );
+    }
+
+    /// SP1b Task 5 fix round 1 (review Important 1): the passkey path mints
+    /// with the verifier's own challenge as the nonce, so one value is
+    /// signed by the authenticator and spent by the kernel. The kernel still
+    /// binds the task, the subject, the resource and the expiry, refuses a
+    /// short nonce and one already open, and spends it exactly once.
+    #[test]
+    fn a_challenge_minted_with_a_given_nonce_is_bound_and_spent_like_any_other() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let (task, subject) = waiting_task(&mut k);
+        let webauthn_challenge = "c".repeat(43);
+        let ch = k
+            .mint_approval_challenge_with_nonce(&machine(5), &task, webauthn_challenge.clone())
+            .unwrap();
+        assert_eq!(ch.nonce, webauthn_challenge);
+        assert_eq!(ch.resource, format!("task:{task}"));
+        assert_eq!(ch.action_digest, subject);
+        assert_eq!(ch.expires_at_ms, 5 + APPROVAL_CHALLENGE_TTL_MS);
+        assert_eq!(k.pending_approvals(5)[0].challenge, ch);
+
+        // Too short, already open, or for a task that is not there: refused,
+        // and nothing is minted for any of them.
+        let err = k
+            .mint_approval_challenge_with_nonce(&machine(5), &task, "short".into())
+            .unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("32")),
+            "{err}"
+        );
+        let err = k
+            .mint_approval_challenge_with_nonce(&machine(5), &task, webauthn_challenge.clone())
+            .unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("already open")),
+            "{err}"
+        );
+        let err = k
+            .mint_approval_challenge_with_nonce(&machine(5), "task-none", "d".repeat(43))
+            .unwrap_err();
+        assert!(matches!(err, KernelError::NotFound(_)), "{err}");
+        assert_eq!(k.pending_approvals(5).len(), 1);
+
+        // Spent once by the passkey path, then gone.
+        let approval = Approval {
+            subject_hash: subject.clone(),
+            kind: ApprovalKind::Human,
+            approver: Principal::Human {
+                device_id: "passkey:abc".into(),
+            },
+            challenge: Some(ch.clone()),
+            signature_hex: Some("3045".into()),
+        };
+        k.record_verified_human_approval(6, approval.clone(), "webauthn", None)
+            .unwrap();
+        assert!(k.pending_approvals(6).is_empty());
+        let err = k
+            .record_verified_human_approval(7, approval, "webauthn", None)
+            .unwrap_err();
+        assert!(
+            matches!(&err, KernelError::I1(m) if m.contains("minted")),
+            "{err}"
+        );
+        // The task is done with its approval now, so nothing more is minted
+        // for it — with that nonce or any other.
+        assert_eq!(
+            k.run_task_step(&machine(8), &task).unwrap().status,
+            crate::tasks::TaskStatus::Done
+        );
+        assert!(k
+            .mint_approval_challenge_with_nonce(&machine(9), &task, webauthn_challenge)
+            .is_err());
     }
 
     /// A passkey is a device row of its own class: listed with its credential

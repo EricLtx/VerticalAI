@@ -129,12 +129,11 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("bind {}", endpoint.0))?;
     // The pages' port too, before the record, for the same reason: a port
     // another daemon holds is a start that is refused, not a node that
-    // serves half of its ceremony.
-    let web_listener = vk_web::bind(a.web_port).await?;
-    let web_port = web_listener
-        .local_addr()
-        .context("the web listener's address")?
-        .port();
+    // serves half of its ceremony. Both loopback families — a browser asked
+    // for `localhost` may connect to `::1` first, and an address this daemon
+    // does not hold is one anybody else may (review Critical 1).
+    let web_listeners = vk_web::bind(a.web_port).await?;
+    let web_port = web_listeners.port();
     if a.auto_enroll_node {
         let source = match a.node_key_file {
             Some(p) => vk_kernel::presence::KeySource::File(p),
@@ -201,11 +200,16 @@ async fn main() -> anyhow::Result<()> {
     // The passkey pages, on loopback beside the endpoint (SP1b Task 5). They
     // share the kernel mutex with the transport and take it the same way —
     // for a call, never across an await. A link into them is minted only
-    // over the endpoint (`web.link`), so the pages inherit its ACL.
+    // over the endpoint (`web.link`); what protects the pages is in
+    // `contracts/tcb.md`.
     let web = vk_web::build(kernel.clone(), &a.node_id, web_port)?;
-    tracing::info!(web = %web.links.origin(), "passkey pages listening");
+    tracing::info!(
+        web = %web.links.origin(),
+        bound = %web_listeners.bound(),
+        "passkey pages listening"
+    );
     tokio::spawn(async move {
-        if let Err(e) = vk_web::serve(web_listener, web.router).await {
+        if let Err(e) = vk_web::serve(web_listeners, web.router).await {
             tracing::error!(error = %format!("{e:#}"), "the passkey pages stopped serving");
         }
     });

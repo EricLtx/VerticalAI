@@ -414,7 +414,7 @@ struct Presented {
 fn takes_presence(method: &str) -> bool {
     matches!(
         method,
-        "task.create" | "task.step" | "stop" | "resume" | "approve"
+        "task.create" | "task.step" | "stop" | "resume" | "approve" | "web.link"
     )
 }
 
@@ -556,20 +556,34 @@ fn dispatch(
             "web": config.web.as_ref().map(|w| w.origin()),
         })),
         // The link a person opens to enrol a passkey or to approve a task with
-        // one (SP1b Task 5). Minted here, over the endpoint whose ACL already
-        // proved the peer is this user's process, so the pages inherit that
-        // ACL: nobody who could not open this pipe gets a link. The approve
-        // link is minted only for a task that is waiting at its approve step,
-        // for the same reason `task.subject` answers only then.
+        // one (SP1b Task 5). Minted here, over the endpoint, so only a process
+        // that could open this pipe gets one; the link is single-use, short
+        // and page-bound, and the pages themselves hold both loopback
+        // addresses and check the `Host` — see `contracts/tcb.md` for what
+        // that does and does not protect. The approve link is minted only for
+        // a task that is waiting at its approve step, for the same reason
+        // `task.subject` answers only then. The **enrol** link is a human act
+        // (review Important 2): a new passkey is admitted only under an
+        // existing ceremony — a presence proof by the node's device key
+        // today, so a same-user process with the pipe and nothing else cannot
+        // enrol a passkey of its own.
         "web.link" => {
             let web = config.web.as_ref().ok_or_else(|| RpcError {
                 code: E_STORE,
                 message: "this daemon serves no web pages: start vkd with --web-port".into(),
             })?;
+            let ctx = ctx_for(&k, presence, now)?;
             match p["page"].as_str().ok_or_else(|| bad("page"))? {
-                "enroll" => Ok(json!({ "url": web.enroll_link(now) })),
+                "enroll" => {
+                    if !ctx.principal.is_human() {
+                        return Err(invariant(
+                            "I1: enrolling a passkey requires a human ceremony: present a presence \
+                             proof by this node's device key (`vk passkey enroll` signs one)",
+                        ));
+                    }
+                    Ok(json!({ "url": web.enroll_link(now) }))
+                }
                 "approve" => {
-                    let ctx = ctx_for(&k, presence, now)?;
                     let id = p["task_id"].as_str().ok_or_else(|| bad("task_id"))?;
                     let subject = k.approval_subject(&ctx, id).map_err(kerr)?;
                     Ok(json!({ "url": web.approve_link(id, now), "subject_hash": subject }))

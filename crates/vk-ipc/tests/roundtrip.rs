@@ -1039,3 +1039,142 @@ async fn approve_accepts_only_a_challenge_the_kernel_minted_and_only_once() {
     assert_eq!(step().await.unwrap()["status"], "done");
     server.abort();
 }
+
+/// The pages' side of `web.link`, as a test sees it: links that name what
+/// they are for, minted by nothing but this stub.
+struct StubLinks;
+
+impl vk_ipc::server::WebLinks for StubLinks {
+    fn origin(&self) -> String {
+        "http://localhost:1".into()
+    }
+    fn enroll_link(&self, _now_ms: u64) -> String {
+        "http://localhost:1/enroll?t=stub".into()
+    }
+    fn approve_link(&self, task_id: &str, _now_ms: u64) -> String {
+        format!("http://localhost:1/approve/{task_id}?t=stub")
+    }
+}
+
+/// SP1b Task 5 fix round 1 (review Important 2): enrolling a passkey is a
+/// human act. `web.link {page: enroll}` is minted only under a presence proof
+/// by an enrolled device key — a process with the pipe and nothing else gets
+/// no link — while an approve link needs no proof, only a waiting task; and a
+/// daemon that serves no pages says so, proof or not.
+#[tokio::test]
+async fn web_link_enroll_requires_a_presence_proof() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let laptop = SoftwareHumanKey::generate("laptop");
+    {
+        use vk_contracts::testing::KernelTestHooks;
+        k.lock()
+            .unwrap()
+            .enroll_device("laptop", laptop.verifying_key_bytes());
+    }
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let listener = vk_ipc::transport::os::bind(&endpoint).await.unwrap();
+    let config = vk_ipc::server::ServerConfig {
+        web: Some(Arc::new(StubLinks)),
+        ..vk_ipc::server::ServerConfig::new(endpoint.0.clone())
+    };
+    let server = tokio::spawn(vk_ipc::server::serve_on(k.clone(), listener, config));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    // No proof: the connection is a machine principal, and I1 refuses.
+    let err = c
+        .call("web.link", json!({"page": "enroll"}), None)
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+    assert!(
+        err.to_string().contains("I1") && err.to_string().contains("presence"),
+        "{err}"
+    );
+
+    // A forged proof (an unissued nonce) is refused the same way.
+    let forged = PresenceProof::sign(&laptop, "never-issued");
+    let err = c
+        .call("web.link", json!({"page": "enroll"}), Some(forged))
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+
+    // The enrolled key's presence: a link.
+    let proof = prove(&c, &laptop).await;
+    let ok = c
+        .call("web.link", json!({"page": "enroll"}), Some(proof))
+        .await
+        .unwrap();
+    assert_eq!(ok["url"], "http://localhost:1/enroll?t=stub");
+
+    // An approve link needs no proof, only a task that is waiting.
+    let err = c
+        .call(
+            "web.link",
+            json!({"page": "approve", "task_id": "task-none"}),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_NOT_FOUND, "{err}");
+    let arch = c
+        .call("arch.mount_mock", json!({"name": "mock"}), None)
+        .await
+        .unwrap()["arch_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let id = c
+        .call(
+            "task.create",
+            json!({
+                "goal": "Draft a proposal",
+                "artefact_type": "proposal",
+                "steps": [
+                    {"kind": "draft", "arch_id": arch},
+                    {"kind": "approve"}
+                ]
+            }),
+            None,
+        )
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let err = c
+        .call("web.link", json!({"page": "approve", "task_id": id}), None)
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+    assert!(err.to_string().contains("not waiting"), "{err}");
+    c.call("task.step", json!({"task_id": id}), None)
+        .await
+        .unwrap();
+    c.call("task.step", json!({"task_id": id}), None)
+        .await
+        .unwrap();
+    let ok = c
+        .call("web.link", json!({"page": "approve", "task_id": id}), None)
+        .await
+        .unwrap();
+    assert_eq!(ok["url"], format!("http://localhost:1/approve/{id}?t=stub"));
+    assert!(ok["subject_hash"].as_str().unwrap().starts_with("sha256:"));
+    server.abort();
+
+    // A daemon without pages: `web.link` says so, whatever the proof.
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+    let proof = prove(&c, &laptop).await;
+    let err = c
+        .call("web.link", json!({"page": "enroll"}), Some(proof))
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_STORE, "{err}");
+    assert!(err.to_string().contains("--web-port"), "{err}");
+    server.abort();
+}

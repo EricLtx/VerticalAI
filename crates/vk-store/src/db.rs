@@ -23,6 +23,10 @@ pub const TABLES: &[&str] = &[
     "liveness",
     "devices",
     "hot",
+    // The bytes a passkey assertion signed, beside the approval it made
+    // (SP1b Task 5 fix round 1): what lets an `approval.recorded` event of
+    // proof `webauthn` be re-verified from the store and the ledger alone.
+    "assertions",
     "kv_test",
 ];
 
