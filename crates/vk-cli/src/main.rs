@@ -24,6 +24,7 @@ use vk_ipc::client::Client;
 use vk_ipc::transport::{default_endpoint, Endpoint};
 use vk_ipc::PresenceProof;
 use vk_kernel::presence::{KeySource, NodeDevice};
+use zeroize::Zeroizing;
 
 /// `vkd --web-port`'s default, handed on by `vk boot`. A literal rather than
 /// `vk_web::DEFAULT_PORT` so this shell does not link the verifier.
@@ -481,16 +482,20 @@ fn secret(cli: &Cli, what: &SecretCmd) -> Result<()> {
              API arch reads"
         ));
     }
-    let value = if *stdin {
-        let mut line = String::new();
+    // Wrapped the moment it exists and never copied out of the wrapper: this
+    // is the one process on this machine that sees the key as a human typed
+    // it, and a plain `String` would leave it in freed heap (fix round 1,
+    // Minor 5).
+    let value: Zeroizing<String> = Zeroizing::new(if *stdin {
+        let mut line = Zeroizing::new(String::new());
         std::io::stdin()
             .read_line(&mut line)
             .context("read the secret from stdin")?;
-        line
+        line.to_string()
     } else {
         rpassword::prompt_password(format!("{service}/{name}: "))
             .context("read the secret from the terminal")?
-    };
+    });
     let value = value.trim();
     if value.is_empty() {
         return Err(anyhow!(
@@ -570,22 +575,31 @@ async fn call(cli: &Cli) -> Result<()> {
                     timeout,
                 },
         } => {
-            let mount = |model: &str| {
-                c.call(
-                    "arch.mount",
-                    json!({
-                        "kind": "claude-code",
-                        "config": {
-                            "binary": bin,
-                            "model": model,
-                            "timeout_secs": timeout,
-                        },
-                    }),
-                    None,
-                )
+            // A proof per call: a nonce is spent by the request that shows
+            // it, so the second mount asks for one of its own (fix round 1,
+            // Critical 1 — a cloud arch is a human act).
+            // `&Client` rather than the client, so the closure stays `Copy`
+            // and can be called for each of the two roles.
+            let client = &c;
+            let mount = move |model: String| async move {
+                let proof = presence(client).await?;
+                client
+                    .call(
+                        "arch.mount",
+                        json!({
+                            "kind": "claude-code",
+                            "config": {
+                                "binary": bin,
+                                "model": model,
+                                "timeout_secs": timeout,
+                            },
+                        }),
+                        Some(proof),
+                    )
+                    .await
             };
-            let draft = mount(draft_model).await?;
-            let judge = match mount(judge_model).await {
+            let draft = mount(draft_model.clone()).await?;
+            let judge = match mount(judge_model.clone()).await {
                 Ok(v) => v,
                 // All or nothing. A verb whose whole reason to exist is that a
                 // node needs both arches must not leave one behind when the
@@ -617,7 +631,11 @@ async fn call(cli: &Cli) -> Result<()> {
         }
         // One mount, one arch, and no key on the wire: the daemon reads it
         // out of its own keyring, so what travels is the model and the
-        // numbers (Task 2b).
+        // numbers (Task 2b). It does travel with a **presence proof**, like
+        // `stop` and `approve` do: mounting a cloud arch authorises this
+        // node's registers to leave the machine for a third party, and it
+        // persists across every restart, so the daemon refuses it from a bare
+        // machine principal (fix round 1, Critical 1).
         Cmd::Mount {
             what:
                 MountCmd::Anthropic {
@@ -626,24 +644,27 @@ async fn call(cli: &Cli) -> Result<()> {
                     max_tokens,
                     timeout,
                 },
-        } => show(
-            cli,
-            c.call(
-                "arch.mount",
-                json!({
-                    "kind": "anthropic",
-                    "config": {
-                        "model": model,
-                        "context_ceiling": ctx,
-                        "max_tokens": max_tokens,
-                        "timeout_secs": timeout,
-                    },
-                }),
-                None,
+        } => {
+            let proof = presence(&c).await?;
+            show(
+                cli,
+                c.call(
+                    "arch.mount",
+                    json!({
+                        "kind": "anthropic",
+                        "config": {
+                            "model": model,
+                            "context_ceiling": ctx,
+                            "max_tokens": max_tokens,
+                            "timeout_secs": timeout,
+                        },
+                    }),
+                    Some(proof),
+                )
+                .await?,
+                render::mounted_arch,
             )
-            .await?,
-            render::mounted_arch,
-        ),
+        }
         Cmd::Mount {
             what:
                 MountCmd::Bedrock {
@@ -652,24 +673,27 @@ async fn call(cli: &Cli) -> Result<()> {
                     ctx,
                     max_tokens,
                 },
-        } => show(
-            cli,
-            c.call(
-                "arch.mount",
-                json!({
-                    "kind": "bedrock",
-                    "config": {
-                        "region": region,
-                        "model": model,
-                        "context_ceiling": ctx,
-                        "max_tokens": max_tokens,
-                    },
-                }),
-                None,
+        } => {
+            let proof = presence(&c).await?;
+            show(
+                cli,
+                c.call(
+                    "arch.mount",
+                    json!({
+                        "kind": "bedrock",
+                        "config": {
+                            "region": region,
+                            "model": model,
+                            "context_ceiling": ctx,
+                            "max_tokens": max_tokens,
+                        },
+                    }),
+                    Some(proof),
+                )
+                .await?,
+                render::mounted_arch,
             )
-            .await?,
-            render::mounted_arch,
-        ),
+        }
         // One mount, one arch: a local model is one engine, and which role it
         // is given is the task's to say.
         Cmd::Mount {

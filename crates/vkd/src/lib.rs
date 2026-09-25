@@ -41,6 +41,14 @@ pub struct Args {
     /// the daemon's files with the daemon's rights.
     #[arg(long)]
     pub anthropic_key_file: Option<PathBuf>,
+    /// Where an `anthropic` arch's calls go. The first-party API unless this
+    /// says otherwise, and this is the **only** way to say otherwise: no pipe
+    /// client can name it, because a client that could would be choosing
+    /// where this daemon sends its own key (SP1b Task 2b fix round 1). Must
+    /// be `https://`, or `http://` on this machine's own loopback, which is
+    /// what the tests use.
+    #[arg(long)]
+    pub anthropic_base_url: Option<String>,
     /// SP1a convenience: enroll this node's own device key at first start, so
     /// the interactive machine can be the human this node knows. SP1b replaces
     /// it with the passkey enrolment ceremony.
@@ -305,14 +313,31 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
     // time a persisted one is re-created (SP1b Task 2b). The keyring unless
     // the operator named a file.
     let anthropic_keys = match &a.anthropic_key_file {
-        Some(p) => vk_arch_anthropic::KeySource::File(p.clone()),
+        Some(p) => {
+            // A key in a file is a key anyone who can read the file has. The
+            // store's master key file is held to the same rule, and for the
+            // same reason (fix round 1, Ruling 30).
+            vk_store::keys::check_private_file(p).context("--anthropic-key-file")?;
+            vk_arch_anthropic::KeySource::File(p.clone())
+        }
         None => vk_arch_anthropic::KeySource::Keyring,
     };
+    // Bounded here, once, rather than trusted: everything downstream of this
+    // point puts an API key on whatever it names.
+    let anthropic_base_url = a
+        .anthropic_base_url
+        .clone()
+        .unwrap_or_else(|| vk_arch_anthropic::DEFAULT_BASE_URL.to_string());
+    vk_arch_anthropic::check_base_url(&anthropic_base_url).context("--anthropic-base-url")?;
     let mut kernel = vk_kernel::RealKernel::open_with_factory(
         &state_dir,
         key_source,
         &a.node_id,
-        vk_ipc::server::adapter_factory(state_dir.clone(), anthropic_keys.clone()),
+        vk_ipc::server::adapter_factory(
+            state_dir.clone(),
+            anthropic_keys.clone(),
+            anthropic_base_url.clone(),
+        ),
     )?;
     // The endpoint before the record. Binding is the other way a start can be
     // refused — another daemon is serving this name — and a daemon that will
@@ -455,6 +480,7 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
         },
         web: Some(Arc::new(LinkMinter(web.links))),
         anthropic_keys,
+        anthropic_base_url,
     };
     vk_ipc::server::serve_on(kernel, listener, config).await
 }

@@ -83,7 +83,7 @@ fn mock_manifest(name: &str) -> vk_contracts::arch::ArchManifest {
         locality: Locality::Local,
         jurisdiction: "FR".into(),
         retention_days: None,
-        cost_per_1k_tokens_eur: 0.0,
+        cost_per_1k_tokens_eur: Some(0.0),
         latency_ms_p50: 1,
         context_ceiling: 4096,
         determinism: Determinism::SeededDeterministic,

@@ -19,7 +19,11 @@
       "minimum": 0
     },
     "cost_per_1k_tokens_eur": {
-      "type": "number",
+      "description": "What a thousand prompt tokens cost on this arch, in euros — or `None`\nwhen this node has no price list for it.\n\n`None` is not zero and must never be rendered as one (SP1b Task 2b fix\nround 1, Ruling 30). `Some(0.0)` is a claim: nothing is billed, which\nis true of a local model and of a subscription. `None` is the absence\nof a claim — the Bedrock arch, whose prices are AWS's and which this\nnode has not read — and an operator shown `0` there would believe the\ncalls were free. `vk top` prints `?`.",
+      "type": [
+        "number",
+        "null"
+      ],
       "format": "double"
     },
     "determinism": {
@@ -61,7 +65,6 @@
     "capabilities",
     "locality",
     "jurisdiction",
-    "cost_per_1k_tokens_eur",
     "latency_ms_p50",
     "context_ceiling",
     "determinism",

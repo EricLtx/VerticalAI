@@ -291,6 +291,13 @@ pub struct TopView {
     /// nothing to explain.
     #[serde(default)]
     pub unavailable: BTreeMap<String, String>,
+    /// What a thousand prompt tokens cost on each mounted arch, in euros, as
+    /// its manifest states it — `None` inside the `Some` for an arch whose
+    /// price this node does not know (SP1b Task 2b fix round 1). Beside the
+    /// counters for the same reason `governed` is: a price is what an arch
+    /// *is*, and an arch with counters and no entry here has been unmounted.
+    #[serde(default)]
+    pub price_eur_per_1k: BTreeMap<String, Option<f64>>,
     pub tasks: BTreeMap<String, TaskStatus>,
     pub stopped_scopes: Vec<String>,
     pub liveness: BTreeMap<String, u64>,
@@ -1274,6 +1281,8 @@ impl RealKernel {
         for (id, m, state) in self.arch_states() {
             v.arches.entry(id.clone()).or_default();
             v.governed.insert(id.clone(), m.governed);
+            v.price_eur_per_1k
+                .insert(id.clone(), m.cost_per_1k_tokens_eur);
             v.states.insert(id.clone(), state.name().into());
             if let Some(why) = state.reason() {
                 v.unavailable.insert(id, why.into());

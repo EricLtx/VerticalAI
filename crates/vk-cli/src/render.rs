@@ -18,6 +18,20 @@ fn text(v: &Value) -> String {
 /// A counter whose zero means "nothing was measured", shown as a dash rather
 /// than as a number a reader could take for a measurement that came out at
 /// zero. A missing or non-numeric field reads the same way.
+/// An arch's price per thousand prompt tokens, as its manifest states it.
+///
+/// Three outcomes and three glyphs, because they are three different things:
+/// a number is a price, `-` is "nothing is billed" (a local model, a
+/// subscription), and `?` is "this node has no price list for that arch" —
+/// the Bedrock case, priced by AWS out of a table nobody here has read. A
+/// `?` rendered as `0` would tell an operator their EU calls are free.
+fn price(v: &Value) -> String {
+    match v {
+        Value::Null => "?".into(),
+        _ => zeroless(v, |n| format!("{n:.4}")),
+    }
+}
+
 fn zeroless(v: &Value, render: impl Fn(f64) -> String) -> String {
     match v.as_f64() {
         Some(n) if n != 0.0 => render(n),
@@ -321,6 +335,13 @@ pub fn top(v: &Value) -> String {
                         // never mistaken for a figure anyone could bill.
                         zeroless(&s["tokens_in_measured"], |n| format!("{n:.0}")),
                         zeroless(&s["cost_list_usd"], |c| format!("{c:.5}")),
+                        // The manifest's own price tag, which is a different
+                        // thing from the cost column beside it: that one is
+                        // what the calls *did* cost, this is what the arch
+                        // charges. `?` where the node has no price list for
+                        // the arch — never `0`, which would read as free
+                        // (Ruling 30).
+                        price(&v["price_eur_per_1k"][id]),
                         text(&s["projected"]),
                     ]
                 })
@@ -339,6 +360,7 @@ pub fn top(v: &Value) -> String {
                 "TOKENS",
                 "MEASURED",
                 "COST (LIST USD)",
+                "EUR/1K",
                 "PROJECTED",
             ],
             &arches,

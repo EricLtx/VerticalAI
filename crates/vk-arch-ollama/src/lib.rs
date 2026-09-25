@@ -345,7 +345,7 @@ impl OllamaAdapter {
             retention_days: if governed { Some(0) } else { None },
             // Local compute is not metered. The cost of a call is the CPU it
             // takes, and `vk top` reports the tokens rather than a price.
-            cost_per_1k_tokens_eur: 0.0,
+            cost_per_1k_tokens_eur: Some(0.0),
             latency_ms_p50: latency_p50_ms(&cfg.model),
             context_ceiling: ceiling_of(cfg, id),
             // A seed, a temperature and a fixed engine version: the same

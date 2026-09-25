@@ -86,6 +86,48 @@ impl MasterKey {
     }
 }
 
+/// Refuse a key file anybody but its owner can read.
+///
+/// A secret in a file is a secret everyone who can open the file has, so a
+/// file-backed key is only as private as its permissions — the same rule
+/// [`MasterKey::load_or_create`] applies to the master key, made available to
+/// the other file seams (`vkd --anthropic-key-file`, SP1b Task 2b fix round 1,
+/// Ruling 30). On Unix that is the mode; on Windows it is the DACL, audited
+/// against the same three accounts a protected state directory admits.
+pub fn check_private_file(path: &std::path::Path) -> Result<()> {
+    anyhow::ensure!(path.is_file(), "{} is not a file", path.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .with_context(|| format!("read the permissions of {}", path.display()))?
+            .permissions()
+            .mode();
+        anyhow::ensure!(
+            mode & 0o077 == 0,
+            "{} is mode {:o}: a key file must be readable by its owner only (chmod 600)",
+            path.display(),
+            mode & 0o777
+        );
+    }
+    #[cfg(windows)]
+    {
+        let mut allowed = vec![
+            crate::win_acl::LOCAL_SYSTEM_SID.to_string(),
+            crate::win_acl::ADMINISTRATORS_SID.to_string(),
+        ];
+        allowed.push(crate::win_acl::current_process_sid()?);
+        let refs: Vec<&str> = allowed.iter().map(String::as_str).collect();
+        crate::win_acl::audit_protected_dir(path, &refs).with_context(|| {
+            format!(
+                "{} is readable by an account that is not this one: a key file must not be",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn fresh() -> [u8; 32] {
     let mut k = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut k);

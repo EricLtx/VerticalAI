@@ -19,6 +19,16 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # The other half of the `bedrock` feature gate. The default build has no
+      # AWS SDK in it (Ruling 30), so `cargo test --workspace` above already
+      # exercises the refusal; this checks that the half *with* the SDK still
+      # compiles, which nothing else in CI would notice breaking.
+      - name: The EU arch's transport still builds
+        run: cargo check -p vkd -p vk-arch-anthropic --features bedrock --all-targets
+      # And that the crates stay buildable with every optional feature off,
+      # which is what a node that wants none of the AWS supply chain builds.
+      - name: The build without any optional feature
+        run: cargo check --no-default-features -p vkd -p vk-arch-anthropic
   arch-ollama:
     # The Ollama adapter against a real container and a real model. Not on
     # every branch push: it starts a container, pulls the 1B model and spends

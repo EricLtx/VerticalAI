@@ -12,7 +12,7 @@ fn arch(max_scope: Scope, third_party: bool) -> ArchManifest {
         locality: Locality::Cloud,
         jurisdiction: "US".into(),
         retention_days: Some(30),
-        cost_per_1k_tokens_eur: 0.01,
+        cost_per_1k_tokens_eur: Some(0.01),
         latency_ms_p50: 1,
         context_ceiling: 10_000,
         determinism: Determinism::NonDeterministic,

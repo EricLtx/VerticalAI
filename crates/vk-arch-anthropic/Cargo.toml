@@ -7,18 +7,21 @@ repository.workspace = true
 description = "VerticalAI arch adapters: the Anthropic API first-party (US) and EU-hosted through Amazon Bedrock"
 
 [features]
-# `bedrock` is **on by default**, because the measurement says it can be: the
-# AWS SDK is 83 extra crates and takes a clean Windows build of this crate
-# from 15 s to 1 m 15 s — about a minute, against the ~3 minutes that would
-# have made it default-off (Task 2b report, §4). Linux (WSL) builds the same
-# tree in 1 m 44 s, `aws-lc-sys` included. A node that wants neither the SDK
-# nor its 83 crates in its supply chain builds with `--no-default-features`;
-# `arch.mount { kind: "bedrock" }` is then refused by name and says so.
+# `bedrock` is **off by default** (Ruling 30). Not for the build time — that
+# was measured at 83 extra crates and about a minute on a clean Windows build,
+# 15 s to 1 m 15 s, which is affordable — but for the supply chain: this is a
+# kernel with a `contracts/tcb.md` that enumerates its trusted base, and 83
+# transitive dependencies (`aws-lc-sys` among them, which wants a C toolchain)
+# do not belong in every node's build for an arch most nodes will never mount.
+# A node that wants the EU arch asks for it: `cargo build --features bedrock`.
+# Without it, `arch.mount { kind: "bedrock" }` is refused by name and says how
+# to get a build that has it — and *that* refusal is what the default build
+# now exercises.
 #
 # Nothing outside `src/bedrock.rs`'s `client` module is gated, so the EU
 # manifest, the model table and `converse_input` are compiled and tested in
 # every build either way.
-default = ["bedrock"]
+default = []
 bedrock = ["dep:aws-config", "dep:aws-sdk-bedrockruntime", "dep:tokio"]
 
 [dependencies]

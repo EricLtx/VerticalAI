@@ -1191,19 +1191,36 @@ fn kernel_with_arches(
         dir,
         vk_store::keys::KeySource::File(dir.join("m.key")),
         "n1",
-        vk_ipc::server::adapter_factory(dir.to_path_buf(), keys.clone()),
+        vk_ipc::server::adapter_factory(
+            dir.to_path_buf(),
+            keys.clone(),
+            vk_arch_anthropic::DEFAULT_BASE_URL.to_string(),
+        ),
     )
     .unwrap()
+}
+
+/// A node with a device enrolled, because mounting a cloud arch is a human
+/// act and needs one (fix round 1, Critical 1).
+fn with_device(k: &Arc<Mutex<vk_kernel::RealKernel>>) -> SoftwareHumanKey {
+    let device = SoftwareHumanKey::generate("laptop");
+    {
+        use vk_contracts::testing::KernelTestHooks;
+        k.lock()
+            .unwrap()
+            .enroll_device("laptop", device.verifying_key_bytes());
+    }
+    device
 }
 
 /// The key a daemon under test holds. Shaped like a real one so that "it is
 /// not in the record" is a claim about a string that would be noticed.
 const FAKE_KEY: &str = "sk-ant-api03-ROUNDTRIPROUNDTRIPROUNDTRIP";
 
-/// Mounting an API arch: the key comes from the daemon's own key source and
-/// never from the request, the arch is a US cloud arch this kernel does not
-/// govern, and what is written down to re-create it carries the model and the
-/// numbers — and no credential.
+/// Mounting an API arch: it is a **human** act, the key comes from the
+/// daemon's own key source and never from the request, the arch is a US cloud
+/// arch this kernel does not govern, and what is written down to re-create it
+/// carries the model and the numbers — and no credential.
 ///
 /// The second half is the one that matters. A mount spec lives unencrypted in
 /// the metadata database, so an adapter that stashed its key there would put
@@ -1215,17 +1232,11 @@ async fn an_anthropic_arch_mounts_from_the_daemons_own_key_and_the_spec_carries_
     let d = tempfile::tempdir().unwrap();
     let dir = d.path().to_path_buf();
     let key_file = dir.join("anthropic.key");
-    std::fs::write(
-        &key_file,
-        format!(
-            "{FAKE_KEY}
-"
-        ),
-    )
-    .unwrap();
+    std::fs::write(&key_file, format!("{FAKE_KEY}\n")).unwrap();
     let keys = vk_arch_anthropic::KeySource::File(key_file);
 
     let k = Arc::new(Mutex::new(kernel_with_arches(&dir, &keys)));
+    let device = with_device(&k);
     let endpoint = vk_ipc::transport::test_endpoint();
     let listener = vk_ipc::transport::os::bind(&endpoint).await.unwrap();
     let config = vk_ipc::server::ServerConfig {
@@ -1235,11 +1246,32 @@ async fn an_anthropic_arch_mounts_from_the_daemons_own_key_and_the_spec_carries_
     let server = tokio::spawn(vk_ipc::server::serve_on(k.clone(), listener, config));
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let c = Client::connect(&endpoint).await.unwrap();
-    let mounted = c
+
+    // Without a proof the connection is a machine principal, and mounting an
+    // arch that sends registers to a third party is not a machine's to do.
+    let err = c
         .call(
             "arch.mount",
             json!({"kind": "anthropic", "config": {"model": "claude-sonnet-5"}}),
             None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+    assert!(err.to_string().contains("I1"), "{err}");
+    assert_eq!(
+        c.call("boot.info", json!({}), None).await.unwrap()["arches"],
+        0,
+        "nothing was mounted on the way past"
+    );
+
+    // With one, it mounts.
+    let proof = prove(&c, &device).await;
+    let mounted = c
+        .call(
+            "arch.mount",
+            json!({"kind": "anthropic", "config": {"model": "claude-sonnet-5"}}),
+            Some(proof),
         )
         .await
         .unwrap();
@@ -1280,7 +1312,12 @@ async fn an_anthropic_arch_mounts_from_the_daemons_own_key_and_the_spec_carries_
             !written.contains(FAKE_KEY) && !written.contains("sk-ant"),
             "a credential is at rest in the clear: {written}"
         );
-        // And the guard that keeps it that way agrees.
+        // Nor an endpoint: the origin is the daemon's, so nothing a client
+        // could have said about it survives into the record either.
+        assert!(
+            !written.contains("base_url") && !written.contains("http"),
+            "the record names an endpoint: {written}"
+        );
         assert!(spec.validate().is_ok(), "{spec:?}");
 
         // Re-created from the record plus the key source, it is the same arch.
@@ -1294,16 +1331,23 @@ async fn an_anthropic_arch_mounts_from_the_daemons_own_key_and_the_spec_carries_
     .unwrap();
 }
 
-/// No key, no arch — and the refusal is the one sentence that fixes it.
+/// **Where the key goes is not the caller's to say.**
 ///
-/// Whether the keyring has no such entry, or this OS has no keyring at all,
-/// or the file the operator named is not there, the remedy is the same and
-/// the message says it. Nothing is mounted on the way past.
+/// The daemon holds the key; a client that could name the origin could name a
+/// collector and have the daemon post the key to it — over plaintext, and
+/// again at every boot, since the spec is replayed. So the config for a cloud
+/// kind is a closed shape: `base_url`, `endpoint`, `host` or anything else
+/// nobody declared is a `-32602` that names the field, and the refusal is the
+/// same on a build with the AWS SDK and on one without (fix round 1,
+/// Critical 1).
 #[tokio::test]
-async fn mounting_an_anthropic_arch_without_a_key_says_how_to_set_one() {
+async fn a_cloud_mount_may_not_name_the_endpoint_its_key_is_sent_to() {
     let d = tempfile::tempdir().unwrap();
-    let keys = vk_arch_anthropic::KeySource::File(d.path().join("not-there.key"));
+    let key_file = d.path().join("anthropic.key");
+    std::fs::write(&key_file, format!("{FAKE_KEY}\n")).unwrap();
+    let keys = vk_arch_anthropic::KeySource::File(key_file);
     let k = Arc::new(Mutex::new(kernel_with_arches(d.path(), &keys)));
+    let device = with_device(&k);
     let endpoint = vk_ipc::transport::test_endpoint();
     let listener = vk_ipc::transport::os::bind(&endpoint).await.unwrap();
     let config = vk_ipc::server::ServerConfig {
@@ -1314,11 +1358,69 @@ async fn mounting_an_anthropic_arch_without_a_key_says_how_to_set_one() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let c = Client::connect(&endpoint).await.unwrap();
 
+    for (kind, field, value) in [
+        ("anthropic", "base_url", json!("http://collector.example")),
+        ("anthropic", "endpoint", json!("http://collector.example")),
+        ("anthropic", "host", json!("collector.example")),
+        ("bedrock", "base_url", json!("http://collector.example")),
+        ("bedrock", "endpoint_url", json!("http://collector.example")),
+    ] {
+        // A fresh proof per attempt: a nonce is spent by the request that
+        // shows it, and this must fail on the config and not on the nonce.
+        let proof = prove(&c, &device).await;
+        let err = c
+            .call(
+                "arch.mount",
+                json!({"kind": kind, "config": { field: value }}),
+                Some(proof),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            code_of(&err),
+            vk_ipc::E_BAD_PARAMS,
+            "{kind}/{field} was not refused as a bad parameter: {err}"
+        );
+        assert!(
+            err.to_string().contains(field),
+            "the refusal must name the field: {err}"
+        );
+    }
+    assert_eq!(
+        c.call("boot.info", json!({}), None).await.unwrap()["arches"],
+        0,
+        "nothing was mounted by any of them"
+    );
+    server.abort();
+}
+
+/// No key, no arch — and the refusal is the one sentence that fixes it.
+///
+/// Whether the keyring has no such entry, or this OS has no keyring at all,
+/// or the file the operator named is not there, the remedy is the same and
+/// the message says it. Nothing is mounted on the way past.
+#[tokio::test]
+async fn mounting_an_anthropic_arch_without_a_key_says_how_to_set_one() {
+    let d = tempfile::tempdir().unwrap();
+    let keys = vk_arch_anthropic::KeySource::File(d.path().join("not-there.key"));
+    let k = Arc::new(Mutex::new(kernel_with_arches(d.path(), &keys)));
+    let device = with_device(&k);
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let listener = vk_ipc::transport::os::bind(&endpoint).await.unwrap();
+    let config = vk_ipc::server::ServerConfig {
+        anthropic_keys: keys,
+        ..vk_ipc::server::ServerConfig::new(endpoint.0.clone())
+    };
+    let server = tokio::spawn(vk_ipc::server::serve_on(k.clone(), listener, config));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    let proof = prove(&c, &device).await;
     let err = c
         .call(
             "arch.mount",
             json!({"kind": "anthropic", "config": {}}),
-            None,
+            Some(proof),
         )
         .await
         .unwrap_err();
@@ -1333,21 +1435,24 @@ async fn mounting_an_anthropic_arch_without_a_key_says_how_to_set_one() {
 
 /// A daemon built without the AWS SDK refuses `bedrock` by name and says how
 /// to get one that has it — rather than "no arch kind bedrock", which reads
-/// like a typo and is not one.
+/// like a typo and is not one. This is the **default** build (Ruling 30), so
+/// this is the half of the feature gate that CI exercises.
 #[cfg(not(feature = "bedrock"))]
 #[tokio::test]
 async fn a_build_without_the_aws_sdk_refuses_a_bedrock_mount_by_name() {
     let d = tempfile::tempdir().unwrap();
     let k = kernel(d.path());
+    let device = with_device(&k);
     let endpoint = vk_ipc::transport::test_endpoint();
     let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let c = Client::connect(&endpoint).await.unwrap();
+    let proof = prove(&c, &device).await;
     let err = c
         .call(
             "arch.mount",
             json!({"kind": "bedrock", "config": {"region": "eu-central-1"}}),
-            None,
+            Some(proof),
         )
         .await
         .unwrap_err();
@@ -1357,23 +1462,25 @@ async fn a_build_without_the_aws_sdk_refuses_a_bedrock_mount_by_name() {
     server.abort();
 }
 
-/// The same door with the SDK built in: the mount reaches the adapter, which
-/// refuses because this machine has no AWS credentials. Either way the answer
-/// names what is missing.
+/// The same door with the SDK built in: the region is checked before the
+/// credentials are, so a mount outside the Union is refused for being outside
+/// the Union.
 #[cfg(feature = "bedrock")]
 #[tokio::test]
 async fn a_bedrock_mount_is_refused_for_a_region_outside_the_union() {
     let d = tempfile::tempdir().unwrap();
     let k = kernel(d.path());
+    let device = with_device(&k);
     let endpoint = vk_ipc::transport::test_endpoint();
     let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let c = Client::connect(&endpoint).await.unwrap();
+    let proof = prove(&c, &device).await;
     let err = c
         .call(
             "arch.mount",
             json!({"kind": "bedrock", "config": {"region": "us-east-1"}}),
-            None,
+            Some(proof),
         )
         .await
         .unwrap_err();

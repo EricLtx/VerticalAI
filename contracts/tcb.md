@@ -27,9 +27,12 @@ cloud`, `governed: false`, clearance capped at Business with third-party data
 refused — and both are metered, unlike the subscription arch. The first-party
 one carries Anthropic's list price in its manifest (`cost_per_1k_tokens_eur`,
 converted at a pinned and dated rate) and the USD figure on every call;
-Bedrock is priced by AWS, whose list this node has not read, so that arch
-claims **no** price rather than one from the wrong table — `vk top` shows a
-dash, which is honest and is not the same as free.
+Bedrock is priced by AWS, whose list this node has not read, so that arch's
+price is `None` rather than a figure from the wrong table. `cost_per_1k_tokens_eur`
+is `Option<f64>` for exactly this (Ruling 30): `Some(0.0)` is the claim a
+local model and a subscription make — nothing is billed — while `None` is the
+absence of a claim, and `vk top` prints `?` for it. A `?` rendered as `0`
+would tell an operator their EU calls were free.
 
 `vk mount anthropic` posts `/v1/messages` to `api.anthropic.com` over raw
 HTTPS (rustls, a connect timeout and a call timeout, and *with* the machine's
@@ -37,16 +40,47 @@ proxy configuration honoured — the opposite of the Ollama adapter, because a
 proxy on the path to a public API is how many networks reach it at all and the
 manifest already says the register leaves the node). Header
 `anthropic-version: 2023-06-01`, `thinking: {"type":"adaptive"}`, no
-streaming, `max_tokens` bounded at 4096, and the answer is the response's
+streaming, `max_tokens` bounded at 4096 — and `thinking` **only** for a model
+the table marks as taking it, because adaptive thinking arrived with the
+4.6/5 generation and `claude-haiku-4-5` 400s on it — and the answer is the
+response's
 `text` blocks concatenated — never `content[0]`, because a thinking block sits
 in front of them. Manifest: `jurisdiction: "US"`, `retention_days: Some(30)`.
 `vk mount bedrock` is the same models through Bedrock's `Converse` in
 `eu-central-1` or `eu-west-1` — **those two regions and no other, refused at
 the door**, because the manifest's `jurisdiction: "EU"` *is* the region —
 with `retention_days: None`, since AWS stores neither the inputs nor the
-outputs. Its transport is behind the `bedrock` cargo feature — on by
-default, at a measured 83 extra crates and about a minute of clean Windows
-build; a daemon built `--no-default-features` refuses that kind by name.
+outputs. Its transport is behind the `bedrock` cargo feature, **off by
+default** (Ruling 30): the 83 extra crates it brings — `aws-lc-sys` among
+them — do not belong in the trusted base of every node for an arch most never
+mount, and the default build refuses that kind by name and says how to get
+one that has it.
+
+**Mounting either of them is a human act (I1).** `arch.mount` of any kind
+whose manifest says `locality: cloud` — `anthropic`, `bedrock` and
+`claude-code` — requires the same presence proof `stop`, `resume` and
+`approve` require, and is refused from a bare machine principal. The reason
+is I2's third-party rule: a cloud mount authorises this node's registers to
+leave the machine, and it does so durably, because the mount spec is replayed
+at every boot. The refusal happens twice, on purpose: once on the kind, before
+this daemon reads its keyring or walks an AWS credential chain for a caller
+who has shown no presence, and once on the built adapter's own manifest, so a
+future cloud kind nobody added to the list is caught rather than admitted.
+
+**Where the key is sent is the daemon's to decide, not a caller's.** The
+first-party origin is fixed at `https://api.anthropic.com`; the mount config
+for a cloud kind is a closed shape (`deny_unknown_fields`), so `base_url`,
+`endpoint` or any other name a caller invents is a `-32602` that names the
+field rather than a host this daemon then posts its key to. Only
+`vkd --anthropic-base-url` moves it, it exists for tests, and it must itself
+be `https://` or this machine's own loopback. Redirects are not followed
+(`redirect::Policy::none()`): reqwest strips `authorization` and four other
+headers across a host change and `x-api-key` is on none of those lists, so a
+`307` would otherwise hand the key and the POST body to whatever it named.
+`context_ceiling` and `timeout_secs` are clamped rather than taken as given —
+`context_ceiling` is a manifest field outside `ArchIdentity`, so an unclamped
+one would let a caller mount an arch claiming a four-billion-token window
+under an ordinary-looking arch id and leave I4′ bounding nothing.
 
 **The key is in the OS keyring and in no other place.** Service `vk`, user
 `anthropic`, put there by `vk secret set anthropic`, which prompts with the
@@ -59,8 +93,13 @@ holds it prints as `SecretString(redacted)`, and its bytes are zeroed when the
 adapter is dropped. The daemon reads the keyring at mount and again whenever
 it re-creates a persisted arch at boot, which is what makes rotation a `vk
 secret set` and a restart. `vkd --anthropic-key-file` is the one file seam,
-for CI and for a headless node with no credential store; it is daemon
-configuration and no pipe client can name it.
+for CI, for a headless node with no credential store, and for the Windows
+service account — whose keyring is its own and not the interactive user's, so
+`vk secret set` run by that user does not reach it. A key in a file is a key
+everyone who can read the file has, so the daemon refuses to start on one that
+is not private: mode `0600` on Unix, and on Windows a DACL whose owner and
+every entry is this account, SYSTEM or the local administrators — the same
+rule, and the same audit, the state directory is held to.
 
 **I4′ on a provider that refuses rather than truncates.** The ceiling is the
 model's documented context window (1 000 000 for the Claude 5 family, from

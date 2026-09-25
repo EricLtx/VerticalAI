@@ -425,7 +425,7 @@ fn the_manifest_says_what_this_arch_is() {
     assert!(!m.clearance.third_party_allowed);
     assert!(!m.governed, "the kernel did not launch Anthropic's servers");
     // Subscription: the call is not billed per token (ruling 3).
-    assert_eq!(m.cost_per_1k_tokens_eur, 0.0);
+    assert_eq!(m.cost_per_1k_tokens_eur, Some(0.0));
     assert_eq!(m.identity.engine, "claude-code");
     assert_eq!(m.identity.engine_version, "9.9.9-fake");
     assert!(m.identity.weights_sha256.contains("claude-sonnet-5"));

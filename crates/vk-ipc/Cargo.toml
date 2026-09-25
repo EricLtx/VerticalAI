@@ -7,11 +7,11 @@ repository.workspace = true
 description = "VerticalAI IPC: local transport between vk CLI and vkd"
 
 [features]
-# The EU arch's transport, passed straight through to `vk-arch-anthropic` —
-# whose own default is off here, so that `--no-default-features` on this crate
-# really does leave the AWS SDK out rather than having it arrive anyway
-# through the dependency's defaults.
-default = ["bedrock"]
+# The EU arch's transport, passed straight through to `vk-arch-anthropic`,
+# whose own default is off (Ruling 30 — see the reasoning there). The
+# dependency is taken with `default-features = false` as well, so enabling it
+# is always a deliberate act and never something a default carries in.
+default = []
 bedrock = ["vk-arch-anthropic/bedrock"]
 
 [dependencies]

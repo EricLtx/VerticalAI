@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufR
 use vk_arch_anthropic::{AnthropicAdapter, AnthropicConfig, SecretString};
 use vk_arch_claude_code::{ClaudeCodeAdapter, ClaudeCodeConfig};
 use vk_arch_ollama::{ContainerSpec, OllamaAdapter, OllamaConfig};
-use vk_contracts::arch::ArchManifest;
+use vk_contracts::arch::{ArchManifest, Locality};
 use vk_contracts::labels::{Clearance, Label, Scope};
 use vk_contracts::principal::{Approval, ApprovalKind, Principal};
 use vk_contracts::syscalls::{Ctx, Kernel, KernelError};
@@ -51,6 +51,15 @@ pub struct ServerConfig {
     /// the file the daemon reads a credential out of would be reading the
     /// daemon's files with the daemon's rights.
     pub anthropic_keys: vk_arch_anthropic::KeySource,
+    /// Where an `anthropic` arch's calls go. `https://api.anthropic.com` on
+    /// every real node; `vkd --anthropic-base-url` moves it, for tests.
+    ///
+    /// **Never a request field** (fix round 1, Critical 1). A client that
+    /// could name the origin could name a collector, and this daemon would
+    /// put the key from its own keyring on the wire to it — persistently,
+    /// since the mount spec is replayed at every boot, and from a service
+    /// account whose keyring that client cannot otherwise read at all.
+    pub anthropic_base_url: String,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -60,6 +69,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("harness", &self.harness)
             .field("web", &self.web.as_ref().map(|w| w.origin()))
             .field("anthropic_keys", &self.anthropic_keys)
+            .field("anthropic_base_url", &self.anthropic_base_url)
             .finish()
     }
 }
@@ -73,6 +83,7 @@ impl ServerConfig {
             harness: HarnessSettings::default(),
             web: None,
             anthropic_keys: vk_arch_anthropic::KeySource::Keyring,
+            anthropic_base_url: vk_arch_anthropic::DEFAULT_BASE_URL.to_string(),
         }
     }
 }
@@ -425,7 +436,16 @@ struct Presented {
 fn takes_presence(method: &str) -> bool {
     matches!(
         method,
-        "task.create" | "task.step" | "stop" | "resume" | "approve" | "web.link"
+        "task.create"
+            | "task.step"
+            | "stop"
+            | "resume"
+            | "approve"
+            | "web.link"
+            // Mounting a cloud arch is a human act: see the refusal in
+            // `dispatch` (fix round 1, Critical 1). Local kinds take a proof
+            // and ignore it, as `task.step` does.
+            | "arch.mount"
     )
 }
 
@@ -490,6 +510,24 @@ fn dispatch(
     if req.method == "presence.challenge" {
         let (nonce, exp) = lock(challenges)?.issue(now);
         return Ok(json!({ "nonce": nonce, "expires_at_ms": exp }));
+    }
+    // **Mounting a cloud arch is a human act** (fix round 1, Critical 1).
+    // It authorises this node's registers to leave the machine for a third
+    // party, which is exactly what I2's third-party rule is about, and it is
+    // durable: the mount spec is replayed at every boot. So it needs the same
+    // presence proof `stop`, `resume` and `approve` need — refused here,
+    // before the keyring is read or an AWS credential chain is walked, so a
+    // caller with no proof cannot even make the daemon reach for a secret.
+    // The proof is *verified* below, under the lock, by `ctx_for`; this is
+    // only the cheap half.
+    if req.method == "arch.mount"
+        && is_cloud_kind(req.params["kind"].as_str().unwrap_or_default())
+        && presence.is_none()
+    {
+        return Err(invariant(
+            "I1: mounting a cloud arch sends this node's registers to a third party, \
+             which is a human act; re-run it with a presence proof",
+        ));
     }
     // Mounting a Claude Code arch means running the binary to ask its version,
     // because the version is in the arch identity. That happens here, *before*
@@ -663,6 +701,9 @@ fn dispatch(
         // that mounts a new kind needs no new verb (SP1b ruling 4).
         "arch.mount" => {
             let kind = p["kind"].as_str().ok_or_else(|| bad("kind"))?;
+            // Who is asking. Human only for a request carrying a proof this
+            // server issued the nonce for and an enrolled device signed.
+            let ctx = ctx_for(&k, presence, now)?;
             // Recorded before anything is mounted, so a config this node could
             // not make a spec out of — one carrying a credential — is refused
             // rather than mounted into an arch no boot can bring back.
@@ -684,7 +725,8 @@ fn dispatch(
                 "anthropic" => {
                     let key = anthropic_key.ok_or_else(|| internal("no anthropic key"))?;
                     Arc::new(
-                        anthropic_adapter(key, &p["config"]).map_err(|e| bad(&format!("{e:#}")))?,
+                        anthropic_adapter(key, &config.anthropic_base_url, &p["config"])
+                            .map_err(|e| bad(&format!("{e:#}")))?,
                     )
                 }
                 // The EU one, already built above: its credentials were
@@ -692,6 +734,19 @@ fn dispatch(
                 "bedrock" => Arc::from(bedrock.ok_or_else(|| internal("no bedrock adapter"))?),
                 other => return Err(bad(&format!("no arch kind {other}"))),
             };
+            // The list above is a list, and a list can be forgotten. The
+            // manifest is the thing that actually says where the register
+            // goes, so the refusal is repeated against it — a future cloud
+            // kind whose name nobody added to `is_cloud_kind` is caught here
+            // instead of shipping unguarded (fix round 1, Critical 1).
+            if adapter.manifest().locality == Locality::Cloud
+                && !matches!(ctx.principal, Principal::Human { .. })
+            {
+                return Err(invariant(
+                    "I1: mounting a cloud arch sends this node's registers to a third \
+                     party, which is a human act; re-run it with a presence proof",
+                ));
+            }
             let name = adapter.manifest().name.clone();
             // Said here rather than looked up afterwards: whether the kernel
             // contains the process is the first thing a person mounting an
@@ -986,6 +1041,7 @@ fn claude_code_version(config: &Value) -> anyhow::Result<String> {
 pub fn adapter_factory(
     state_dir: std::path::PathBuf,
     anthropic_keys: vk_arch_anthropic::KeySource,
+    anthropic_base_url: String,
 ) -> vk_kernel::AdapterFactory {
     let mock = vk_kernel::mock_factory();
     Arc::new(move |spec: &MountSpec| -> Result<Box<dyn ArchAdapter>> {
@@ -1008,7 +1064,11 @@ pub fn adapter_factory(
             "anthropic" => {
                 let key =
                     vk_arch_anthropic::load_key(&anthropic_keys, vk_arch_anthropic::KEYRING_USER)?;
-                Ok(Box::new(anthropic_adapter(key, &spec.config)?))
+                Ok(Box::new(anthropic_adapter(
+                    key,
+                    &anthropic_base_url,
+                    &spec.config,
+                )?))
             }
             "bedrock" => bedrock_adapter(&spec.config),
             other => anyhow::bail!("no arch kind {other}"),
@@ -1016,23 +1076,85 @@ pub fn adapter_factory(
     })
 }
 
+/// The longest a mount may make one call wait, in seconds. A client that
+/// asked for a year would pin a kernel thread for a year (fix round 1,
+/// Critical 1's tail).
+const MAX_TIMEOUT_SECS: u32 = 3_600;
+
+/// Everything `arch.mount { kind: "anthropic" }` may say, and — because of
+/// `deny_unknown_fields` — nothing else.
+///
+/// A closed shape rather than a bag of optional lookups, so that `base_url`,
+/// `endpoint`, `host` or whatever a caller invents next is a `-32602` naming
+/// the field instead of a value this daemon quietly honours (fix round 1,
+/// Critical 1). What is *not* here is the whole point of it.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnthropicMountConfig {
+    model: Option<String>,
+    context_ceiling: Option<u32>,
+    max_tokens: Option<u32>,
+    timeout_secs: Option<u32>,
+}
+
+/// The same, for `arch.mount { kind: "bedrock" }`.
+///
+/// Parsed in every build, read only in one: without the `bedrock` feature the
+/// shape is still a validator — a config naming an endpoint must be refused
+/// for naming one, not for the feature — and its fields go nowhere.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(not(feature = "bedrock"), allow(dead_code))]
+struct BedrockMountConfig {
+    region: Option<String>,
+    model: Option<String>,
+    context_ceiling: Option<u32>,
+    max_tokens: Option<u32>,
+}
+
+/// Parse a cloud arch's mount config, refusing anything not in its shape.
+fn mount_config<T: serde::de::DeserializeOwned + Default>(
+    kind: &str,
+    config: &Value,
+) -> anyhow::Result<T> {
+    if config.is_null() {
+        return Ok(T::default());
+    }
+    serde_json::from_value(config.clone())
+        .map_err(|e| anyhow::anyhow!("{kind}: {e}; the endpoint is this daemon's to set"))
+}
+
 /// Build the first-party Anthropic adapter `arch.mount { kind: "anthropic" }`
-/// asks for. Everything in `config` is optional; the key is not in it and
-/// never can be — [`MountSpec::new`] refuses a config carrying anything
-/// credential-shaped, and this takes the key as its own argument, so there is
-/// no path by which one could arrive in a spec.
-fn anthropic_adapter(key: SecretString, config: &Value) -> anyhow::Result<AnthropicAdapter> {
+/// asks for.
+///
+/// Two things never come from `config`: the key, which is this function's own
+/// argument and which [`MountSpec::new`]'s guard would refuse in a spec
+/// anyway, and `base_url`, which is the daemon's (`vkd --anthropic-base-url`)
+/// because a client that chose it would be choosing where this node's key is
+/// sent. `context_ceiling` is clamped to the model's documented window — it
+/// is a manifest field outside `ArchIdentity`, so an unclamped one would let
+/// a client mount an arch claiming a four-billion-token context under an
+/// ordinary-looking arch id, and I4′ would then be bounding nothing.
+fn anthropic_adapter(
+    key: SecretString,
+    base_url: &str,
+    config: &Value,
+) -> anyhow::Result<AnthropicAdapter> {
     let defaults = AnthropicConfig::default();
+    let asked: AnthropicMountConfig = mount_config("anthropic", config)?;
+    let model = asked.model.unwrap_or_else(|| defaults.model.clone());
+    let window = vk_arch_anthropic::context_window(&model);
     let cfg = AnthropicConfig {
-        model: string_of(config, "model", &defaults.model),
-        base_url: string_of(config, "base_url", &defaults.base_url),
-        max_tokens: u32_of(config, "max_tokens", defaults.max_tokens)?,
-        context_ceiling: u32_of(config, "context_ceiling", defaults.context_ceiling)?,
-        timeout: Duration::from_secs(u64::from(u32_of(
-            config,
-            "timeout_secs",
-            u32::try_from(defaults.timeout.as_secs()).unwrap_or(u32::MAX),
-        )?)),
+        context_ceiling: asked.context_ceiling.unwrap_or(0).min(window),
+        model,
+        base_url: base_url.to_string(),
+        max_tokens: asked.max_tokens.unwrap_or(defaults.max_tokens),
+        timeout: Duration::from_secs(u64::from(
+            asked
+                .timeout_secs
+                .unwrap_or(u32::try_from(defaults.timeout.as_secs()).unwrap_or(MAX_TIMEOUT_SECS))
+                .clamp(1, MAX_TIMEOUT_SECS),
+        )),
     };
     Ok(AnthropicAdapter::with_config(key, cfg))
 }
@@ -1044,11 +1166,14 @@ fn anthropic_adapter(key: SecretString, config: &Value) -> anyhow::Result<Anthro
 fn bedrock_adapter(config: &Value) -> anyhow::Result<Box<dyn ArchAdapter>> {
     use vk_arch_anthropic::bedrock::{BedrockAdapter, BedrockConfig};
     let defaults = BedrockConfig::default();
+    let asked: BedrockMountConfig = mount_config("bedrock", config)?;
+    let model = asked.model.unwrap_or_else(|| defaults.model.clone());
+    let window = vk_arch_anthropic::context_window(&model);
     let cfg = BedrockConfig {
-        region: string_of(config, "region", &defaults.region),
-        model: string_of(config, "model", &defaults.model),
-        max_tokens: u32_of(config, "max_tokens", defaults.max_tokens)?,
-        context_ceiling: u32_of(config, "context_ceiling", defaults.context_ceiling)?,
+        context_ceiling: asked.context_ceiling.unwrap_or(0).min(window),
+        model,
+        region: asked.region.unwrap_or_else(|| defaults.region.clone()),
+        max_tokens: asked.max_tokens.unwrap_or(defaults.max_tokens),
     };
     Ok(Box::new(BedrockAdapter::with_config(cfg)?))
 }
@@ -1057,7 +1182,11 @@ fn bedrock_adapter(config: &Value) -> anyhow::Result<Box<dyn ArchAdapter>> {
 /// to get a build that has it, rather than "no arch kind bedrock", which
 /// reads like a typo and is not one.
 #[cfg(not(feature = "bedrock"))]
-fn bedrock_adapter(_config: &Value) -> anyhow::Result<Box<dyn ArchAdapter>> {
+fn bedrock_adapter(config: &Value) -> anyhow::Result<Box<dyn ArchAdapter>> {
+    // Parsed first, so that a config naming an endpoint is refused for naming
+    // one rather than for the feature — the answer must not depend on how the
+    // daemon was built.
+    let _: BedrockMountConfig = mount_config("bedrock", config)?;
     anyhow::bail!(
         "this build has no Bedrock support: it was built `--no-default-features`, which \
          leaves out the `bedrock` cargo feature and the AWS SDK behind it. Rebuild with \
@@ -1065,24 +1194,16 @@ fn bedrock_adapter(_config: &Value) -> anyhow::Result<Box<dyn ArchAdapter>> {
     )
 }
 
-/// A whole number out of an adapter config, or the adapter's own default.
-fn u32_of(config: &Value, name: &str, fallback: u32) -> anyhow::Result<u32> {
-    match config.get(name) {
-        None | Some(Value::Null) => Ok(fallback),
-        Some(v) => v
-            .as_u64()
-            .and_then(|n| u32::try_from(n).ok())
-            .ok_or_else(|| anyhow::anyhow!("{name} must be a whole number")),
-    }
-}
-
-/// A string out of an adapter config, or the adapter's own default.
-fn string_of(config: &Value, name: &str, fallback: &str) -> String {
-    config
-        .get(name)
-        .and_then(Value::as_str)
-        .unwrap_or(fallback)
-        .to_string()
+/// Which arch kinds mount a manifest that says `locality: Cloud`.
+///
+/// Named here rather than derived, because the refusal it drives has to
+/// happen *before* the adapter exists — before this daemon reads its keyring
+/// or walks an AWS credential chain on behalf of a caller who has shown no
+/// presence (fix round 1, Critical 1). The manifest is checked as well, once
+/// the adapter is built, so a kind missing from this list is caught rather
+/// than admitted.
+fn is_cloud_kind(kind: &str) -> bool {
+    matches!(kind, "anthropic" | "bedrock" | "claude-code")
 }
 
 /// The spec `arch.mount` records for what it just mounted.
@@ -1204,7 +1325,7 @@ fn mock_manifest(name: &str, ctx: u32) -> ArchManifest {
         locality: Locality::Local,
         jurisdiction: "FR".into(),
         retention_days: None,
-        cost_per_1k_tokens_eur: 0.0,
+        cost_per_1k_tokens_eur: Some(0.0),
         latency_ms_p50: 1,
         context_ceiling: ctx,
         determinism: Determinism::SeededDeterministic,

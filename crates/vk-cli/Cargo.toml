@@ -29,6 +29,9 @@ keyring.workspace = true
 # `SetConsoleMode` on Windows and termios on Unix, in this crate, for one
 # prompt; this is the crate everything else uses for it.
 rpassword = "7"
+# The typed secret never sits in a plain `String`: this is the one process
+# that sees the key as a human typed it.
+zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3"

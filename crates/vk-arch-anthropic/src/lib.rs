@@ -67,7 +67,14 @@ pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// The model an API arch runs on unless told otherwise.
 pub const DEFAULT_MODEL: &str = "claude-opus-5";
 
-/// The first-party endpoint.
+/// The first-party endpoint, and the only one an ordinary node ever uses.
+///
+/// **Not a request field.** A client that could name the origin could name a
+/// collector, and the daemon would put its own key on the wire to it — over
+/// plaintext, persistently, at every boot, from a service account whose
+/// keyring that client cannot otherwise read (fix round 1, Critical 1). The
+/// origin is daemon configuration (`vkd --anthropic-base-url`, for tests) and
+/// [`check_base_url`] bounds even that.
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 
 /// The longest answer one call may produce. The plan's cap, not the API's:
@@ -118,6 +125,17 @@ pub struct Model {
     /// milliseconds. Outside `ArchIdentity`, so re-measuring it does not mint
     /// a new arch id.
     pub latency_ms_p50: u32,
+    /// Does this model take `thinking: {"type": "adaptive"}`?
+    ///
+    /// Adaptive thinking arrived with the 4.6/5 generation. A 4.5-generation
+    /// model — `claude-haiku-4-5` is the one in this table — takes
+    /// `{"type": "enabled", "budget_tokens": N}` instead and **400s** on
+    /// `adaptive`, so sending it unconditionally would let an operator mount
+    /// a healthy-looking cheap arch whose every call then failed at the far
+    /// end (fix round 1, Important 2). This adapter does not implement the
+    /// older form; it simply sends no `thinking` block for such a model,
+    /// which is a valid request on every model here.
+    pub thinking_supported: bool,
 }
 
 /// Every model this node will price, with its window and its list price.
@@ -143,6 +161,12 @@ pub struct Model {
 /// models through the Claude Code CLI, less its ~3 s of process start-up;
 /// Haiku and Fable were not measured and are estimates. Nothing in this
 /// column is in the arch id.
+///
+/// `thinking_supported` is `false` for `claude-haiku-4-5` alone: adaptive
+/// thinking is a 4.6-and-later parameter and the 4.5 generation rejects it
+/// with a 400 (fix round 1, Important 2). Not verifiable from here — there is
+/// no key — so it is taken from the same published reference as the rest of
+/// the row; `GET /v1/models/claude-haiku-4-5` settles it the day one exists.
 pub const MODELS: &[Model] = &[
     Model {
         id: "claude-opus-5",
@@ -150,6 +174,7 @@ pub const MODELS: &[Model] = &[
         input_usd_per_mtok: 5.00,
         output_usd_per_mtok: 25.00,
         latency_ms_p50: 11_000,
+        thinking_supported: true,
     },
     Model {
         id: "claude-opus-4-8",
@@ -157,6 +182,7 @@ pub const MODELS: &[Model] = &[
         input_usd_per_mtok: 5.00,
         output_usd_per_mtok: 25.00,
         latency_ms_p50: 11_000,
+        thinking_supported: true,
     },
     Model {
         id: "claude-sonnet-5",
@@ -164,6 +190,7 @@ pub const MODELS: &[Model] = &[
         input_usd_per_mtok: 2.00,
         output_usd_per_mtok: 10.00,
         latency_ms_p50: 7_000,
+        thinking_supported: true,
     },
     Model {
         id: "claude-haiku-4-5",
@@ -171,6 +198,7 @@ pub const MODELS: &[Model] = &[
         input_usd_per_mtok: 1.00,
         output_usd_per_mtok: 5.00,
         latency_ms_p50: 4_000,
+        thinking_supported: false,
     },
     Model {
         id: "claude-fable-5-1",
@@ -178,6 +206,7 @@ pub const MODELS: &[Model] = &[
         input_usd_per_mtok: 10.00,
         output_usd_per_mtok: 50.00,
         latency_ms_p50: 20_000,
+        thinking_supported: true,
     },
 ];
 
@@ -193,12 +222,16 @@ pub fn context_window(id: &str) -> u32 {
     model(id).map_or(FALLBACK_CONTEXT, |m| m.context_window)
 }
 
-/// The manifest's price tag: input tokens, per thousand, in euros. `0.0` for a
-/// model with no row — the same `0.0` the subscription arch carries, and for
-/// the same reason: a number nobody can stand behind does not belong in a
-/// manifest.
-pub fn cost_per_1k_tokens_eur(id: &str) -> f64 {
-    model(id).map_or(0.0, |m| m.input_usd_per_mtok / 1_000.0 * EUR_PER_USD)
+/// The manifest's price tag: input tokens, per thousand, in euros, or `None`
+/// for a model with no row.
+///
+/// `None`, emphatically not `0.0` (Ruling 30). Zero is a claim that the calls
+/// are free, which is what a local model and a subscription arch say; an
+/// unlisted model on a metered API is billed at a rate this node does not
+/// know, and `vk top` prints `?` for it rather than a figure that would read
+/// as free.
+pub fn cost_per_1k_tokens_eur(id: &str) -> Option<f64> {
+    model(id).map(|m| m.input_usd_per_mtok / 1_000.0 * EUR_PER_USD)
 }
 
 // --------------------------------------------------------------- the secret
@@ -272,10 +305,13 @@ pub fn load_key(source: &KeySource, name: &str) -> Result<SecretString> {
         KeySource::Keyring => {
             let entry = keyring::Entry::new(KEYRING_SERVICE, name)
                 .with_context(|| format!("no keyring on this machine; {remedy}"))?;
-            match entry.get_password() {
+            match entry.get_password().map(zeroize::Zeroizing::new) {
                 Ok(secret) if secret.trim().is_empty() => {
                     bail!("the keyring entry {KEYRING_SERVICE}/{name} is empty; {remedy}")
                 }
+                // Wrapped on the way out of `keyring`, so the copy this
+                // function made is wiped rather than left in freed heap when
+                // it goes (fix round 1, Minor 5).
                 Ok(secret) => Ok(SecretString::new(secret.trim())),
                 Err(keyring::Error::NoEntry) => {
                     bail!("no {KEYRING_SERVICE}/{name} in this account's keyring; {remedy}")
@@ -285,8 +321,10 @@ pub fn load_key(source: &KeySource, name: &str) -> Result<SecretString> {
             }
         }
         KeySource::File(path) => {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("cannot read {}; {remedy}", path.display()))?;
+            let text = zeroize::Zeroizing::new(
+                std::fs::read_to_string(path)
+                    .with_context(|| format!("cannot read {}; {remedy}", path.display()))?,
+            );
             let line = text.lines().next().unwrap_or_default().trim();
             if line.is_empty() {
                 bail!("{} is empty; {remedy}", path.display());
@@ -376,7 +414,13 @@ impl AnthropicAdapter {
     /// The same, for `vkd`, which has a whole config to hand.
     pub fn with_config(api_key: SecretString, cfg: AnthropicConfig) -> AnthropicAdapter {
         let manifest = Self::manifest_for(&cfg);
-        let client = build_client().map_err(|e| format!("{e:#}"));
+        // The origin is checked here as well as where it is configured: this
+        // is the last place before the key goes on a wire, and a refusal that
+        // reaches every call is better than one that depended on which door
+        // the configuration came in by (fix round 1, Critical 1).
+        let client = check_base_url(&cfg.base_url)
+            .and_then(|()| build_client())
+            .map_err(|e| format!("{e:#}"));
         AnthropicAdapter {
             cfg,
             manifest,
@@ -417,7 +461,18 @@ impl AnthropicAdapter {
                 threads: 1,
                 batch: 1,
                 sampling: [
-                    ("thinking".to_string(), "adaptive".to_string()),
+                    // Which of the two requests this arch sends. A model that
+                    // takes no `thinking` block is answering a different
+                    // question from one that does, so the two must not be
+                    // able to share an arch id.
+                    (
+                        "thinking".to_string(),
+                        if model(&cfg.model).is_some_and(|m| m.thinking_supported) {
+                            "adaptive".to_string()
+                        } else {
+                            "off".to_string()
+                        },
+                    ),
                     // Where the call is addressed. A mount pointed at a proxy
                     // or a stand-in is not the arch a mount pointed at
                     // Anthropic is, and the id should not pretend it is.
@@ -447,25 +502,38 @@ impl AnthropicAdapter {
     /// No `stream`: one request, one answer, and there is no caller here to
     /// stream to. `thinking: {"type": "adaptive"}` is the only thinking
     /// configuration the Claude 5 family accepts — `budget_tokens` is a 400 on
-    /// these models — and its `display` defaults to `omitted`, which is why
-    /// [`text_of`] concatenates the `text` blocks and skips the rest.
+    /// those models — and its `display` defaults to `omitted`, which is why
+    /// [`text_of`] concatenates the `text` blocks and skips the rest. It is
+    /// sent **only** for a model the table marks as taking it: the 4.5
+    /// generation 400s on `adaptive`, and an unlisted model is not something
+    /// to guess about (fix round 1, Important 2).
     pub fn messages_request(
         cfg: &AnthropicConfig,
         prompt: &str,
         max_tokens: u32,
     ) -> serde_json::Value {
-        serde_json::json!({
+        let mut body = serde_json::json!({
             "model": cfg.model,
             "max_tokens": answer_tokens(cfg, max_tokens),
-            "thinking": { "type": "adaptive" },
             "messages": [{ "role": "user", "content": prompt }],
-        })
+        });
+        if model(&cfg.model).is_some_and(|m| m.thinking_supported) {
+            body["thinking"] = serde_json::json!({ "type": "adaptive" });
+        }
+        body
     }
 
     /// A deliberately crude token estimate, for when the API's counter cannot
-    /// be reached. Three bytes per token errs low for prose and high for
-    /// code — the same heuristic the other two adapters use, so a prompt
-    /// projected for one arch is projected the same way for this one.
+    /// be reached: three bytes to the token plus a fixed margin, the same
+    /// heuristic the other two adapters use, so a prompt projected for one
+    /// arch is projected the same way for this one.
+    ///
+    /// It **over**-counts. Prose runs nearer four bytes to the token, so
+    /// `len / 3` is high by about a quarter on it and by more on short
+    /// prompts (spike 1a measured 1.25× and 1.9×); code, being denser in
+    /// punctuation, narrows the gap without closing it. Erring high is the
+    /// direction a refusal should err in, and it is what the argument at
+    /// [`AnthropicAdapter::count_tokens`] rests on.
     pub fn estimate_tokens(text: &str) -> u32 {
         u32::try_from(text.len() / 3 + 64).unwrap_or(u32::MAX)
     }
@@ -542,7 +610,12 @@ impl AnthropicAdapter {
         let parsed: serde_json::Value =
             serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
         if !status.is_success() {
-            let kind = parsed["error"]["type"].as_str().unwrap_or("error");
+            // Scrubbed like every other string out of the far end: a hostile
+            // one that echoed the key into `error.type` must not get it
+            // printed back out of this daemon (fix round 1, Minor 2).
+            let kind = self
+                .key
+                .scrub(parsed["error"]["type"].as_str().unwrap_or("error"));
             let message = parsed["error"]["message"]
                 .as_str()
                 .map(str::to_string)
@@ -578,6 +651,42 @@ fn answer_tokens(cfg: &AnthropicConfig, max_tokens: u32) -> u32 {
     }
 }
 
+/// Is this an origin this node will send its API key to?
+///
+/// `https://` anywhere, or `http://` on this machine's own loopback — which
+/// is the test stand-in and nothing else. Plaintext to another host would put
+/// the key on the wire in the clear, and there is no configuration worth
+/// having that wants it (fix round 1, Critical 1).
+pub fn check_base_url(url: &str) -> Result<()> {
+    let rest = match url.split_once("://") {
+        Some(("https", rest)) => {
+            anyhow::ensure!(!rest.is_empty(), "{url} has no host in it");
+            return Ok(());
+        }
+        Some(("http", rest)) => rest,
+        _ => bail!("{url} is not an https:// URL"),
+    };
+    // The authority, without any userinfo, path, query or fragment after it.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    // A bracketed IPv6 literal keeps its colons; anything else loses its port.
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split_once(']').map_or(v6, |(h, _)| h),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    // Parsed as an address rather than matched as a prefix: `127.example.com`
+    // starts with `127.` and is somebody else's machine.
+    let loopback = host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    anyhow::ensure!(
+        loopback,
+        "{url} is plaintext http:// to {host}: this node will not put an API key on the          wire in the clear to anywhere but its own loopback"
+    );
+    Ok(())
+}
+
 /// The blocking client every call goes through.
 ///
 /// **`no_proxy()` is deliberately absent**, which is the opposite of the
@@ -591,10 +700,20 @@ fn answer_tokens(cfg: &AnthropicConfig, max_tokens: u32) -> u32 {
 /// rustls rather than the platform's TLS, so the same build works on all three
 /// CI runners, and a connect timeout so a black-holed route fails in ten
 /// seconds rather than at the call's own timeout.
+///
+/// **`Policy::none()` is the other load-bearing line.** reqwest follows up to
+/// ten redirects by default and, on a host change, strips only `authorization`,
+/// `cookie`, `cookie2`, `proxy-authorization` and `www-authenticate` —
+/// `x-api-key` is a custom header and is on none of those lists, so it would
+/// be re-sent verbatim to wherever a `307` pointed, body and all (fix round 1,
+/// Important 1). The Messages API does not redirect; a redirect here is an
+/// interception or a misconfiguration, and either is a failed call rather than
+/// a hop to follow.
 fn build_client() -> Result<Client> {
     Client::builder()
         .user_agent("verticalai-vk-arch-anthropic")
         .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("build the HTTPS client for the Anthropic API")
 }
@@ -690,10 +809,16 @@ impl ArchAdapter for AnthropicAdapter {
         // refuses an oversize prompt rather than truncating it, so reaching
         // this is a surprise — but a surprise about the size of the prompt is
         // exactly the surprise this invariant exists to catch.
+        //
+        // Against the **full** window, and the refusal says so: comparing the
+        // measured count against `0.9 ×` would be tautological on the path
+        // where the pre-check already measured it, and a refusal reporting a
+        // ceiling it did not compare against is one no operator can reconcile
+        // with a single number (fix round 1, Minor 1).
         if tokens_in >= self.manifest.context_ceiling {
             return Err(AdapterError::I4Prime {
                 needed: tokens_in,
-                ceiling,
+                ceiling: self.manifest.context_ceiling,
             });
         }
 
@@ -755,9 +880,11 @@ mod tests {
     #[test]
     fn the_price_tag_is_the_input_rate_per_thousand_tokens_in_euros() {
         // $5 per million in, at the pinned rate: €0.0046 per 1 000.
-        assert!((cost_per_1k_tokens_eur("claude-opus-5") - 0.0046).abs() < 1e-12);
-        // And a model with no row claims nothing.
-        assert_eq!(cost_per_1k_tokens_eur("claude-imaginary-9"), 0.0);
+        let opus = cost_per_1k_tokens_eur("claude-opus-5").expect("a listed model is priced");
+        assert!((opus - 0.0046).abs() < 1e-12);
+        // And a model with no row claims nothing — `None`, never `0.0`, which
+        // would read as free (Ruling 30).
+        assert_eq!(cost_per_1k_tokens_eur("claude-imaginary-9"), None);
     }
 
     #[test]
@@ -795,5 +922,57 @@ mod tests {
         ]);
         assert_eq!(text_of(&content), "ab");
         assert_eq!(text_of(&serde_json::Value::Null), "");
+    }
+
+    #[test]
+    fn an_origin_is_https_anywhere_or_plaintext_only_on_this_machine() {
+        for good in [
+            "https://api.anthropic.com",
+            "https://gateway.example.com/v1",
+            "http://127.0.0.1:8080",
+            "http://localhost:3000/base",
+            "http://[::1]:9000",
+        ] {
+            assert!(check_base_url(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "http://collector.example",
+            "http://10.0.0.5:80",
+            "http://127.example.com",
+            "ftp://api.anthropic.com",
+            "api.anthropic.com",
+        ] {
+            assert!(check_base_url(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn thinking_is_sent_only_to_a_model_that_takes_it() {
+        let adaptive = AnthropicAdapter::messages_request(&AnthropicConfig::default(), "hi", 0);
+        assert_eq!(
+            adaptive["thinking"],
+            serde_json::json!({"type": "adaptive"})
+        );
+        // Haiku 4.5 is a 4.5-generation model: `adaptive` is a 400 there, so
+        // the block is left out rather than sent and refused.
+        let haiku = AnthropicAdapter::messages_request(
+            &AnthropicConfig {
+                model: "claude-haiku-4-5".into(),
+                ..Default::default()
+            },
+            "hi",
+            0,
+        );
+        assert!(haiku.get("thinking").is_none(), "{haiku}");
+        // And an unlisted model is not guessed about.
+        let unknown = AnthropicAdapter::messages_request(
+            &AnthropicConfig {
+                model: "claude-imaginary-9".into(),
+                ..Default::default()
+            },
+            "hi",
+            0,
+        );
+        assert!(unknown.get("thinking").is_none(), "{unknown}");
     }
 }

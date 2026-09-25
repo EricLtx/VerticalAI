@@ -126,7 +126,7 @@ impl ClaudeCodeAdapter {
             retention_days: Some(30),
             // A subscription call is not billed per token; what it would have
             // cost rides on the completion as `cost_list_usd` (ruling 3).
-            cost_per_1k_tokens_eur: 0.0,
+            cost_per_1k_tokens_eur: Some(0.0),
             latency_ms_p50: latency_p50_ms(&cfg.model),
             context_ceiling: cfg.context_ceiling,
             determinism: Determinism::NonDeterministic,

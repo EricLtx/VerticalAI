@@ -130,9 +130,10 @@ pub fn manifest_for(cfg: &BedrockConfig) -> ArchManifest {
         // Bedrock inference, so there is no window to name.
         retention_days: None,
         // Bedrock is partner-operated and priced by AWS, not by Anthropic.
-        // This node has not read that price list, so it claims no price —
-        // `vk top` shows a dash rather than a figure from the wrong table.
-        cost_per_1k_tokens_eur: 0.0,
+        // This node has not read that price list, so it claims no price at
+        // all: `None`, which `vk top` prints as `?`. Not `0.0`, which would
+        // tell an operator their EU calls were free (Ruling 30).
+        cost_per_1k_tokens_eur: None,
         latency_ms_p50: crate::model(&cfg.model).map_or(12_000, |m| m.latency_ms_p50),
         context_ceiling: cfg.ceiling(),
         determinism: Determinism::NonDeterministic,
@@ -326,10 +327,15 @@ mod client {
             } else {
                 max_tokens.min(cap)
             };
+            // Read back out of `converse_input` so the typed request and the
+            // JSON one this crate pins can never bound an answer
+            // differently — and `expect`, not a fallback: a shape change
+            // must fail the build's tests, not silently halve the caller's
+            // bound (fix round 1, nit).
             let bounded = converse_input(prompt, asked)["inferenceConfig"]["maxTokens"]
                 .as_u64()
                 .and_then(|n| i32::try_from(n).ok())
-                .unwrap_or(1024);
+                .expect("converse_input always writes inferenceConfig.maxTokens");
             let message = Message::builder()
                 .role(ConversationRole::User)
                 .content(ContentBlock::Text(prompt.to_string()))

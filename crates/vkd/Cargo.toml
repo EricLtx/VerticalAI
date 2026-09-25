@@ -15,9 +15,10 @@ name = "vkd"
 path = "src/main.rs"
 
 [features]
-# Build the EU (Bedrock) arch into this daemon. See `vk-arch-anthropic`'s own
-# feature for the build-cost measurement behind the default.
-default = ["bedrock"]
+# Build the EU (Bedrock) arch into this daemon: `cargo build -p vkd
+# --features bedrock`. Off by default (Ruling 30); see `vk-arch-anthropic`'s
+# own feature for why.
+default = []
 bedrock = ["vk-ipc/bedrock"]
 
 [dependencies]

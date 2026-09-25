@@ -94,14 +94,19 @@ Because this arch counts its own prompts, `vk top` shows what the calls
 actually cost rather than what this node guessed they would:
 
 ```
-ARCH            GOVERNED  CALLS  TOKENS  MEASURED  COST (LIST USD)  PROJECTED
-sha256:2ee2...  no            2   28870     28870          0.02964          0
-sha256:fd4b...  yes           1      74        74                -          0
+ARCH            STATE  GOVERNED  CALLS  TOKENS  MEASURED  COST (LIST USD)  EUR/1K  PROJECTED
+sha256:2ee2...  ready  no            2   28870     28870          0.02964       -          0
+sha256:fd4b...  ready  yes           1      74        74                -       -          0
+sha256:91ac...  ready  no            0       0         -                -  0.0046          0
+sha256:c30f...  ready  no            0       0         -                -       ?          0
 ```
 
 `TOKENS` is the best number available per call, `MEASURED` how much of it the
 arch itself counted — a dash where an arch reports no usage, so an estimate is
-never mistaken for a figure anyone could bill against.
+never mistaken for a figure anyone could bill against. `EUR/1K` is the price
+the arch's manifest states: a dash where nothing is billed (the subscription
+arch, a local model) and `?` where this node has no price list for it (the
+Bedrock arch, priced by AWS), which is never printed as `0`.
 
 Inference happens on Anthropic's servers, so the manifest is honest about it:
 `governed: false`, `locality: cloud`, `jurisdiction: US`, 30-day retention, and
@@ -121,6 +126,23 @@ vk mount anthropic --model claude-sonnet-5 --ctx 200000 --max-tokens 2048
 vk mount bedrock --region eu-central-1                  # EU-hosted, Frankfurt or Dublin
 ```
 
+**Mounting a cloud arch is a human act.** It authorises this node's registers
+to leave the machine for a third party — and durably, because the mount is
+replayed at every restart — so `vk mount anthropic`, `vk mount bedrock` and
+`vk mount claude-code` carry a presence proof signed by this node's device
+key, exactly as `vk stop` and `vk approve` do, and the daemon refuses them
+from a bare connection with `I1`. `vk mount ollama` and `vk mount mock` are
+unchanged: nothing leaves the machine.
+
+**Where the calls go is not the caller's to say.** The first-party origin is
+`https://api.anthropic.com`, fixed in the daemon; a mount config naming
+`base_url`, `endpoint` or anything else nobody declared is refused as a bad
+parameter rather than honoured. Only `vkd --anthropic-base-url` moves it, it
+is for tests, and even it must be `https://` or this machine's own loopback —
+because whatever it names is where this node puts its API key. Redirects are
+not followed for the same reason: `x-api-key` is a custom header that
+`reqwest` would carry across a `307` to another host.
+
 The key lives in this account's OS keyring under `vk`/`anthropic` and nowhere
 else: not in the mount spec (which is stored unencrypted, and which the kernel
 refuses to build out of anything credential-shaped), not in a manifest, not in
@@ -130,7 +152,10 @@ again each time it re-creates that arch at boot, so rotating the key is `vk
 secret set anthropic` and a restart. A daemon that finds no key refuses the
 mount and prints the one line that fixes it. (`vkd --anthropic-key-file` reads
 it from a file instead, for CI and for a headless node whose OS has no
-credential store.)
+credential store — and for the Windows **service** account, whose keyring is
+not the interactive user's; the file must be readable by its owner alone
+(`chmod 600`, or a DACL naming only this account, SYSTEM and the
+administrators), and the daemon refuses to start on one that is not.)
 
 The two differ in exactly the things a manifest exists to say:
 
@@ -158,11 +183,20 @@ belt to that suspender rather than the load-bearing one. `--ctx` pins a smaller
 ceiling for a node that wants one.
 
 `vk mount bedrock`'s transport is the AWS SDK, behind the `bedrock` cargo
-feature — **on by default**: it is 83 extra crates and about a minute on a
-clean Windows build (15 s to 1 m 15 s), which was the budget. A node that
-wants neither the SDK nor those crates in its supply chain builds
-`--no-default-features`, and a daemon without them refuses the mount by name
-and says how to get a build that has them.
+feature, which is **off by default**. Not for the build time — measured at 83
+extra crates and about a minute on a clean Windows build, 15 s to 1 m 15 s,
+which is affordable — but for the supply chain: 83 transitive dependencies do
+not belong in every node's build for an arch most nodes never mount. A node
+that wants the EU arch asks for it (`cargo build -p vkd --features bedrock`);
+a daemon without it refuses the mount by name and says how to get one that
+has it.
+
+`vk top`'s `EUR/1K` column is the manifest's own price, which is a different
+number from the `COST (LIST USD)` beside it: that one is what the calls did
+cost, this is what the arch charges. A dash means nothing is billed (a local
+model, a subscription); a **`?`** means this node has no price list for that
+arch, which is the Bedrock case — AWS prices it and nobody here has read that
+table. `?` is never rendered as `0`, because `0` would read as free.
 
 ### Arches: a model this kernel governs
 

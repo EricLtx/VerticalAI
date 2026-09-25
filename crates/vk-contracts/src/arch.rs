@@ -57,7 +57,16 @@ pub struct ArchManifest {
     /// ISO 3166 country code, or "EU".
     pub jurisdiction: String,
     pub retention_days: Option<u32>,
-    pub cost_per_1k_tokens_eur: f64,
+    /// What a thousand prompt tokens cost on this arch, in euros — or `None`
+    /// when this node has no price list for it.
+    ///
+    /// `None` is not zero and must never be rendered as one (SP1b Task 2b fix
+    /// round 1, Ruling 30). `Some(0.0)` is a claim: nothing is billed, which
+    /// is true of a local model and of a subscription. `None` is the absence
+    /// of a claim — the Bedrock arch, whose prices are AWS's and which this
+    /// node has not read — and an operator shown `0` there would believe the
+    /// calls were free. `vk top` prints `?`.
+    pub cost_per_1k_tokens_eur: Option<f64>,
     pub latency_ms_p50: u32,
     pub context_ceiling: u32,
     pub determinism: Determinism,
@@ -103,7 +112,7 @@ mod tests {
             locality: Locality::Local,
             jurisdiction: "FR".into(),
             retention_days: None,
-            cost_per_1k_tokens_eur: 0.0,
+            cost_per_1k_tokens_eur: Some(0.0),
             latency_ms_p50: 900,
             context_ceiling: 8192,
             determinism: Determinism::SeededDeterministic,

@@ -43,6 +43,10 @@ struct Canned {
     count: Option<u32>,
     /// An error object to answer `/v1/messages` with instead, and its status.
     error: Option<(u16, Value)>,
+    /// Answer `/v1/messages` with a redirect of this status to this origin
+    /// instead. The adapter must **not** follow it: `x-api-key` is a custom
+    /// header and reqwest's default policy would carry it across the hop.
+    redirect_to: Option<(u16, String)>,
 }
 
 impl Default for Canned {
@@ -62,6 +66,7 @@ impl Default for Canned {
             output_tokens: 56,
             count: Some(1234),
             error: None,
+            redirect_to: None,
         }
     }
 }
@@ -151,9 +156,10 @@ fn serve(mut stream: TcpStream, canned: &Canned, log: &Arc<Mutex<Vec<Seen>>>) {
                 &json!({"type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}}),
             ),
         },
-        "/v1/messages" => match &canned.error {
-            Some((status, body)) => respond(&mut stream, *status, body),
-            None => respond(
+        "/v1/messages" => match (&canned.error, &canned.redirect_to) {
+            (_, Some((status, to))) => redirect(&mut stream, *status, &format!("{to}/v1/messages")),
+            (Some((status, body)), _) => respond(&mut stream, *status, body),
+            (None, None) => respond(
                 &mut stream,
                 200,
                 &json!({
@@ -210,6 +216,16 @@ fn read_request(stream: &TcpStream) -> Option<(String, BTreeMap<String, String>,
     let mut body = vec![0u8; length];
     reader.read_exact(&mut body).ok()?;
     Some((path, headers, String::from_utf8_lossy(&body).into_owned()))
+}
+
+/// A redirect. `302` is the ordinary one; `307` is the dangerous one,
+/// because it replays the POST and its body at the new origin.
+fn redirect(stream: &mut TcpStream, status: u16, location: &str) {
+    let head = format!(
+        "HTTP/1.1 {status} Redirect\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.flush();
 }
 
 fn respond(stream: &mut TcpStream, status: u16, body: &Value) {
@@ -437,11 +453,10 @@ fn the_manifest_is_a_us_cloud_arch_kept_thirty_days_at_business_and_ungoverned()
     assert_eq!(m.identity.weights_sha256, "model:claude-opus-5");
     // Metered, unlike the subscription arch: a per-token price, in euros.
     // $5/MTok in at the pinned rate is €0.0046 per 1 000 tokens.
-    assert!(
-        (m.cost_per_1k_tokens_eur - 0.0046).abs() < 1e-9,
-        "{}",
-        m.cost_per_1k_tokens_eur
-    );
+    let price = m
+        .cost_per_1k_tokens_eur
+        .expect("a listed model carries a price");
+    assert!((price - 0.0046).abs() < 1e-9, "{price}");
     assert!(m.validate().is_ok());
 }
 
@@ -548,6 +563,9 @@ fn a_key_read_from_a_file_is_the_file_s_one_line_and_a_missing_one_says_so() {
 fn the_bedrock_manifest_is_an_eu_arch_that_keeps_nothing() {
     let m = bedrock::manifest_for(&bedrock::BedrockConfig::default());
     assert_eq!(m.jurisdiction, "EU");
+    // AWS prices Bedrock and this node has not read that list, so the arch
+    // claims no price at all rather than a misleading zero (Ruling 30).
+    assert_eq!(m.cost_per_1k_tokens_eur, None);
     // Bedrock does not retain model inputs or outputs; there is no window to
     // name, which is not the same as a window of unknown length.
     assert_eq!(m.retention_days, None);
@@ -623,6 +641,14 @@ fn a_bedrock_model_id_keeps_a_full_one_and_prefixes_a_bare_one() {
 fn every_model_in_the_table_is_priced_and_has_a_window() {
     for m in vk_arch_anthropic::MODELS {
         assert!(m.context_window > 0, "{}", m.id);
+        // Adaptive thinking is a 4.6-and-later parameter; the one
+        // 4.5-generation row in the table is the one that must not be sent it.
+        assert_eq!(
+            m.thinking_supported,
+            !m.id.contains("-4-5"),
+            "{} has the wrong thinking flag for its generation",
+            m.id
+        );
         assert!(m.input_usd_per_mtok > 0.0, "{}", m.id);
         assert!(m.output_usd_per_mtok > m.input_usd_per_mtok, "{}", m.id);
         assert!(m.latency_ms_p50 > 0, "{}", m.id);
@@ -642,10 +668,167 @@ fn an_unknown_model_mounts_with_no_price_rather_than_a_made_up_one() {
     // No row in the table, so no price is claimed and no window is invented:
     // the conservative fallback ceiling is used and `vk top` shows nothing
     // it cannot stand behind.
-    assert_eq!(m.cost_per_1k_tokens_eur, 0.0);
+    // `None`, never `0.0`: zero is a claim that the calls are free, and
+    // `vk top` prints `?` for the absence of a claim (Ruling 30).
+    assert_eq!(m.cost_per_1k_tokens_eur, None);
     assert_eq!(m.context_ceiling, vk_arch_anthropic::FALLBACK_CONTEXT);
     assert_eq!(
         AnthropicAdapter::cost_list_usd("claude-imaginary-9", 1, 1),
         None
     );
+}
+
+// ------------------------------------------------- where the key is sent
+
+/// A redirect is a failed call, not a hop to follow.
+///
+/// reqwest follows up to ten by default and strips only `authorization`,
+/// `cookie`, `cookie2`, `proxy-authorization` and `www-authenticate` on a host
+/// change — `x-api-key` is a custom header and is on none of those lists, so
+/// without `Policy::none()` this node would hand its key to whatever a `307`
+/// named, POST body and all (fix round 1, Important 1). Two stand-ins: the one
+/// the adapter is pointed at answers `307` to the other, and the other must
+/// never be spoken to at all.
+#[test]
+fn a_redirect_is_refused_and_the_key_never_reaches_the_second_host() {
+    // Both kinds: `302`, the ordinary one, and `307`, which replays the POST
+    // and its body at the new origin.
+    for status in [302u16, 307] {
+        let collector = Fake::start(Canned::default());
+        let api = Fake::start(Canned {
+            redirect_to: Some((status, collector.base_url.clone())),
+            ..Default::default()
+        });
+        let err = adapter(&api)
+            .complete("hello", 0)
+            .expect_err("a redirect is not an answer");
+        let AdapterError::Other(e) = err else {
+            panic!("a redirect is not an invariant refusal")
+        };
+        let text = format!("{e:#}");
+        assert!(
+            text.contains(&status.to_string()),
+            "say what came back: {text}"
+        );
+        assert!(!text.contains(KEY), "the key is in the error: {text}");
+        // The one that matters: the second host saw nothing at all.
+        assert!(
+            collector.seen("/v1/messages").is_empty(),
+            "{status}: the key was sent to the redirect target"
+        );
+        assert!(collector.seen("/v1/messages/count_tokens").is_empty());
+    }
+}
+
+/// The origin is bounded wherever it comes from: `https://` to anywhere, or
+/// plaintext to this machine's own loopback and nowhere else. The daemon
+/// refuses to accept one from a pipe client at all (see `vk-ipc`'s tests);
+/// this is the adapter's own last line, which refuses every call rather than
+/// putting the key on a wire it should not be on.
+#[test]
+fn an_adapter_pointed_at_a_plaintext_host_refuses_every_call() {
+    let a = AnthropicAdapter::new(
+        SecretString::new(KEY),
+        DEFAULT_MODEL,
+        "http://collector.example",
+    );
+    let err = a.complete("hello", 0).expect_err("nowhere to send it");
+    let AdapterError::Other(e) = err else {
+        panic!("not an invariant refusal")
+    };
+    let text = format!("{e:#}");
+    assert!(text.contains("in the clear"), "{text}");
+}
+
+/// Haiku 4.5 is in the table and must be callable: adaptive thinking is a
+/// 4.6-and-later parameter and a 4.5-generation model 400s on it, so the
+/// block is left out of the request rather than sent and refused at the far
+/// end (fix round 1, Important 2).
+#[test]
+fn the_older_generation_is_sent_no_thinking_block_at_all() {
+    let fake = Fake::start(Canned::default());
+    adapter_with(
+        &fake,
+        AnthropicConfig {
+            model: "claude-haiku-4-5".into(),
+            ..Default::default()
+        },
+    )
+    .complete("hello", 0)
+    .expect("answered");
+    let sent = fake.only("/v1/messages");
+    assert_eq!(sent.body["model"], "claude-haiku-4-5");
+    assert!(
+        sent.body.get("thinking").is_none(),
+        "adaptive thinking would 400 on this model: {}",
+        sent.body
+    );
+    // And the two requests are two arches: a model answering without a
+    // thinking block is not the same arch as one answering with it.
+    assert_ne!(
+        AnthropicAdapter::manifest_for(&AnthropicConfig {
+            model: "claude-haiku-4-5".into(),
+            ..Default::default()
+        })
+        .identity
+        .sampling["thinking"],
+        AnthropicAdapter::manifest_for(&AnthropicConfig::default())
+            .identity
+            .sampling["thinking"],
+    );
+}
+
+/// The post-check names the number it compared against. A refusal reading
+/// `needed 4096, ceiling 3686` is one no operator can reconcile: the
+/// threshold is the full window, so the message says the full window (fix
+/// round 1, Minor 1).
+#[test]
+fn the_post_checks_refusal_names_the_ceiling_it_actually_compared() {
+    let fake = Fake::start(Canned {
+        count: Some(10),
+        input_tokens: 4_096,
+        ..Default::default()
+    });
+    let adapter = adapter_with(
+        &fake,
+        AnthropicConfig {
+            context_ceiling: 4_096,
+            ..Default::default()
+        },
+    );
+    match adapter.complete("short", 0) {
+        Err(AdapterError::I4Prime { needed, ceiling }) => {
+            assert_eq!(needed, 4_096);
+            assert_eq!(ceiling, 4_096, "the full window, not nine tenths of it");
+            assert_ne!(ceiling, adapter.context_budget());
+        }
+        other => panic!("expected an I4′ refusal after the call, got {other:?}"),
+    }
+}
+
+/// A hostile far end that echoes the key into `error.type` gets it scrubbed
+/// out of the daemon's message like every other string it sends (fix round 1,
+/// Minor 2).
+#[test]
+fn even_the_error_type_is_scrubbed() {
+    let fake = Fake::start(Canned {
+        error: Some((
+            400,
+            json!({"type": "error", "error": {
+                "type": format!("leak_{KEY}"),
+                "message": "nothing to see",
+            }}),
+        )),
+        ..Default::default()
+    });
+    let err = adapter(&fake).complete("hello", 0).expect_err("a 400");
+    let AdapterError::Other(e) = err else {
+        panic!("not an invariant refusal")
+    };
+    let text = format!("{e:#}");
+    assert!(
+        !text.contains(KEY),
+        "the key came back in error.type: {text}"
+    );
+    assert!(text.contains("leak_[redacted]"), "{text}");
 }
