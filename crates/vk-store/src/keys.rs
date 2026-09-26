@@ -7,14 +7,37 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rand::RngCore;
 use std::io::Write as _;
 use std::path::PathBuf;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub enum KeySource {
     Keyring { service: String, user: String },
     File(PathBuf),
 }
 
-#[derive(Clone)]
+/// Thirty-two bytes of key material that are wiped when they are dropped
+/// (SP1a review M4): a subject's DEK between its unwrap and the seal, the
+/// master key's bytes while they are being loaded, the node seed. `Zeroizing`
+/// derefs to the array, so every consumer takes `&[u8; 32]` as before; what
+/// changes is that no owned copy outlives its use unwiped.
+pub type KeyBytes = Zeroizing<[u8; 32]>;
+
+/// The master key. Deliberately **not** `Clone`: the store holds the one
+/// copy that was loaded, and it is zeroed when the store lets go of it.
+///
+/// ```compile_fail
+/// fn take(k: vk_store::keys::MasterKey) -> vk_store::keys::MasterKey {
+///     k.clone()
+/// }
+/// ```
 pub struct MasterKey([u8; 32]);
+
+impl Drop for MasterKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for MasterKey {}
 
 impl MasterKey {
     pub fn load_or_create(source: KeySource) -> Result<MasterKey> {
@@ -22,11 +45,13 @@ impl MasterKey {
             KeySource::Keyring { service, user } => {
                 let entry = keyring::Entry::new(&service, &user)?;
                 match entry.get_password() {
-                    Ok(b64) => Ok(MasterKey(decode(&b64)?)),
+                    // The base64 the keyring hands back is the key: wiped
+                    // with the bytes it decodes to.
+                    Ok(b64) => Ok(MasterKey(*decode(&Zeroizing::new(b64))?)),
                     Err(keyring::Error::NoEntry) => {
                         let k = fresh();
-                        entry.set_password(&base64::engine::general_purpose::STANDARD.encode(k))?;
-                        Ok(MasterKey(k))
+                        entry.set_password(&encode(&k))?;
+                        Ok(MasterKey(*k))
                     }
                     Err(e) => Err(e.into()),
                 }
@@ -47,13 +72,9 @@ impl MasterKey {
                 match opts.open(&path) {
                     Ok(mut file) => {
                         let k = fresh();
-                        file.write_all(
-                            base64::engine::general_purpose::STANDARD
-                                .encode(k)
-                                .as_bytes(),
-                        )
-                        .with_context(|| format!("write {}", path.display()))?;
-                        Ok(MasterKey(k))
+                        file.write_all(encode(&k).as_bytes())
+                            .with_context(|| format!("write {}", path.display()))?;
+                        Ok(MasterKey(*k))
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                         #[cfg(unix)]
@@ -64,7 +85,8 @@ impl MasterKey {
                                 anyhow::bail!("{} is readable by others; refusing", path.display());
                             }
                         }
-                        Ok(MasterKey(decode(std::fs::read_to_string(&path)?.trim())?))
+                        let text = Zeroizing::new(std::fs::read_to_string(&path)?);
+                        Ok(MasterKey(*decode(text.trim())?))
                     }
                     Err(err) => Err(err).with_context(|| format!("create {}", path.display())),
                 }
@@ -76,13 +98,24 @@ impl MasterKey {
         vk_contracts::hash_bytes(&self.0)[..23].to_string()
     }
 
-    /// Wrap a DEK: nonce || ciphertext.
-    pub fn wrap(&self, dek: &[u8; 32]) -> Result<Vec<u8>> {
-        seal(&self.0, &[], dek)
+    /// Wrap a subject's DEK: nonce || ciphertext, with the **subject id as
+    /// associated data** (SP1a review N4). The tag then vouches for the
+    /// subject as well as the bytes, so a `.dek` file copied or renamed
+    /// under another subject's name does not unwrap there — and a `shred` of
+    /// that subject cannot be tricked into destroying somebody else's key.
+    pub fn wrap(&self, key_id: &str, dek: &[u8; 32]) -> Result<Vec<u8>> {
+        seal(&self.0, key_id.as_bytes(), dek)
     }
-    pub fn unwrap_dek(&self, wrapped: &[u8]) -> Result<[u8; 32]> {
-        let v = open(&self.0, &[], wrapped)?;
-        v.try_into().map_err(|_| anyhow::anyhow!("bad DEK length"))
+
+    /// The inverse, under the same subject id. Fails for any other subject,
+    /// any other master key and any altered byte alike; the caller says which
+    /// of those it thinks it is looking at.
+    pub fn unwrap_dek(&self, key_id: &str, wrapped: &[u8]) -> Result<KeyBytes> {
+        let v = Zeroizing::new(open(&self.0, key_id.as_bytes(), wrapped)?);
+        anyhow::ensure!(v.len() == 32, "bad DEK length");
+        let mut dek = Zeroizing::new([0u8; 32]);
+        dek.copy_from_slice(&v);
+        Ok(dek)
     }
 }
 
@@ -154,16 +187,24 @@ pub fn check_private_file(path: &std::path::Path, allowed_owners: &[&str]) -> Re
     Ok(())
 }
 
-fn fresh() -> [u8; 32] {
-    let mut k = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut k);
+/// Thirty-two random bytes, born in a wiped-on-drop container.
+pub fn fresh() -> KeyBytes {
+    let mut k = Zeroizing::new([0u8; 32]);
+    rand::rngs::OsRng.fill_bytes(&mut *k);
     k
 }
 
-fn decode(b64: &str) -> Result<[u8; 32]> {
-    let v = base64::engine::general_purpose::STANDARD.decode(b64)?;
-    v.try_into()
-        .map_err(|_| anyhow::anyhow!("master key must be 32 bytes"))
+/// The base64 form a keyring or a key file holds — wiped with the key.
+fn encode(k: &[u8; 32]) -> Zeroizing<String> {
+    Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(k))
+}
+
+fn decode(b64: &str) -> Result<KeyBytes> {
+    let v = Zeroizing::new(base64::engine::general_purpose::STANDARD.decode(b64)?);
+    anyhow::ensure!(v.len() == 32, "master key must be 32 bytes");
+    let mut k = Zeroizing::new([0u8; 32]);
+    k.copy_from_slice(&v);
+    Ok(k)
 }
 
 /// Seal `plaintext` under `key`: nonce || ciphertext, with `aad` bound into
@@ -207,6 +248,33 @@ pub fn open(key: &[u8; 32], aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The key types wipe themselves when dropped (review M4). A bound, not a
+    /// memory probe: reading freed memory is undefined behaviour, and the
+    /// promise this checks is that the types carry the trait that zeroes them.
+    #[test]
+    fn key_material_is_wiped_on_drop() {
+        fn wiped<T: ZeroizeOnDrop>() {}
+        wiped::<MasterKey>();
+        wiped::<KeyBytes>();
+        wiped::<Zeroizing<String>>();
+        let fresh_key = fresh();
+        assert_ne!(*fresh_key, [0u8; 32]);
+    }
+
+    /// The subject id is the AEAD's associated data: the same wrapped bytes
+    /// open under their own subject and under no other.
+    #[test]
+    fn a_dek_unwraps_under_its_own_subject_only() {
+        let master = MasterKey(*fresh());
+        let dek = fresh();
+        let wrapped = master.wrap("task:1", &dek).unwrap();
+        assert_eq!(*master.unwrap_dek("task:1", &wrapped).unwrap(), *dek);
+        assert!(master.unwrap_dek("task:2", &wrapped).is_err());
+        assert!(master.unwrap_dek("", &wrapped).is_err());
+        let other = MasterKey(*fresh());
+        assert!(other.unwrap_dek("task:1", &wrapped).is_err());
+    }
 
     /// A key file must be readable by its owner and nobody else — the rule
     /// `vkd --anthropic-key-file` is held to before the store opens

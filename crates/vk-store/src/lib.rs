@@ -629,6 +629,38 @@ mod tests {
         );
     }
 
+    /// A wrapped key filed under a subject that is not its own — copied or
+    /// renamed from another subject's file — fails the key tier by name
+    /// (review N4): the AEAD tag binds a DEK to the subject it was wrapped
+    /// for, so the tier tells "this subject's key no longer unwraps" from
+    /// "this is somebody else's key".
+    #[test]
+    fn fsck_finds_a_wrapped_key_filed_under_another_subject() {
+        let d = tempfile::tempdir().unwrap();
+        drop(furnished(d.path()));
+        let keys = d.path().join("blobs").join("keys");
+        std::fs::copy(
+            keys.join(format!("{}.dek", hex::encode(b"subject-a"))),
+            keys.join(format!("{}.dek", hex::encode(b"subject-b"))),
+        )
+        .unwrap();
+
+        let r = open(d.path()).fsck();
+        assert!(!r.ok, "{r:?}");
+        let keys = tier(&r, "keys");
+        assert_eq!(keys.checked, 2, "{keys:?}");
+        assert_eq!(keys.failed, 1, "{keys:?}");
+        assert!(
+            keys.problems.iter().any(|p| p.contains("subject-b")),
+            "the subject whose key is not its own is named: {keys:?}"
+        );
+        // And subject-a, whose file is still its own, passes.
+        assert!(
+            !keys.problems.iter().any(|p| p.contains("subject-a")),
+            "{keys:?}"
+        );
+    }
+
     /// A shredded subject is not damage: its DEK was deleted on purpose and
     /// its ciphertext is meant to be unreadable for ever. `fsck` counts it as
     /// skipped and stays green, or erasure would read as corruption.

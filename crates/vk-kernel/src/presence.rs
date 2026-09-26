@@ -11,6 +11,7 @@ use rand::RngCore;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use vk_contracts::principal::HumanKey;
+use zeroize::Zeroizing;
 
 pub const KEYRING_SERVICE: &str = "vk";
 
@@ -19,6 +20,18 @@ pub enum KeySource {
     File(PathBuf),
 }
 
+/// The seed on its way from the keyring or the file into the signing key:
+/// wiped when dropped (SP1a review M4), as is the base64 it came as.
+type Seed = Zeroizing<[u8; 32]>;
+
+/// The node's device key. Not `Clone`, and its ed25519 secret is zeroed when
+/// it is dropped (`ed25519_dalek::SigningKey` wipes itself).
+///
+/// ```compile_fail
+/// fn take(d: vk_kernel::presence::NodeDevice) -> vk_kernel::presence::NodeDevice {
+///     d.clone()
+/// }
+/// ```
 pub struct NodeDevice {
     node_id: String,
     key: SigningKey,
@@ -49,10 +62,10 @@ impl HumanKey for NodeDevice {
     }
 }
 
-fn keyring_seed(node_id: &str) -> Result<[u8; 32]> {
+fn keyring_seed(node_id: &str) -> Result<Seed> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, &format!("node-device:{node_id}"))?;
     match entry.get_password() {
-        Ok(b64) => decode(&b64),
+        Ok(b64) => decode(&Zeroizing::new(b64)),
         Err(keyring::Error::NoEntry) => {
             let seed = fresh();
             entry.set_password(&encode(&seed))?;
@@ -65,7 +78,7 @@ fn keyring_seed(node_id: &str) -> Result<[u8; 32]> {
 /// Mirrors `vk_store::keys`: an atomic `create_new` so there is no
 /// exists-then-write window, born `0o600` on Unix, and an existing file that
 /// others could read is refused rather than trusted.
-fn file_seed(path: &Path) -> Result<[u8; 32]> {
+fn file_seed(path: &Path) -> Result<Seed> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -89,26 +102,29 @@ fn file_seed(path: &Path) -> Result<[u8; 32]> {
                     anyhow::bail!("{} is readable by others; refusing", path.display());
                 }
             }
-            decode(std::fs::read_to_string(path)?.trim())
+            let text = Zeroizing::new(std::fs::read_to_string(path)?);
+            decode(text.trim())
         }
         Err(err) => Err(err).with_context(|| format!("create {}", path.display())),
     }
 }
 
-fn fresh() -> [u8; 32] {
-    let mut seed = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut seed);
+fn fresh() -> Seed {
+    let mut seed = Zeroizing::new([0u8; 32]);
+    rand::rngs::OsRng.fill_bytes(&mut *seed);
     seed
 }
 
-fn encode(seed: &[u8; 32]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(seed)
+fn encode(seed: &[u8; 32]) -> Zeroizing<String> {
+    Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(seed))
 }
 
-fn decode(b64: &str) -> Result<[u8; 32]> {
-    let v = base64::engine::general_purpose::STANDARD.decode(b64)?;
-    v.try_into()
-        .map_err(|_| anyhow::anyhow!("node device key must be 32 bytes"))
+fn decode(b64: &str) -> Result<Seed> {
+    let v = Zeroizing::new(base64::engine::general_purpose::STANDARD.decode(b64)?);
+    anyhow::ensure!(v.len() == 32, "node device key must be 32 bytes");
+    let mut seed = Zeroizing::new([0u8; 32]);
+    seed.copy_from_slice(&v);
+    Ok(seed)
 }
 
 #[cfg(test)]
@@ -133,6 +149,19 @@ mod tests {
             .iter()
             .filter(|e| e.kind == "device.enrolled")
             .count()
+    }
+
+    /// The seed, and the base64 it travels as, are wiped when dropped
+    /// (review M4); the signing key wipes itself.
+    #[test]
+    fn the_seed_and_its_base64_are_wiped_on_drop() {
+        fn wiped<T: zeroize::ZeroizeOnDrop>() {}
+        wiped::<Seed>();
+        wiped::<Zeroizing<String>>();
+        wiped::<SigningKey>();
+        let seed = fresh();
+        let b64 = encode(&seed);
+        assert_eq!(*decode(&b64).unwrap(), *seed);
     }
 
     #[test]

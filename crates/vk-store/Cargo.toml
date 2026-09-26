@@ -20,6 +20,9 @@ rand.workspace = true
 sha2.workspace = true
 hex.workspace = true
 thiserror.workspace = true
+# Key material is wiped when it is dropped (SP1a review M4): the master key,
+# every DEK and the node seed, and the base64 strings they pass through.
+zeroize = "1"
 
 # `flock` for the single-writer lock on the state directory; Windows uses the
 # file share mode the standard library already exposes.
