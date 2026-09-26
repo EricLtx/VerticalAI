@@ -1515,8 +1515,14 @@ mod detach_tests {
     /// A detached daemon leads its own **session**, not only its own process
     /// group (SP1a review M7): `setsid` in the child, so the terminal's
     /// `SIGHUP` — sent to the session when the shell that ran `vk boot`
-    /// closes — never reaches it. Read back from the child itself: `ps`
-    /// prints the session id, which is the child's own pid for a leader.
+    /// closes — never reaches it.
+    ///
+    /// The child reports its session and this process reports its own, both
+    /// through the same `ps -o sess=` — a numeric session id on Linux, an
+    /// opaque session pointer on macOS. The test never parses it; it only
+    /// asserts the two **differ**, which is exactly what distinguishes `setsid`
+    /// (a new session) from a mere `process_group(0)` (a new group in the same
+    /// session): a regression to the latter would leave the two equal.
     #[test]
     fn a_detached_daemon_leads_its_own_session() {
         let d = tempfile::tempdir().unwrap();
@@ -1525,14 +1531,20 @@ mod detach_tests {
         detach(&mut cmd, d.path()).unwrap();
         let status = cmd.status().unwrap();
         assert!(status.success(), "{status}");
-        let log = std::fs::read_to_string(d.path().join("vkd.log")).unwrap();
-        let sid: i32 = log
-            .trim()
-            .parse()
-            .unwrap_or_else(|e| panic!("{e}: {log:?}"));
-        // SAFETY: `getsid(0)` reads this process's own session id.
-        let ours = unsafe { libc::getsid(0) };
-        assert_ne!(sid, ours, "the child must not be in this process's session");
-        assert!(sid > 0, "{sid}");
+        let child_sess = std::fs::read_to_string(d.path().join("vkd.log")).unwrap();
+        let child_sess = child_sess.trim();
+        assert!(!child_sess.is_empty(), "the child printed no session");
+
+        // This process's own session, read the same way.
+        let ours = Command::new("ps")
+            .args(["-o", "sess=", "-p", &std::process::id().to_string()])
+            .output()
+            .unwrap();
+        let ours = String::from_utf8_lossy(&ours.stdout);
+        let ours = ours.trim();
+        assert_ne!(
+            child_sess, ours,
+            "the child must be in a different session (setsid), not this one"
+        );
     }
 }

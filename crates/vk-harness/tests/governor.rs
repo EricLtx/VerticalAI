@@ -307,11 +307,22 @@ fn a_childs_process_group_is_settled_before_the_child_is_reaped() {
     let started = std::time::Instant::now();
     let status = vk_harness::launch::settle_and_reap(&mut child).unwrap();
     assert!(status.success(), "{status}");
-    // SAFETY: `kill(-pgid, 0)` delivers nothing; it asks whether any member is left.
+    // The group can no longer be signalled: no live member is left. `kill(-pgid,
+    // 0)` returns -1, with `ESRCH` (no such process, Linux's answer for an empty
+    // group) or `EPERM` (macOS's answer once the last member has been reparented
+    // away and reaped). Both mean "gone"; the exact errno is the platform's.
+    // SAFETY: `kill(-pgid, 0)` delivers nothing; it only asks whether any member
+    // is left that this process could signal.
     let left = unsafe { libc::kill(-pgid, 0) };
     let errno = std::io::Error::last_os_error().raw_os_error();
-    assert_eq!(left, -1, "the group must be empty");
-    assert_eq!(errno, Some(libc::ESRCH), "{errno:?}");
+    assert_eq!(
+        left, -1,
+        "the group must have no signallable member: {errno:?}"
+    );
+    assert!(
+        matches!(errno, Some(e) if e == libc::ESRCH || e == libc::EPERM),
+        "the group is gone (ESRCH) or unsignallable (EPERM): {errno:?}"
+    );
     assert!(
         started.elapsed() < std::time::Duration::from_secs(10),
         "the helper went on SIGTERM, not on the grace timeout: {:?}",
