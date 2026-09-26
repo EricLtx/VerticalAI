@@ -11,6 +11,18 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # No debug info and no incremental cache. The Windows Server 2025 image
+    # behind `windows-latest` lost its D: drive in 2025 and has about 33 GB
+    # free; this workspace's test build with full debug info is ~29 GB on
+    # Windows, so the feature builds below (the AWS SDK on top of it) ran the
+    # runner out of disk the first time the workspace tests let them run
+    # (Ruling 35). Measured locally with both settings: 3.7 GB for the
+    # workspace *and* the `bedrock` build. Panic messages keep their file and
+    # line — those are compiled in regardless — and a one-shot CI build has no
+    # use for an incremental cache.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -45,14 +57,43 @@ jobs:
       # the refusal; this one *runs* the tests the feature turns on — the EU
       # mount path included — rather than only compiling them, so neither half
       # of the gate can rot unnoticed.
+      #
+      # Under bash and teed to a log, like the workspace step, so that a
+      # failure here is named in annotations too — the Windows job's first
+      # failure in these steps arrived as a bare "exit code 1" with nothing a
+      # public reader could see.
       - name: The EU arch's transport builds and its mount path runs
-        run: cargo test -p vk-ipc -p vk-arch-anthropic --features vk-ipc/bedrock
+        shell: bash
+        run: |
+          set -o pipefail
+          df -h . | tail -1 | sed 's/^/disk before the feature builds: /' | tee feature-builds.log
+          cargo test -p vk-ipc -p vk-arch-anthropic --features vk-ipc/bedrock 2>&1 | tee -a feature-builds.log
       - name: And the daemon with it
-        run: cargo check -p vkd --features bedrock --all-targets
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check -p vkd --features bedrock --all-targets 2>&1 | tee -a feature-builds.log
       # And that the crates stay buildable with every optional feature off,
       # which is what a node that wants none of the AWS supply chain builds.
       - name: The build without any optional feature
-        run: cargo check --no-default-features -p vkd -p vk-arch-anthropic
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check --no-default-features -p vkd -p vk-arch-anthropic 2>&1 | tee -a feature-builds.log
+      # GitHub shows at most ten error annotations per step, so this names the
+      # disk left and the first error with its context, then the log's tail.
+      - name: Name what broke in the feature builds
+        if: failure()
+        shell: bash
+        run: |
+          [ -f feature-builds.log ] || exit 0
+          printf '::error title=disk::%s\n' "$(df -h . | tail -1)"
+          grep -E -m 1 -A 5 "panicked at|^error(\[E[0-9]+\])?:|could not compile|failed to run custom build command|LNK[0-9]+|No space left|not enough space" feature-builds.log | head -6 | while IFS= read -r line; do
+            printf '::error title=feature build::%s\n' "$line"
+          done
+          tail -3 feature-builds.log | while IFS= read -r line; do
+            printf '::error title=feature build tail::%s\n' "$line"
+          done
   arch-ollama:
     # The Ollama adapter against a real container and a real model. Not on
     # every branch push: it starts a container, pulls the 1B model and spends
