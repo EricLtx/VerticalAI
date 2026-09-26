@@ -17,7 +17,7 @@ Pure completion, no tools. The kernel launches the installed `claude` with every
 
 The inference itself is **not governed**: it happens on Anthropic's servers, where no interceptor of ours runs. The manifest says so — `governed: false`, `locality: Cloud`, `jurisdiction: "US"`, `retention_days: 30`, clearance capped at Business with third-party data refused — so I2 refuses to lower anything above that into it. **Egress to Anthropic is not observed in SP1b**: this node records what it sent and what came back, not what the far end did with it.
 
-Subscription use is the founder's own. A claude.ai subscription is a person's, not a product's: nothing is billed per call, so the manifest's `cost_per_1k_tokens_eur` is `0` and the list-price equivalent the CLI reports rides on the `infer` event as `cost_list_usd`, visibly a comparison and not a charge. **Customer nodes use API arches** (task 2b), which carry a key, a per-token price and, for the EU jurisdiction, a different host.
+Subscription use is the founder's own. A claude.ai subscription is a person's, not a product's: nothing is billed per call, so the manifest's `cost_per_1k_tokens_eur` is `0` and the list-price equivalent the CLI reports rides on the `infer` event as `cost_list_usd` — and, since SP1b Task 8, on the per-call usage row and the per-arch counters `vk top` and `vk task show` print — visibly a comparison and not a charge. **Customer nodes use API arches** (task 2b), which carry a key, a per-token price and, for the EU jurisdiction, a different host.
 
 ### Anthropic API adapters — first-party (US) and Bedrock (EU)
 

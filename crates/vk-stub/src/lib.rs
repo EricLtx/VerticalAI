@@ -7,7 +7,7 @@ use vk_contracts::labels::{Label, Scope};
 use vk_contracts::ledger::{ClockQuality, HlcClock, Ledger, RetentionClass};
 use vk_contracts::locks::{Lease, LockHome, LockTable};
 use vk_contracts::module::{GateKind, GateVerdict, ModuleManifest};
-use vk_contracts::principal::{Approval, ApprovalKind, DeviceRegistry};
+use vk_contracts::principal::{Approval, ApprovalKind, Challenge, DeviceRegistry};
 use vk_contracts::register::{Register, RegisterId};
 use vk_contracts::stop::{LivenessLease, ResumeEvent, StopEvent, StopSet};
 use vk_contracts::syscalls::{Ctx, InferOutcome, Kernel, KernelError};
@@ -24,6 +24,10 @@ pub struct StubKernel {
     home: LockHome,
     devices: DeviceRegistry,
     approvals: Vec<Approval>,
+    /// The challenges this stub has minted and no approval has spent, by
+    /// nonce — the real kernel's rule (SP1b Task 5): a human approval
+    /// answers a minted challenge or it is nothing.
+    challenges: BTreeMap<String, Challenge>,
     stops: StopSet,
     liveness: BTreeMap<String, LivenessLease>,
     hot: Vec<String>,
@@ -44,6 +48,7 @@ impl StubKernel {
             home: LockHome::default(),
             devices: DeviceRegistry::default(),
             approvals: vec![],
+            challenges: BTreeMap::new(),
             stops: StopSet::default(),
             liveness: BTreeMap::new(),
             hot: vec![],
@@ -185,6 +190,27 @@ impl Kernel for StubKernel {
     }
 
     fn approve(&mut self, ctx: &Ctx, approval: Approval) -> Result<(), KernelError> {
+        // The challenge first, as the real kernel does (SP1b Task 5): a human
+        // approval answers one this stub minted, unspent and unexpired, and
+        // the nonce is spent whatever follows.
+        if approval.kind == ApprovalKind::Human {
+            let presented = approval.challenge.as_ref().ok_or_else(|| {
+                KernelError::I1("a human approval answers a minted challenge".into())
+            })?;
+            let minted = self.challenges.remove(&presented.nonce).ok_or_else(|| {
+                KernelError::I1(
+                    "approval challenge was not minted by this node, or was already spent".into(),
+                )
+            })?;
+            if minted != *presented {
+                return Err(KernelError::I1(
+                    "approval challenge is not the one this node minted for that nonce".into(),
+                ));
+            }
+            if ctx.now_ms >= presented.expires_at_ms {
+                return Err(KernelError::I1("approval challenge expired".into()));
+            }
+        }
         interceptors::i1_approval(&ctx.principal, &approval, &self.devices, ctx.now_ms)?;
         self.log("approval.recorded", ctx.now_ms, &approval);
         self.approvals.push(approval);
@@ -336,6 +362,23 @@ impl KernelTestHooks for StubKernel {
     }
     fn stops(&self) -> StopSet {
         self.stops.clone()
+    }
+    fn mint_challenge(
+        &mut self,
+        ctx: &Ctx,
+        resource: &str,
+        action_digest: &str,
+        ttl_ms: u64,
+    ) -> Challenge {
+        let nonce = self.next_id("nonce");
+        let challenge = Challenge {
+            resource: resource.into(),
+            action_digest: action_digest.into(),
+            nonce: nonce.clone(),
+            expires_at_ms: ctx.now_ms.saturating_add(ttl_ms),
+        };
+        self.challenges.insert(nonce, challenge.clone());
+        challenge
     }
 }
 
@@ -595,12 +638,9 @@ mod tests {
         ));
         let key = SoftwareHumanKey::generate("phone-1");
         k.enroll_device("phone-1", key.verifying_key_bytes());
-        let ch = Challenge {
-            resource: "module:quote-drafter".into(),
-            action_digest: "sha256:c".into(),
-            nonce: "n".into(),
-            expires_at_ms: 10,
-        };
+        // The challenge is the kernel's to mint now (SP1b Task 5, mirrored in
+        // the stub by group F): a human approval answers one this node minted.
+        let ch = k.mint_challenge(&human_ctx(2), "module:quote-drafter", "sha256:c", 60_000);
         let sig = key.sign(&ch.digest());
         let ap = Approval {
             subject_hash: "sha256:c".into(),

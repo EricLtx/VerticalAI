@@ -72,6 +72,11 @@ jobs:
           grep -E "^test result:" test.log | grep -v " 0 failed" | while IFS= read -r line; do
             printf '::error title=suite::%s\n' "$line"
           done
+          # The temp-directory leak guard (Windows): a suite that left `.tmp*`
+          # directories behind names them on its way out.
+          grep -E -A 8 "^temp-leak guard:" test.log | head -40 | while IFS= read -r line; do
+            printf '::error title=temp leak::%s\n' "$line"
+          done
       # The other half of the `bedrock` feature gate. The default build has no
       # AWS SDK in it (Ruling 30), so `cargo test --workspace` above exercises
       # the refusal; this one *runs* the tests the feature turns on — the EU
@@ -156,7 +161,12 @@ jobs:
     # The founder has not chosen between the two paths (README.md, "Signing
     # release binaries"); both are wired up so whichever secret set is added
     # first is the one that runs.
-    if: ${{ github.event_name == 'push' }}
+    #
+    # Master pushes, tags and `workflow_dispatch` only — mirroring
+    # `arch-ollama` — so a real signing operation is never spent on a branch
+    # push (Task 10 group F): a branch is covered by `test` on three
+    # operating systems, and a signed artifact is for a release.
+    if: (github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/'))) || github.event_name == 'workflow_dispatch'
     needs: test
     runs-on: windows-latest
     env:

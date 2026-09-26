@@ -35,6 +35,7 @@ use vk_kernel::RealKernel;
 /// writes_nothing` still proves it. This is the test waiting out a race the
 /// test suite creates for itself.
 fn open(dir: &Path) -> RealKernel {
+    vk_contracts::testing::guard_state_dir(dir);
     let source = || vk_store::keys::KeySource::File(dir.join("m.key"));
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {

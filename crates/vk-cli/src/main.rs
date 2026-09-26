@@ -436,7 +436,8 @@ enum HarnessCmd {
         #[arg(long)]
         dry_run: bool,
         /// Keep the workspace after the run instead of removing it (it is
-        /// swept at the daemon's next boot regardless).
+        /// swept a day later by the daemon's retention sweep, and at the
+        /// daemon's next boot, whichever comes first).
         #[arg(long)]
         keep: bool,
     },

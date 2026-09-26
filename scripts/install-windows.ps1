@@ -293,6 +293,12 @@ function Get-ElevatedCommand([string[]]$extraArgs) {
 function Do-Uninstall {
     Say "uninstall from $Root"
 
+    # As Do-Install: a thrown Step must still leave the operator with the
+    # summary, which is what says how far the uninstall got.
+    $serviceOutcome = 'not installed'
+    $removed = @()
+    try {
+
     $svc = Get-Service -Name 'vkd' -ErrorAction SilentlyContinue
     if ($svc) {
         if (-not (Test-Elevated)) {
@@ -301,11 +307,13 @@ function Do-Uninstall {
         } else {
             $svcBin = Join-Path $Root 'vkd-service.exe'
             if (Test-Path -LiteralPath $svcBin) {
+                $serviceOutcome = 'installed; removal failed (see above)'
                 Step 'stop and delete the vkd service' {
                     $r = Try-Run $svcBin @('uninstall') 60
                     if ($r.Out) { Write-Host $r.Out }
                     if ($r.Code -ne 0) { throw $r.Err }
                 }
+                $serviceOutcome = 'removed'
             } else {
                 Warn "vkd service is installed but $svcBin is gone; remove it directly: sc.exe stop vkd, then sc.exe delete vkd"
             }
@@ -320,6 +328,7 @@ function Do-Uninstall {
         $p = Join-Path $Root $b
         if (Test-Path -LiteralPath $p) {
             Step "remove $p" { Remove-Item -LiteralPath $p -Force }
+            $removed += $b
         }
     }
 
@@ -334,9 +343,18 @@ function Do-Uninstall {
         }
     }
 
-    Write-Host ''
-    Write-Host "Left untouched, on purpose: %ProgramData%\VerticalAI\vk (the node's store) and this" -ForegroundColor DarkGray
-    Write-Host "account's OS keyring entries. Uninstalling the program is not discarding a node." -ForegroundColor DarkGray
+    } finally {
+        Write-Host ''
+        Write-Host '=== UNINSTALL SUMMARY ===' -ForegroundColor Green
+        Write-Host "root:      $Root"
+        Write-Host ("binaries:  removed {0}" -f $(if ($removed.Count -gt 0) { $removed -join ', ' } else { 'none' }))
+        Write-Host "service:   $serviceOutcome"
+        Write-Host "path:      $Root taken off this account's PATH (open a new shell)"
+        Write-Host '=========================='
+        Write-Host ''
+        Write-Host "Left untouched, on purpose: %ProgramData%\VerticalAI\vk (the node's store) and this" -ForegroundColor DarkGray
+        Write-Host "account's OS keyring entries. Uninstalling the program is not discarding a node." -ForegroundColor DarkGray
+    }
 }
 
 # -------------------------------------------------------------------- Install

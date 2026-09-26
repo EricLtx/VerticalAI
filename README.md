@@ -64,7 +64,7 @@ table or, with `--json`, as the daemon's own answer.
 | `vk secret set NAME` | the credential store: a secret this node's daemon reads, put in this account's OS keyring without ever being echoed or printed |
 | `vk task submit` / `step` / `show` | processes: a task is the unit of work, its register is its address space |
 | `vk stop [SCOPE]`, `vk resume ID` | signals: a STOP halts a scope until a human lifts it |
-| `vk approve ID [--passkey]` | the human ceremony: an approval of a kernel-minted challenge, signed by this node's device key or by a passkey in the browser (invariant I1) |
+| `vk approve ID [--passkey]` | the human ceremony: an approval of a kernel-minted challenge, signed by this node's device key or by a passkey in the browser (invariant I1). **The trust model without a passkey:** the node's device key sits in this account's OS keyring, so every process running as this user can sign with it — every same-user process counts as "the human" until `--passkey` moves the human key into Windows Hello or a phone (SP1a's stand-in, Rulings 17/20; `contracts/tcb.md`) |
 | `vk passkey enroll [--open]`, `vk passkey ls` | the human's own device: a passkey (Windows Hello, a phone) enrolled through the browser |
 | `vk dmesg -n N` | the kernel ring buffer: the tail of the hash-chained ledger |
 | `vk ledger verify` | `fsck` for the record: does the hash chain recompute |
@@ -586,7 +586,7 @@ serve nobody.
 
 | | default | override |
 |---|---|---|
-| state directory | this user's local app data, never a synced folder; `%ProgramData%\VerticalAI\vk` under `--as-service` | `--state-dir DIR` |
+| state directory | this user's local app data — `%LOCALAPPDATA%\VerticalAI\vk\data` on Windows (the `data` leaf is `directories`' own), `~/.local/share/vk` on Linux, `~/Library/Application Support/ai.VerticalAI.vk` on macOS — never a synced folder; `%ProgramData%\VerticalAI\vk` under `--as-service` | `--state-dir DIR` |
 | master key | OS keyring, service `vk`, user `master` | `--master-key-file FILE` (tests and CI) |
 | node device key | OS keyring | `--node-key-file FILE`, or `$VK_NODE_KEY_FILE` |
 | endpoint | `\\.\pipe\vk-<user>` (Windows — under `--as-service` too, for the `--user-sid` account); `$XDG_RUNTIME_DIR/vk.sock`, else `/tmp/vk-<user>/vk.sock` (Unix) | `--endpoint EP`, or `$VK_ENDPOINT` |
@@ -677,7 +677,13 @@ means one store — and it creates nothing before refusing.
 
 Shell notes: `vk boot` without `--state-dir` and `--master-key-file` uses this
 user's local app data and writes a `vk`/`master` entry in the OS keyring, which
-is the intended everyday path. In Git Bash on Windows, set `MSYS_NO_PATHCONV=1`
+is the intended everyday path. **Headless Linux:** a machine with no Secret
+Service (no desktop session, a container, a server over SSH) has no keyring
+for the daemon to put the master key or the node's device key in, and the
+keyring call fails rather than falling back — start it with
+`--master-key-file FILE` and `--node-key-file FILE` (both born `0600`, refused
+if anybody else can read them), and keep the two files with the state
+directory: a master key that is lost is every blob on the node lost. In Git Bash on Windows, set `MSYS_NO_PATHCONV=1`
 first, or namespace paths like `/arches` are rewritten into filesystem paths
 before `vk` ever sees them — and pass a named-pipe endpoint from PowerShell or
 `cmd` rather than Git Bash, which eats the leading `\` of `\\.\pipe\...` even

@@ -1983,7 +1983,7 @@ impl RealKernel {
     /// The other is this method, which no syscall reaches: it is called only
     /// in-process, by `vk-web`'s `POST /approve/<task>/finish`, after
     /// `webauthn-rs` has verified the assertion against a passkey that was
-    /// enrolled through the admin flow — so the *approver* here is the passkey
+    /// enrolled under an existing human ceremony — so the *approver* here is the passkey
     /// the verifier identified, never a principal a client asserted, and the
     /// *challenge* is checked here to be one this kernel minted, unspent and
     /// unexpired, never one a client supplied. What a client sends over the
@@ -2870,6 +2870,38 @@ impl KernelTestHooks for RealKernel {
             .expect("store write");
     }
 
+    /// The I1 property's mint (SP1a review M16): a challenge over a subject
+    /// of the test's own, through the same map `approve` spends from, with
+    /// no task behind it. A hook of the same standing as `enroll_device` —
+    /// in-process, for tests — and no syscall reaches it.
+    fn mint_challenge(
+        &mut self,
+        ctx: &Ctx,
+        resource: &str,
+        action_digest: &str,
+        ttl_ms: u64,
+    ) -> Challenge {
+        let nonce = {
+            use base64::Engine;
+            let bytes: [u8; 32] = rand::random();
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        };
+        let challenge = Challenge {
+            resource: resource.into(),
+            action_digest: action_digest.into(),
+            nonce: nonce.clone(),
+            expires_at_ms: ctx.now_ms.saturating_add(ttl_ms),
+        };
+        self.approval_challenges.insert(
+            nonce,
+            PendingApproval {
+                task_id: resource.into(),
+                challenge: challenge.clone(),
+            },
+        );
+        challenge
+    }
+
     fn set_context_budget(&mut self, arch_id: &str, tokens: u32) {
         self.budgets.insert(arch_id.into(), tokens);
     }
@@ -2918,6 +2950,7 @@ mod tests {
     use vk_store::keys::KeySource;
 
     fn open(dir: &std::path::Path) -> RealKernel {
+        vk_contracts::testing::guard_state_dir(dir);
         RealKernel::open(dir, KeySource::File(dir.join("master.key")), "n1").unwrap()
     }
 

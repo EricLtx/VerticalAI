@@ -27,14 +27,44 @@ struct Node {
     server: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
-impl Drop for Node {
-    fn drop(&mut self) {
-        self.server.abort();
+impl Node {
+    /// Stop the pages and let go of the kernel before the TempDir goes: abort
+    /// and **join** the server task, drop the HTTP client's connections, wait
+    /// until the kernel Arc is uniquely held again, and only then remove the
+    /// state directory (Task 10 group F). `close()` rather than a drop, so a
+    /// directory that could not be removed fails the test rather than leaking
+    /// a `.tmp*` into %TEMP%.
+    async fn shutdown(self) {
+        let Node {
+            kernel,
+            links,
+            http,
+            dir,
+            server,
+            ..
+        } = self;
+        server.abort();
+        let _ = server.await;
+        drop(links);
+        drop(http);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while Arc::strong_count(&kernel) > 1 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            Arc::strong_count(&kernel),
+            1,
+            "a page connection task still holds the kernel"
+        );
+        drop(kernel);
+        dir.close()
+            .expect("the state directory is removed once the pages are down");
     }
 }
 
 async fn node() -> Node {
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let kernel = Arc::new(Mutex::new(
         RealKernel::open(
             dir.path(),
@@ -433,6 +463,7 @@ async fn a_passkey_enrols_through_the_pages_and_approves_a_waiting_task() {
         .await;
     assert_eq!(status, 404, "the link was spent by the ceremony: {again}");
     assert_eq!(events_of_kind(&n.kernel, "approval.recorded"), 1);
+    n.shutdown().await;
 }
 
 /// An assertion for a different challenge or state is rejected and nothing
@@ -504,6 +535,7 @@ async fn an_assertion_for_another_challenge_or_state_records_nothing() {
     // And replayed under any later start it is refused: the link is spent.
     let (status, err) = start().await;
     assert_eq!(status, 404, "{err}");
+    n.shutdown().await;
 }
 
 /// Review Minor 2: `finish` records the approval, and runs a step only if the
@@ -580,6 +612,7 @@ async fn finish_records_but_never_steps_a_task_that_has_moved_on() {
     );
     assert_eq!(task_status(&n.kernel, &task), TaskStatus::Running);
     assert_eq!(n.kernel.lock().unwrap().approvals_for(&subject).len(), 2);
+    n.shutdown().await;
 }
 
 /// Review Critical 1: the pages hold **both** loopback addresses — a browser
@@ -637,6 +670,7 @@ async fn both_loopback_families_answer_and_a_taken_family_refuses_the_start() {
     assert!(err.contains("taken"), "{err}");
     let (status, _) = n.get("/").await;
     assert_eq!(status, 200);
+    n.shutdown().await;
 }
 
 /// Review Minor 3: a request that names another host — a page on some
@@ -680,6 +714,7 @@ async fn a_request_that_names_another_host_is_refused() {
     // The refusal carries the security headers too: read them raw.
     let (status, _) = raw_request(format!("127.0.0.1:{p}"), "GET / HTTP/1.1", &["Host: x:1"]).await;
     assert_eq!(status, 400);
+    n.shutdown().await;
 }
 
 /// The pages open only from a link the endpoint minted, for the page and
@@ -726,6 +761,7 @@ async fn the_pages_open_only_from_a_link_for_their_page_and_task() {
         .unwrap()
         .pending_approvals(now_ms())
         .is_empty());
+    n.shutdown().await;
 }
 
 /// Without an enrolled passkey the approval page says so and mints nothing;
@@ -797,4 +833,5 @@ async fn without_a_passkey_or_a_waiting_task_no_challenge_is_minted() {
         "{body}"
     );
     assert!(!body.contains("<b>bold</b>"), "{body}");
+    n.shutdown().await;
 }

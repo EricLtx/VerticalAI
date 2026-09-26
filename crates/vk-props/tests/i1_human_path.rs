@@ -7,6 +7,10 @@ use vk_contracts::testing::KernelTestHooks;
 #[derive(Debug, Clone)]
 enum Op {
     Approve(ApprovalKind),
+    /// A human approval that is valid in every respect but the channel: a
+    /// challenge the kernel minted, signed by the enrolled key, presented by
+    /// a machine principal (SP1a review M16).
+    SignedApprovalOnMachineChannel,
     Lease(String),
     Stop,
     Automation,
@@ -20,13 +24,35 @@ fn op() -> impl Strategy<Value = Op> {
             Just(ApprovalKind::Human)
         ]
         .prop_map(Op::Approve),
+        Just(Op::SignedApprovalOnMachineChannel),
         "[a-c]".prop_map(Op::Lease),
         Just(Op::Stop),
         Just(Op::Automation),
     ]
 }
 
+/// `key`'s approval of exactly `challenge`, as `vk approve` would build it.
+fn signed(key: &SoftwareHumanKey, challenge: Challenge) -> Approval {
+    Approval {
+        subject_hash: challenge.action_digest.clone(),
+        kind: ApprovalKind::Human,
+        approver: Principal::Human {
+            device_id: key.device_id(),
+        },
+        signature_hex: Some(hex::encode(key.sign(&challenge.digest()))),
+        challenge: Some(challenge),
+    }
+}
+
+/// I1, both halves: whatever the machine principal tries — unsigned human
+/// approvals, a **valid** signed approval on its own channel, STOPs,
+/// automations — no human approval is recorded and no STOP lands; and the
+/// human's own channel still works, for a STOP and for **one valid approval
+/// per run** (SP1a review M16), so the property proves acceptance and not
+/// only refusal.
 fn human_path_property<K: KernelTestHooks>(k: &mut K, ops: &[Op]) -> Result<(), TestCaseError> {
+    let key = SoftwareHumanKey::generate("phone-1");
+    k.enroll_device("phone-1", key.verifying_key_bytes());
     k.renew_liveness("acme", "phone-1", 1_000_000);
     let m = Ctx {
         principal: Principal::Machine {
@@ -60,6 +86,14 @@ fn human_path_property<K: KernelTestHooks>(k: &mut K, ops: &[Op]) -> Result<(), 
                     },
                 );
             }
+            Op::SignedApprovalOnMachineChannel => {
+                let challenge = k.mint_challenge(&ctx, "subject", "sha256:s", 60_000);
+                let refused = k.approve(&ctx, signed(&key, challenge));
+                prop_assert!(
+                    matches!(refused, Err(KernelError::I1(_))),
+                    "a valid signature on a machine channel is still not a human: {refused:?}"
+                );
+            }
             Op::Lease(r) => {
                 let _ = k.lease(&ctx, r, 10);
             }
@@ -84,6 +118,7 @@ fn human_path_property<K: KernelTestHooks>(k: &mut K, ops: &[Op]) -> Result<(), 
         principal: Principal::Human {
             device_id: "phone-1".into(),
         },
+        now_ms: 1_000,
         ..m.clone()
     };
     prop_assert!(k.stop(&h, "business:acme").is_ok());
@@ -92,10 +127,27 @@ fn human_path_property<K: KernelTestHooks>(k: &mut K, ops: &[Op]) -> Result<(), 
         k.run_automation(&m, "acme", "m"),
         Err(KernelError::Stopped(_))
     ));
+    // …and one valid human approval per run is accepted: minted by the
+    // kernel, signed by the enrolled key, presented on the human's channel —
+    // exactly once, because the challenge is spent by the approval.
+    let challenge = k.mint_challenge(&h, "subject", "sha256:h", 60_000);
+    let approval = signed(&key, challenge);
+    prop_assert!(
+        k.approve(&h, approval.clone()).is_ok(),
+        "the human path accepts"
+    );
+    let recorded = k.approvals_for("sha256:h");
+    prop_assert_eq!(recorded.len(), 1);
+    prop_assert_eq!(recorded[0].kind, ApprovalKind::Human);
+    prop_assert!(
+        matches!(k.approve(&h, approval), Err(KernelError::I1(_))),
+        "a spent challenge is not answered twice"
+    );
     Ok(())
 }
 
 fn real(dir: &std::path::Path) -> vk_kernel::RealKernel {
+    vk_contracts::testing::guard_state_dir(dir);
     vk_kernel::RealKernel::open(
         dir,
         vk_store::keys::KeySource::File(dir.join("master.key")),

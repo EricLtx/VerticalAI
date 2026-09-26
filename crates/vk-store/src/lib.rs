@@ -482,6 +482,7 @@ mod tests {
     use vk_contracts::ledger::{ClockQuality, Hlc, RetentionClass};
 
     fn open(dir: &std::path::Path) -> Store {
+        vk_contracts::testing::guard_state_dir(dir);
         Store::open(dir, keys::KeySource::File(dir.join("master.key"))).unwrap()
     }
 

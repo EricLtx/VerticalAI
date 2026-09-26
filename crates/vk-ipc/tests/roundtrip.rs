@@ -236,6 +236,7 @@ async fn shutdown(
 }
 
 fn kernel(dir: &std::path::Path) -> Arc<Mutex<vk_kernel::RealKernel>> {
+    vk_contracts::testing::guard_state_dir(dir);
     Arc::new(Mutex::new(
         vk_kernel::RealKernel::open(
             dir,
@@ -281,7 +282,8 @@ async fn cli_principal_cannot_stop_but_presence_proof_can() {
         use vk_contracts::testing::KernelTestHooks;
         assert!(k.lock().unwrap().stops().stopped("node"));
     }
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 #[tokio::test]
@@ -344,7 +346,8 @@ async fn ns_and_task_flow_over_ipc() {
         c.call("ledger.verify", json!({}), None).await.unwrap()["ok"],
         true
     );
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 #[tokio::test]
@@ -435,7 +438,8 @@ async fn a_presence_nonce_is_single_use_and_expires() {
         .await
         .unwrap();
     assert!(!stopped());
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 #[tokio::test]
@@ -522,7 +526,8 @@ async fn device_enroll_node_only_enrols_this_nodes_own_device() {
             .code,
         vk_ipc::E_BAD_PARAMS
     );
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 #[tokio::test]
@@ -581,7 +586,8 @@ async fn garbage_lines_get_a_parse_error_and_the_connection_survives() {
         c.call("boot.info", json!({}), None).await.unwrap()["node_id"],
         "n1"
     );
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 /// The JSON-RPC code the server answered with.
@@ -759,7 +765,8 @@ async fn approve_over_ipc_requires_presence_and_a_matching_human_approval() {
     assert_eq!(ok["ok"], true);
     let done = step().await.unwrap();
     assert_eq!(done["status"], "done", "{done}");
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 /// A client cannot read a register, so the subject of an approval is something
@@ -856,7 +863,8 @@ async fn task_subject_is_what_the_approve_step_accepts() {
         .unwrap();
     assert_eq!(ok["ok"], true);
     assert_eq!(step().await.unwrap()["status"], "done");
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 #[tokio::test]
@@ -921,7 +929,8 @@ async fn a_presence_proof_on_a_method_that_takes_none_is_refused_and_still_spent
         .await
         .unwrap();
     assert!(stopped());
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 /// Ruling 13: mounting an arch that is already mounted answers with the same
@@ -960,7 +969,8 @@ async fn mounting_the_same_arch_twice_is_idempotent_and_says_so() {
         .filter(|e| e["kind"] == "arch.mounted")
         .count();
     assert_eq!(mounted, 1, "an idempotent re-mount appends nothing");
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 /// An arch is either usable or it is not, and every list of them says which
@@ -1015,7 +1025,8 @@ async fn arch_ls_says_whether_each_arch_is_ready() {
     let info = c.call("boot.info", json!({}), None).await.unwrap();
     assert_eq!(info["arch_states"][0]["arch_id"], json!(arch), "{info}");
     assert_eq!(info["arch_states"][0]["state"], "ready", "{info}");
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 /// Ruling 20: the harness binary, model and budget are the daemon's
@@ -1060,7 +1071,8 @@ async fn harness_run_refuses_a_request_that_names_the_binary_model_timeout_or_an
     // Nothing was created or leased on the way.
     let tasks = c.call("task.ls", json!({}), None).await.unwrap();
     assert!(tasks.as_array().unwrap().is_empty(), "{tasks}");
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 /// A machine principal at the local endpoint's clearance, for a test that
@@ -1249,7 +1261,8 @@ async fn approve_accepts_only_a_challenge_the_kernel_minted_and_only_once() {
         assert_eq!(kk.approvals_for(&subject).len(), 1);
     }
     assert_eq!(step().await.unwrap()["status"], "done");
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 /// The pages' side of `web.link`, as a test sees it: links that name what
@@ -1374,7 +1387,11 @@ async fn web_link_enroll_requires_a_presence_proof() {
         .unwrap();
     assert_eq!(ok["url"], format!("http://localhost:1/approve/{id}?t=stub"));
     assert!(ok["subject_hash"].as_str().unwrap().starts_with("sha256:"));
+    // Drain this server and its client before the next, so no connection task
+    // is left holding the kernel when the second one starts (Task 10 group F).
+    drop(c);
     server.abort();
+    let _ = server.await;
 
     // A daemon without pages: `web.link` says so, whatever the proof.
     let endpoint = vk_ipc::transport::test_endpoint();
@@ -1388,7 +1405,8 @@ async fn web_link_enroll_requires_a_presence_proof() {
         .unwrap_err();
     assert_eq!(code_of(&err), vk_ipc::E_STORE, "{err}");
     assert!(err.to_string().contains("--web-port"), "{err}");
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 // --------------------------------------------------- the API arches (Task 2b)
@@ -1399,6 +1417,7 @@ fn kernel_with_arches(
     dir: &std::path::Path,
     keys: &vk_arch_anthropic::KeySource,
 ) -> vk_kernel::RealKernel {
+    vk_contracts::testing::guard_state_dir(dir);
     vk_kernel::RealKernel::open_with_factory(
         dir,
         vk_store::keys::KeySource::File(dir.join("m.key")),
@@ -1603,7 +1622,8 @@ async fn a_cloud_mount_may_not_name_the_endpoint_its_key_is_sent_to() {
         0,
         "nothing was mounted by any of them"
     );
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 /// No key, no arch — and the refusal is the one sentence that fixes it.
@@ -1642,7 +1662,8 @@ async fn mounting_an_anthropic_arch_without_a_key_says_how_to_set_one() {
     );
     let info = c.call("boot.info", json!({}), None).await.unwrap();
     assert_eq!(info["arches"], 0, "nothing was mounted on the way past");
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 /// A daemon built without the AWS SDK refuses `bedrock` by name and says how
@@ -1671,7 +1692,8 @@ async fn a_build_without_the_aws_sdk_refuses_a_bedrock_mount_by_name() {
     let text = err.to_string();
     assert!(text.contains("bedrock` cargo feature"), "{text}");
     assert!(text.contains("--features bedrock"), "{text}");
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 /// The same door with the SDK built in: the region is checked before the
@@ -1697,7 +1719,8 @@ async fn a_bedrock_mount_is_refused_for_a_region_outside_the_union() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("not an EU region"), "{err}");
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }
 
 /// A **forged** proof must be refused before the daemon touches a secret.
@@ -1759,5 +1782,6 @@ async fn a_forged_presence_proof_is_refused_before_the_keyring_is_touched() {
         c.call("boot.info", json!({}), None).await.unwrap()["arches"],
         0
     );
-    server.abort();
+    drop(c);
+    shutdown(server, k, d).await;
 }

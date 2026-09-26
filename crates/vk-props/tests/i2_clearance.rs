@@ -103,6 +103,7 @@ fn clearance_property<K: KernelTestHooks>(
 }
 
 fn real(dir: &std::path::Path) -> vk_kernel::RealKernel {
+    vk_contracts::testing::guard_state_dir(dir);
     vk_kernel::RealKernel::open(
         dir,
         vk_store::keys::KeySource::File(dir.join("master.key")),

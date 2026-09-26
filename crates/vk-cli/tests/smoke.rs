@@ -18,9 +18,30 @@ struct Daemon(Child);
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        kill_tree(self.0.id());
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+/// Kill a daemon and everything it spawned. `Child::kill` reaches only the
+/// daemon itself; an infer's `cmd.exe` or a harness's `vk-mcp` is a
+/// grandchild, and an orphaned one keeps a handle to the state directory that
+/// would outlive the test's `TempDir` (Task 10 group F). On Windows
+/// `taskkill /T` walks the tree; on Unix the daemon's own children are reaped
+/// as it dies (the harness runs under a Job Object that closes with it), so
+/// the direct kill is enough.
+fn kill_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    let _ = pid;
 }
 
 fn vk_exe() -> PathBuf {
@@ -144,6 +165,28 @@ fn serving(sh: &Shell) -> Option<Value> {
         .then(|| serde_json::from_slice(&o.stdout).expect("status JSON"))
 }
 
+/// Whether a process with this id is still running.
+fn process_alive(pid: u64) -> bool {
+    #[cfg(windows)]
+    {
+        // `tasklist` filtered to the pid prints the image line only when it is
+        // still there; otherwise "No tasks are running…".
+        let out = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output();
+        match out {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // SAFETY: `kill(pid, 0)` sends no signal and only asks whether the
+        // process exists and is signallable.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+}
+
 /// A daemon this test knows only by pid — which is all `vk boot --json` gives
 /// a caller, and so exactly what it must be enough to stop it with.
 struct Detached(u64);
@@ -151,9 +194,11 @@ struct Detached(u64);
 impl Detached {
     fn kill(&self) {
         let pid = self.0.to_string();
+        // Tree-kill (Task 10 group F): a detached `vk boot` daemon may have
+        // spawned children of its own, and an orphan keeps the state dir open.
         let mut cmd = if cfg!(windows) {
             let mut c = Command::new("taskkill");
-            c.args(["/F", "/PID", &pid]);
+            c.args(["/F", "/T", "/PID", &pid]);
             c
         } else {
             let mut c = Command::new("kill");
@@ -161,6 +206,12 @@ impl Detached {
             c
         };
         let _ = cmd.stdout(Stdio::null()).stderr(Stdio::null()).status();
+        // Wait for it to be gone, so its handles are released before the
+        // TempDir is removed.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && process_alive(self.0) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -173,6 +224,7 @@ impl Drop for Detached {
 #[test]
 fn the_vk_shell_drives_a_task_from_mount_to_release() {
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let node_key = dir.path().join("node.key");
     let mut daemon = Daemon(
@@ -289,6 +341,7 @@ fn the_vk_shell_drives_a_task_from_mount_to_release() {
 #[test]
 fn vk_arch_show_umount_and_fsck_cover_the_arches_and_the_store() {
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let node_key = dir.path().join("node.key");
     let _daemon = Daemon(
@@ -395,6 +448,7 @@ fn vk_arch_show_umount_and_fsck_cover_the_arches_and_the_store() {
 #[test]
 fn vk_fsck_reports_a_cut_record_and_the_typed_rebase_is_the_way_back() {
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let sh = Shell {
         endpoint: endpoint.clone(),
@@ -561,6 +615,7 @@ fn vk_fsck_reports_a_cut_record_and_the_typed_rebase_is_the_way_back() {
 #[test]
 fn vk_fsck_refuses_a_record_whose_head_row_was_deleted() {
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let sh = Shell {
         endpoint: endpoint.clone(),
@@ -665,6 +720,7 @@ fn vk_fsck_refuses_a_record_whose_head_row_was_deleted() {
 #[test]
 fn vk_fsck_finds_a_tampered_blob_and_exits_non_zero() {
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let sh = Shell {
         endpoint: endpoint.clone(),
@@ -801,6 +857,7 @@ fn fake_claude(dir: &std::path::Path) -> PathBuf {
 #[test]
 fn vk_mounts_two_claude_code_arches_and_a_task_runs_through_one() {
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let node_key = dir.path().join("node.key");
     let _daemon = Daemon(
@@ -1077,6 +1134,7 @@ fn ollama_request_path(stream: &std::net::TcpStream) -> Option<String> {
 #[test]
 fn vk_mounts_an_external_ollama_as_ungoverned_and_a_task_runs_through_it() {
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let node_key = dir.path().join("node.key");
     let _daemon = Daemon(
@@ -1206,6 +1264,7 @@ fn vk_boot_detaches_a_daemon_it_can_be_asked_to_stop_and_will_not_serve_two_stat
     // `cargo test -p vk-cli`.
     let vkd = vkd_exe();
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let other = tempfile::tempdir().unwrap();
     let node_key = dir.path().join("node.key");
     let sh = Shell {
@@ -1334,6 +1393,7 @@ fn harness_standin(dir: &std::path::Path) -> PathBuf {
 #[test]
 fn vk_harness_run_dry_run_prints_the_launch_line_the_fence_and_a_redacted_mcp_config() {
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let node_key = dir.path().join("node.key");
     let standin = path_of(&harness_standin(dir.path()));
@@ -1447,6 +1507,7 @@ fn vk_harness_run_dry_run_prints_the_launch_line_the_fence_and_a_redacted_mcp_co
 #[test]
 fn vk_harness_run_drives_a_stand_in_to_an_attached_proposal() {
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let node_key = dir.path().join("node.key");
     let standin = path_of(&harness_standin(dir.path()));
@@ -1535,6 +1596,7 @@ fn vk_harness_run_drives_a_stand_in_to_an_attached_proposal() {
 #[test]
 fn vk_task_submit_builds_judge_and_harness_steps() {
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let node_key = dir.path().join("node.key");
     let _daemon = Daemon(
@@ -1726,6 +1788,7 @@ fn ledger_lines(state_dir: &std::path::Path) -> usize {
 /// forced start that still serves on it, are the same for every kind.
 fn vkd_refuses_to_serve_a_damaged_ledger_unless_forced(damage: fn(&std::path::Path)) {
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let sh = Shell {
         endpoint: endpoint.clone(),
@@ -1814,6 +1877,7 @@ fn vkd_refuses_to_serve_a_ledger_whose_tail_was_cut_unless_forced() {
 #[test]
 fn a_second_vkd_over_a_served_state_dir_is_refused_and_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let first = Shell {
         endpoint: vk_ipc::transport::test_endpoint().0,
         node_key: dir.path().join("node.key"),
@@ -1926,6 +1990,7 @@ fn vk_boot_reports_the_daemons_refusal_and_serves_only_when_forced() {
     // build has to happen before the first boot rather than under it.
     assert!(vkd_exe().exists());
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let node_key = dir.path().join("node.key");
     let sh = Shell {
         endpoint: vk_ipc::transport::test_endpoint().0,
@@ -2043,6 +2108,7 @@ fn vk_man_reads_the_contracts_without_a_daemon() {
 #[test]
 fn a_real_arch_is_re_created_when_the_daemon_restarts_and_is_never_a_mock() {
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let sh = Shell {
         endpoint: endpoint.clone(),
@@ -2148,6 +2214,7 @@ fn a_real_arch_is_re_created_when_the_daemon_restarts_and_is_never_a_mock() {
 #[test]
 fn an_arch_whose_engine_has_gone_comes_back_unavailable_and_refuses_to_run() {
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let sh = Shell {
         endpoint: endpoint.clone(),
@@ -2316,6 +2383,7 @@ fn a_node_with_slow_arches_serves_while_they_start_and_vk_boot_does_not_kill_it(
     let vkd = vkd_exe();
     assert!(vkd.exists());
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let sh = Shell {
         endpoint: endpoint.clone(),
@@ -2491,6 +2559,7 @@ fn http_get(port: u16, path_and_query: &str) -> (u16, String) {
 #[test]
 fn vk_passkey_verbs_print_links_that_open_the_pages_and_approve_waits() {
     let dir = tempfile::tempdir().unwrap();
+    vk_contracts::testing::guard_state_dir(dir.path());
     let endpoint = vk_ipc::transport::test_endpoint().0;
     let node_key = dir.path().join("node.key");
     let _daemon = Daemon(

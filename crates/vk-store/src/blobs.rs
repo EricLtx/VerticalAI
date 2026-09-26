@@ -390,6 +390,7 @@ mod tests {
 
     fn store() -> (tempfile::TempDir, BlobStore) {
         let d = tempfile::tempdir().unwrap();
+        vk_contracts::testing::guard_state_dir(d.path());
         let master =
             MasterKey::load_or_create(KeySource::File(d.path().join("master.key"))).unwrap();
         let s = BlobStore::open(&d.path().join("blobs"), master).unwrap();

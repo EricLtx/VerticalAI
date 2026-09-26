@@ -1440,6 +1440,7 @@ mod tests {
     use vk_contracts::testing::KernelTestHooks;
 
     fn open(dir: &std::path::Path) -> RealKernel {
+        vk_contracts::testing::guard_state_dir(dir);
         RealKernel::open(
             dir,
             vk_store::keys::KeySource::File(dir.join("m.key")),

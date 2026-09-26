@@ -72,8 +72,10 @@ pub struct Args {
     #[arg(long, default_value_t = 300)]
     pub harness_timeout_secs: u64,
     /// Loopback port for the passkey pages (`vk passkey enroll`, `vk approve
-    /// --passkey`): `127.0.0.1:<port>`, never a routable address. `0` asks the
-    /// OS for a port, for tests; `vk status` says which one was taken.
+    /// --passkey`): bound on `127.0.0.1:<port>` **and** `[::1]:<port>` — both
+    /// loopback families, never a routable address — and refused if either
+    /// is taken. `0` asks the OS for a port, for tests; `vk status` says
+    /// which one was taken.
     #[arg(long, default_value_t = vk_web::DEFAULT_PORT)]
     pub web_port: u16,
     /// Run as the Windows service account (SP1b Task 6): the state directory
