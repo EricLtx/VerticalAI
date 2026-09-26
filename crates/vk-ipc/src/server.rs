@@ -496,7 +496,7 @@ fn dispatch(
     // happens next: it leaves the map here, before anything is dispatched, so
     // a proof sent to a method that would ignore it cannot be shown again to
     // one that would not.
-    let presence = match req.presence {
+    let mut presence = match req.presence {
         None => None,
         Some(proof) => {
             let nonce = lock(challenges)?.spend(&proof.nonce, now);
@@ -514,21 +514,33 @@ fn dispatch(
     // **Mounting a cloud arch is a human act** (fix round 1, Critical 1).
     // It authorises this node's registers to leave the machine for a third
     // party, which is exactly what I2's third-party rule is about, and it is
-    // durable: the mount spec is replayed at every boot. So it needs the same
-    // presence proof `stop`, `resume` and `approve` need — refused here,
-    // before the keyring is read or an AWS credential chain is walked, so a
-    // caller with no proof cannot even make the daemon reach for a secret.
-    // The proof is *verified* below, under the lock, by `ctx_for`; this is
-    // only the cheap half.
-    if req.method == "arch.mount"
+    // durable: the mount spec is replayed at every boot.
+    //
+    // Fully **verified here**, signature and nonce, not merely "a proof was
+    // attached" (fix round 2, Minor C): everything below this point reads a
+    // keyring, walks an AWS credential chain or executes `claude --version`,
+    // and a forged proof must not be able to make the daemon do any of those.
+    // The lock is taken for the verification alone and released again, because
+    // the slow work must not hold it; the `Ctx` it produces is what the mount
+    // arm uses, so the proof is verified exactly once and the nonce — already
+    // spent above — cannot be shown again.
+    let cloud_ctx = if req.method == "arch.mount"
         && is_cloud_kind(req.params["kind"].as_str().unwrap_or_default())
-        && presence.is_none()
     {
-        return Err(invariant(
-            "I1: mounting a cloud arch sends this node's registers to a third party, \
-             which is a human act; re-run it with a presence proof",
-        ));
-    }
+        let ctx = {
+            let k = lock(kernel)?;
+            ctx_for(&k, presence.take(), now)?
+        };
+        if !matches!(ctx.principal, Principal::Human { .. }) {
+            return Err(invariant(
+                "I1: mounting a cloud arch sends this node's registers to a third party, \
+                 which is a human act; re-run it with a presence proof",
+            ));
+        }
+        Some(ctx)
+    } else {
+        None
+    };
     // Mounting a Claude Code arch means running the binary to ask its version,
     // because the version is in the arch identity. That happens here, *before*
     // the kernel lock, so a binary that is slow — or missing, and about to be
@@ -701,9 +713,12 @@ fn dispatch(
         // that mounts a new kind needs no new verb (SP1b ruling 4).
         "arch.mount" => {
             let kind = p["kind"].as_str().ok_or_else(|| bad("kind"))?;
-            // Who is asking. Human only for a request carrying a proof this
-            // server issued the nonce for and an enrolled device signed.
-            let ctx = ctx_for(&k, presence, now)?;
+            // Who is asking. For a cloud kind this was settled above, before
+            // any secret was touched; for a local one it is settled here.
+            let ctx = match cloud_ctx {
+                Some(ctx) => ctx,
+                None => ctx_for(&k, presence, now)?,
+            };
             // Recorded before anything is mounted, so a config this node could
             // not make a spec out of — one carrying a credential — is refused
             // rather than mounted into an arch no boot can bring back.

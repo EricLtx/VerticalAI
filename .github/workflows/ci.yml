@@ -20,11 +20,14 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       # The other half of the `bedrock` feature gate. The default build has no
-      # AWS SDK in it (Ruling 30), so `cargo test --workspace` above already
-      # exercises the refusal; this checks that the half *with* the SDK still
-      # compiles, which nothing else in CI would notice breaking.
-      - name: The EU arch's transport still builds
-        run: cargo check -p vkd -p vk-arch-anthropic --features bedrock --all-targets
+      # AWS SDK in it (Ruling 30), so `cargo test --workspace` above exercises
+      # the refusal; this one *runs* the tests the feature turns on — the EU
+      # mount path included — rather than only compiling them, so neither half
+      # of the gate can rot unnoticed.
+      - name: The EU arch's transport builds and its mount path runs
+        run: cargo test -p vk-ipc -p vk-arch-anthropic --features vk-ipc/bedrock
+      - name: And the daemon with it
+        run: cargo check -p vkd --features bedrock --all-targets
       # And that the crates stay buildable with every optional feature off,
       # which is what a node that wants none of the AWS supply chain builds.
       - name: The build without any optional feature

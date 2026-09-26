@@ -62,10 +62,16 @@ whose manifest says `locality: cloud` — `anthropic`, `bedrock` and
 `approve` require, and is refused from a bare machine principal. The reason
 is I2's third-party rule: a cloud mount authorises this node's registers to
 leave the machine, and it does so durably, because the mount spec is replayed
-at every boot. The refusal happens twice, on purpose: once on the kind, before
-this daemon reads its keyring or walks an AWS credential chain for a caller
-who has shown no presence, and once on the built adapter's own manifest, so a
+at every boot. The refusal happens twice, on purpose: once on the kind — with the
+proof fully verified, signature and nonce, *before* this daemon reads its
+keyring, walks an AWS credential chain or runs `claude --version` for a caller
+who may have forged it — and once on the built adapter's own manifest, so a
 future cloud kind nobody added to the list is caught rather than admitted.
+**The boot replay takes no proof and is not meant to:** re-creating a
+persisted arch goes through `adapter_factory`, which the kernel calls
+directly and which never enters the RPC dispatch at all. The human authorises
+the mount once and the authorisation is durable because the spec is; an
+unattended restart is not a second authorisation and has nobody to ask.
 
 **Where the key is sent is the daemon's to decide, not a caller's.** The
 first-party origin is fixed at `https://api.anthropic.com`; the mount config

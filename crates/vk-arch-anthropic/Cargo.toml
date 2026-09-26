@@ -38,6 +38,9 @@ keyring.workspace = true
 # The key is wiped when the adapter is dropped. A loop that writes zeroes can
 # be optimised away; this one cannot.
 zeroize = "1"
+# The origin is parsed by the same crate `reqwest` parses it with, so the check
+# and the client can never disagree about where a URL points (fix round 2).
+url = "2"
 
 # The EU half. Optional, and nothing else in the crate depends on it.
 aws-config = { version = "1", optional = true }

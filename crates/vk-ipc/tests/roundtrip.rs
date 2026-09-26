@@ -1487,3 +1487,65 @@ async fn a_bedrock_mount_is_refused_for_a_region_outside_the_union() {
     assert!(err.to_string().contains("not an EU region"), "{err}");
     server.abort();
 }
+
+/// A **forged** proof must be refused before the daemon touches a secret.
+///
+/// The cheap "is a proof attached?" gate is not enough: a caller who sends a
+/// junk nonce and 64 bytes of junk signature would pass it, and on Linux the
+/// keyring read that follows is a D-Bus round trip that can raise an unlock
+/// prompt (fix round 2, Minor C). So the proof is verified in full — signature
+/// and nonce — before `load_key` runs.
+///
+/// The ordering is *observable* here rather than asserted by reading the code:
+/// the daemon's key source is a file that does not exist, so if the key were
+/// loaded first the refusal would name `vk secret set anthropic`. It names
+/// `I1` instead, which it can only do if nothing reached for the key.
+#[tokio::test]
+async fn a_forged_presence_proof_is_refused_before_the_keyring_is_touched() {
+    let d = tempfile::tempdir().unwrap();
+    let keys = vk_arch_anthropic::KeySource::File(d.path().join("not-there.key"));
+    let k = Arc::new(Mutex::new(kernel_with_arches(d.path(), &keys)));
+    let _enrolled = with_device(&k);
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let listener = vk_ipc::transport::os::bind(&endpoint).await.unwrap();
+    let config = vk_ipc::server::ServerConfig {
+        anthropic_keys: keys,
+        ..vk_ipc::server::ServerConfig::new(endpoint.0.clone())
+    };
+    let server = tokio::spawn(vk_ipc::server::serve_on(k.clone(), listener, config));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    // A key nobody enrolled, over a nonce this server did issue: the
+    // signature verifies against the wrong device, so I1 refuses it.
+    let rogue = SoftwareHumanKey::generate("laptop");
+    let nonce = c.call("presence.challenge", json!({}), None).await.unwrap()["nonce"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for proof in [
+        PresenceProof::sign(&rogue, &nonce),
+        // And a nonce this server never issued, signed by the rogue too.
+        PresenceProof::sign(&rogue, "never-issued"),
+    ] {
+        let err = c
+            .call(
+                "arch.mount",
+                json!({"kind": "anthropic", "config": {"model": "claude-sonnet-5"}}),
+                Some(proof),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+        assert!(err.to_string().contains("I1"), "{err}");
+        assert!(
+            !err.to_string().contains("vk secret set"),
+            "the key was read before the proof was checked: {err}"
+        );
+    }
+    assert_eq!(
+        c.call("boot.info", json!({}), None).await.unwrap()["arches"],
+        0
+    );
+    server.abort();
+}

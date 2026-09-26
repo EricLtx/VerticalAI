@@ -131,8 +131,12 @@ to leave the machine for a third party — and durably, because the mount is
 replayed at every restart — so `vk mount anthropic`, `vk mount bedrock` and
 `vk mount claude-code` carry a presence proof signed by this node's device
 key, exactly as `vk stop` and `vk approve` do, and the daemon refuses them
-from a bare connection with `I1`. `vk mount ollama` and `vk mount mock` are
-unchanged: nothing leaves the machine.
+from a bare connection with `I1` — with the proof verified before it reads a
+keyring or walks a credential chain, so a forged one buys nothing.
+`vk mount ollama` and `vk mount mock` are unchanged: nothing leaves the
+machine. A **restart** asks nobody: the mount is written down and re-created
+from the record, so the human authorises it once and that authorisation is as
+durable as the arch.
 
 **Where the calls go is not the caller's to say.** The first-party origin is
 `https://api.anthropic.com`, fixed in the daemon; a mount config naming

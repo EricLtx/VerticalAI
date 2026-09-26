@@ -15,9 +15,6 @@ fn text(v: &Value) -> String {
     }
 }
 
-/// A counter whose zero means "nothing was measured", shown as a dash rather
-/// than as a number a reader could take for a measurement that came out at
-/// zero. A missing or non-numeric field reads the same way.
 /// An arch's price per thousand prompt tokens, as its manifest states it.
 ///
 /// Three outcomes and three glyphs, because they are three different things:
@@ -32,6 +29,9 @@ fn price(v: &Value) -> String {
     }
 }
 
+/// A counter whose zero means "nothing was measured", shown as a dash rather
+/// than as a number a reader could take for a measurement that came out at
+/// zero. A missing or non-numeric field reads the same way.
 fn zeroless(v: &Value, render: impl Fn(f64) -> String) -> String {
     match v.as_f64() {
         Some(n) if n != 0.0 => render(n),
@@ -714,6 +714,58 @@ pub fn harness_run(v: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The three states of an arch's price, and the three glyphs that must
+    /// stay distinct (Ruling 30). A `?` printed as `0` would tell an operator
+    /// that an arch whose price this node does not know is free, which is the
+    /// Bedrock case and is the whole reason the field is an `Option`.
+    #[test]
+    fn a_price_is_a_number_a_dash_for_free_or_a_question_mark_for_unknown() {
+        // No price list for this arch: the manifest said `None`.
+        assert_eq!(price(&Value::Null), "?");
+        // Nothing is billed: a local model, or a subscription.
+        assert_eq!(price(&json!(0.0)), "-");
+        // A price, to four places, because these are thousandths of a euro.
+        assert_eq!(price(&json!(0.0046)), "0.0046");
+        assert_eq!(price(&json!(0.01)), "0.0100");
+        // An arch with counters but no entry at all reads as unknown rather
+        // than as free: `v["price_eur_per_1k"][id]` on a missing key is Null.
+        assert_eq!(price(&json!({})["nope"]), "?");
+    }
+
+    /// And the column the operator actually reads carries them.
+    #[test]
+    fn vk_top_shows_the_manifests_price_beside_what_the_calls_cost() {
+        let rendered = top(&json!({
+            "arches": {
+                "sha256:eu": {"calls": 0, "tokens_in": 0, "tokens_in_measured": 0,
+                               "cost_list_usd": 0.0, "projected": 0},
+                "sha256:us": {"calls": 2, "tokens_in": 100, "tokens_in_measured": 100,
+                               "cost_list_usd": 0.5, "projected": 0},
+            },
+            "states": {"sha256:eu": "ready", "sha256:us": "ready"},
+            "governed": {"sha256:eu": false, "sha256:us": false},
+            // The EU arch is priced by AWS out of a list this node has not
+            // read; the US one is in the table.
+            "price_eur_per_1k": {"sha256:eu": null, "sha256:us": 0.0046},
+            "tasks": {}, "stopped_scopes": [], "liveness": {},
+        }));
+        let eu = rendered
+            .lines()
+            .find(|l| l.starts_with("sha256:eu"))
+            .expect("a row for the EU arch");
+        assert!(
+            eu.contains(" ? "),
+            "the unknown price must read `?`: {eu:?}"
+        );
+        assert!(!eu.contains(" 0.0000 "), "and never as free: {eu:?}");
+        let us = rendered
+            .lines()
+            .find(|l| l.starts_with("sha256:us"))
+            .expect("a row for the US arch");
+        assert!(us.contains("0.0046"), "{us:?}");
+        assert!(rendered.contains("EUR/1K"), "{rendered}");
+    }
 
     #[test]
     fn columns_are_as_wide_as_their_widest_cell_and_lines_do_not_trail() {

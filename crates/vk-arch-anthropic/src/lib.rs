@@ -653,38 +653,41 @@ fn answer_tokens(cfg: &AnthropicConfig, max_tokens: u32) -> u32 {
 
 /// Is this an origin this node will send its API key to?
 ///
-/// `https://` anywhere, or `http://` on this machine's own loopback — which
-/// is the test stand-in and nothing else. Plaintext to another host would put
-/// the key on the wire in the clear, and there is no configuration worth
-/// having that wants it (fix round 1, Critical 1).
-pub fn check_base_url(url: &str) -> Result<()> {
-    let rest = match url.split_once("://") {
-        Some(("https", rest)) => {
-            anyhow::ensure!(!rest.is_empty(), "{url} has no host in it");
-            return Ok(());
+/// `https://` anywhere, or `http://` to a loopback **address** — which is the
+/// test stand-in and nothing else. Plaintext to another host would put the key
+/// on the wire in the clear, and there is no configuration worth having that
+/// wants it (fix round 1, Critical 1). An address and not `localhost`: a name
+/// resolves to whatever `hosts` says today (fix round 2, Minor A).
+pub fn check_base_url(raw: &str) -> Result<()> {
+    // Parsed by the same crate `reqwest` parses it with, rather than scanned
+    // by hand. WHATWG ends the authority of a special scheme at a backslash
+    // as well as at `/`, `?` and `#`, so a hand-rolled scan reads
+    // `http://evil.example\@127.0.0.1` as loopback while the client posts to
+    // `evil.example` (fix round 2, Minor A). One parser, one answer.
+    let url = url::Url::parse(raw).with_context(|| format!("{raw} is not a URL"))?;
+    match url.scheme() {
+        "https" => {
+            anyhow::ensure!(url.host().is_some(), "{raw} has no host in it");
+            Ok(())
         }
-        Some(("http", rest)) => rest,
-        _ => bail!("{url} is not an https:// URL"),
-    };
-    // The authority, without any userinfo, path, query or fragment after it.
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    // A bracketed IPv6 literal keeps its colons; anything else loses its port.
-    let host = match authority.strip_prefix('[') {
-        Some(v6) => v6.split_once(']').map_or(v6, |(h, _)| h),
-        None => authority.split(':').next().unwrap_or_default(),
-    };
-    // Parsed as an address rather than matched as a prefix: `127.example.com`
-    // starts with `127.` and is somebody else's machine.
-    let loopback = host == "localhost"
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback());
-    anyhow::ensure!(
-        loopback,
-        "{url} is plaintext http:// to {host}: this node will not put an API key on the          wire in the clear to anywhere but its own loopback"
-    );
-    Ok(())
+        // Plaintext only to an address on this machine — and an *address*:
+        // `localhost` is a name, and a name is whatever `hosts` says it is
+        // today, which is not something to put an API key on.
+        "http" => {
+            let loopback = match url.host() {
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                _ => false,
+            };
+            anyhow::ensure!(
+                loopback,
+                "{raw} is plaintext http:// to {}: this node will not put an API key on the wire in the clear to anywhere but a loopback address",
+                url.host_str().unwrap_or("nowhere")
+            );
+            Ok(())
+        }
+        other => bail!("{raw} is {other}://, not https://"),
+    }
 }
 
 /// The blocking client every call goes through.
@@ -930,7 +933,7 @@ mod tests {
             "https://api.anthropic.com",
             "https://gateway.example.com/v1",
             "http://127.0.0.1:8080",
-            "http://localhost:3000/base",
+            "http://127.0.0.2:9999/base",
             "http://[::1]:9000",
         ] {
             assert!(check_base_url(good).is_ok(), "{good}");
@@ -938,7 +941,14 @@ mod tests {
         for bad in [
             "http://collector.example",
             "http://10.0.0.5:80",
+            // Starts with `127.` and is somebody else's machine.
             "http://127.example.com",
+            // A name, not an address: `hosts` decides where it goes.
+            "http://localhost:3000/base",
+            // WHATWG ends the authority at the backslash, so the host is
+            // `evil.example` and the rest is a path. A scan that took
+            // everything after the last `@` read this as loopback.
+            r"http://evil.example\@127.0.0.1",
             "ftp://api.anthropic.com",
             "api.anthropic.com",
         ] {

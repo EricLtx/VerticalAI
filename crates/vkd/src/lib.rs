@@ -317,7 +317,17 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
             // A key in a file is a key anyone who can read the file has. The
             // store's master key file is held to the same rule, and for the
             // same reason (fix round 1, Ruling 30).
-            vk_store::keys::check_private_file(p).context("--anthropic-key-file")?;
+            // The same owner set the state directory is audited against
+            // (`service_dir_owners`), so a key file an administrator put
+            // there for the service account does not stop the service from
+            // starting (fix round 2, Minor B).
+            #[cfg(windows)]
+            let owners = service_dir_owners()?;
+            #[cfg(windows)]
+            let owner_refs: Vec<&str> = owners.iter().map(String::as_str).collect();
+            #[cfg(not(windows))]
+            let owner_refs: Vec<&str> = Vec::new();
+            vk_store::keys::check_private_file(p, &owner_refs).context("--anthropic-key-file")?;
             vk_arch_anthropic::KeySource::File(p.clone())
         }
         None => vk_arch_anthropic::KeySource::Keyring,
