@@ -359,53 +359,59 @@ function Do-Install {
 
     Test-Signatures $sourcePaths
 
-    if (-not (Test-Path -LiteralPath $Root)) {
-        Step "create $Root" { New-Item -ItemType Directory -Path $Root -Force | Out-Null }
-    }
-    foreach ($p in $sourcePaths) {
-        $leaf = Split-Path $p -Leaf
-        $dst = Join-Path $Root $leaf
-        Step "copy $leaf to $Root" { Copy-Item -LiteralPath $p -Destination $dst -Force }
-    }
+    # From here on, a thrown Step (a copy that fails, an elevated
+    # vkd-service install/start that fails) must still leave the operator
+    # with the summary — that recap is what says which parts of the install
+    # actually landed, and it is needed most exactly when something broke.
+    try {
+        if (-not (Test-Path -LiteralPath $Root)) {
+            Step "create $Root" { New-Item -ItemType Directory -Path $Root -Force | Out-Null }
+        }
+        foreach ($p in $sourcePaths) {
+            $leaf = Split-Path $p -Leaf
+            $dst = Join-Path $Root $leaf
+            Step "copy $leaf to $Root" { Copy-Item -LiteralPath $p -Destination $dst -Force }
+        }
 
-    Add-ToPath $Root
+        Add-ToPath $Root
 
-    Test-DockerDesktop
-    Test-ClaudeCode
+        Test-DockerDesktop
+        Test-ClaudeCode
 
-    if ($Service) {
-        Say 'register vkd as a Windows service'
-        if (-not (Test-Elevated)) {
-            Warn 'vkd-service install needs an elevated shell. From an elevated PowerShell:'
-            $extra = @('-Service', '-Root', (Quote-Arg $Root))
-            if ($Source -ne $PSScriptRoot) { $extra += @('-Source', (Quote-Arg $Source)) }
-            Warn ("    " + (Get-ElevatedCommand $extra))
-        } else {
-            $svcBin = Join-Path $Root 'vkd-service.exe'
-            Step 'vkd-service install' {
-                $r = Try-Run $svcBin @('install', '--binary', $svcBin) 30
-                if ($r.Out) { Write-Host $r.Out }
-                if ($r.Code -ne 0) { throw $r.Err }
-            }
-            Step 'vkd-service start' {
-                $r = Try-Run $svcBin @('start') 40
-                if ($r.Out) { Write-Host $r.Out }
-                if ($r.Code -ne 0) { throw $r.Err }
+        if ($Service) {
+            Say 'register vkd as a Windows service'
+            if (-not (Test-Elevated)) {
+                Warn 'vkd-service install needs an elevated shell. From an elevated PowerShell:'
+                $extra = @('-Service', '-Root', (Quote-Arg $Root))
+                if ($Source -ne $PSScriptRoot) { $extra += @('-Source', (Quote-Arg $Source)) }
+                Warn ("    " + (Get-ElevatedCommand $extra))
+            } else {
+                $svcBin = Join-Path $Root 'vkd-service.exe'
+                Step 'vkd-service install' {
+                    $r = Try-Run $svcBin @('install', '--binary', $svcBin) 30
+                    if ($r.Out) { Write-Host $r.Out }
+                    if ($r.Code -ne 0) { throw $r.Err }
+                }
+                Step 'vkd-service start' {
+                    $r = Try-Run $svcBin @('start') 40
+                    if ($r.Out) { Write-Host $r.Out }
+                    if ($r.Code -ne 0) { throw $r.Err }
+                }
             }
         }
+    } finally {
+        $serviceNote = 'not requested (pass -Service, elevated)'
+        if ($Service) { $serviceNote = 'requested' }
+
+        Write-Host ''
+        Write-Host '=== INSTALL SUMMARY ===' -ForegroundColor Green
+        Write-Host "root:      $Root"
+        Write-Host ("binaries:  {0}" -f ($Binaries -join ', '))
+        Write-Host ("path:      {0} ({1} {2})" -f $Root, $PathScope, $PathVarName)
+        Write-Host "service:   $serviceNote"
+        Write-Host 'Open a new shell for the PATH change to take effect.'
+        Write-Host '========================'
     }
-
-    $serviceNote = 'not requested (pass -Service, elevated)'
-    if ($Service) { $serviceNote = 'requested' }
-
-    Write-Host ''
-    Write-Host '=== INSTALL SUMMARY ===' -ForegroundColor Green
-    Write-Host "root:      $Root"
-    Write-Host ("binaries:  {0}" -f ($Binaries -join ', '))
-    Write-Host ("path:      {0} ({1} {2})" -f $Root, $PathScope, $PathVarName)
-    Write-Host "service:   $serviceNote"
-    Write-Host 'Open a new shell for the PATH change to take effect.'
-    Write-Host '========================'
 }
 
 # ------------------------------------------------------------------- Main

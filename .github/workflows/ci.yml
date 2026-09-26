@@ -140,22 +140,33 @@ jobs:
         if: steps.decide.outputs.path == 'ov-cert'
         shell: pwsh
         run: |
-          [IO.File]::WriteAllBytes("$pwd\cert.pfx", [Convert]::FromBase64String($env:SIGNING_CERT_B64))
-          $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
-                      Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
-          if (-not $signtool) { $signtool = 'signtool.exe' }
-          $exes = Get-ChildItem -Path dist -Filter *.exe | ForEach-Object { $_.FullName }
-          $signArgs = @('sign', '/fd', 'SHA256', '/tr', 'http://timestamp.digicert.com', '/td', 'SHA256', '/f', "$pwd\cert.pfx")
-          if ($env:SIGNING_CERT_PASSWORD) { $signArgs += @('/p', $env:SIGNING_CERT_PASSWORD) }
-          $signArgs += $exes
-          & $signtool @signArgs
-          if ($LASTEXITCODE -ne 0) { throw "signtool exited $LASTEXITCODE" }
-          Remove-Item "$pwd\cert.pfx" -Force
+          # $env:RUNNER_TEMP, not the checkout root: it is wiped with the runner
+          # regardless, but a failed sign must not be able to leave the decoded
+          # private key sitting beside the checkout for the rest of the job.
+          $pfx = Join-Path $env:RUNNER_TEMP 'cert.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGNING_CERT_B64))
+          try {
+              $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+                          Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+              if (-not $signtool) { $signtool = 'signtool.exe' }
+              $exes = Get-ChildItem -Path dist -Filter *.exe | ForEach-Object { $_.FullName }
+              $signArgs = @('sign', '/fd', 'SHA256', '/tr', 'http://timestamp.digicert.com', '/td', 'SHA256', '/f', $pfx)
+              if ($env:SIGNING_CERT_PASSWORD) { $signArgs += @('/p', $env:SIGNING_CERT_PASSWORD) }
+              $signArgs += $exes
+              & $signtool @signArgs
+              if ($LASTEXITCODE -ne 0) { throw "signtool exited $LASTEXITCODE" }
+          } finally {
+              # Runs on the success path and on a thrown signtool failure alike
+              # (bad password, expired cert, timestamp-server hiccup) — the PFX
+              # never survives this step either way.
+              Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
+          }
       - name: No signing secrets configured
         if: steps.decide.outputs.path == 'unsigned'
         shell: bash
         run: |
           echo "unsigned: no signing secrets configured"
+          echo "::warning title=unsigned::unsigned: no signing secrets configured"
       - name: Upload signed artifacts
         if: steps.decide.outputs.path != 'unsigned'
         uses: actions/upload-artifact@v4
