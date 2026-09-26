@@ -585,6 +585,69 @@ fn a_launch_naming_another_harness_is_refused() {
 
 /// Ruling 21.4 at boot: no harness survives a restart, so every `harness:*`
 /// lease row and everything under `<state_dir>/harness/` is swept.
+/// A `--keep` workspace holds projected plaintext for the operator to look
+/// at after the run, and "after the run" is a day (Task 10 group C): the
+/// scheduled retention sweep removes it then, and never before; a live run's
+/// workspace and configuration are never touched; a directory no task
+/// accounts for goes at once.
+#[test]
+fn a_kept_workspace_is_swept_a_day_after_its_run_and_a_live_run_is_not() {
+    let d = tempfile::tempdir().unwrap();
+    let mut k = open(d.path());
+    let t = harness_task(&mut k, false);
+    let launch = k
+        .harness_launch(&machine(2), &t.id, "claude-code", 30_000)
+        .unwrap();
+    std::fs::create_dir_all(launch.workspace.join("OUT")).unwrap();
+    std::fs::write(launch.workspace.join("OUT").join("proposal.md"), b"# kept").unwrap();
+    let ended = 1_000_000u64;
+    k.harness_settle(
+        &machine(ended),
+        &t.id,
+        &launch,
+        &run_ending(ExitReason::Exited(0)),
+        true,
+    )
+    .unwrap();
+    let kept = k.harness_workspace_dir(&t.id);
+    assert!(kept.exists(), "--keep leaves the workspace");
+
+    // A second task whose run is live, and a directory nothing accounts for.
+    let live = harness_task(&mut k, false);
+    let live_launch = k
+        .harness_launch(&machine(ended), &live.id, "claude-code", 30_000)
+        .unwrap();
+    let orphan = d.path().join("harness").join("no-such-task");
+    std::fs::create_dir_all(&orphan).unwrap();
+
+    let an_hour_later = ended + 60 * 60 * 1000;
+    let swept = k.sweep_retention(an_hour_later).unwrap();
+    assert_eq!(swept.workspaces, 1, "only the orphan: {swept:?}");
+    assert!(!orphan.exists());
+    assert!(kept.exists(), "a day has not passed");
+    assert!(live_launch.workspace.exists(), "the live run is untouched");
+
+    let a_day_later = ended + vk_kernel::KEPT_WORKSPACE_TTL_MS;
+    let swept = k.sweep_retention(a_day_later).unwrap();
+    assert_eq!(swept.workspaces, 1, "the kept one: {swept:?}");
+    assert!(
+        !kept.exists(),
+        "a kept workspace is swept a day after its run"
+    );
+    assert!(
+        live_launch.workspace.exists(),
+        "the live run is still untouched"
+    );
+    k.harness_settle(
+        &machine(a_day_later),
+        &live.id,
+        &live_launch,
+        &run_ending(ExitReason::Exited(0)),
+        false,
+    )
+    .ok();
+}
+
 #[test]
 fn boot_sweeps_harness_leases_and_workspaces_left_by_a_previous_run() {
     let d = tempfile::tempdir().unwrap();

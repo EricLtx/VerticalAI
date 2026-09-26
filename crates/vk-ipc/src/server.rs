@@ -281,6 +281,36 @@ pub async fn start_arches(kernel: Shared) {
     tracing::info!("every arch has been re-created; `vk ls /arches` says how each one came up");
 }
 
+/// The retention sweep on a schedule (Task 10 group C): every `every`, the
+/// kernel's `sweep_retention` runs under the lock for the length of a delete
+/// and a directory walk. `vkd` spawns this once, after `boot()` — which did
+/// the first sweep — with an hour; a test hands it milliseconds. The first
+/// tick of a tokio interval completes at once and is skipped for that reason.
+pub async fn sweep_retention_every(kernel: Shared, every: Duration) {
+    let mut tick = tokio::time::interval(every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        let k = kernel.clone();
+        let swept = tokio::task::spawn_blocking(move || match k.lock() {
+            Ok(mut k) => k.sweep_retention(now_ms()).map_err(|e| e.to_string()),
+            Err(_) => Err("kernel lock poisoned".to_string()),
+        })
+        .await;
+        match swept {
+            Ok(Ok(s)) if s.usage_rows > 0 || s.workspaces > 0 => tracing::info!(
+                usage_rows = s.usage_rows,
+                workspaces = s.workspaces,
+                "retention sweep"
+            ),
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "the retention sweep failed; next hour"),
+            Err(e) => tracing::error!(error = %e, "the retention sweep task did not run"),
+        }
+    }
+}
+
 async fn handle_connection(
     stream: Box<dyn transport::Stream>,
     kernel: Shared,

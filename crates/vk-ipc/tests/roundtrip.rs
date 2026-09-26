@@ -23,6 +23,57 @@ where
     serde_json::from_str(&line).unwrap()
 }
 
+/// The daemon's scheduled retention sweep (Task 10 group C) runs the
+/// kernel's `sweep_retention` on its interval: a stale usage row is gone
+/// after a tick, with nothing on the pipe having asked for it.
+#[tokio::test]
+async fn the_scheduled_sweep_removes_a_stale_usage_row_on_its_own() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let ts = 1u64;
+    k.lock()
+        .unwrap()
+        .store()
+        .db
+        .put_json(
+            "usage",
+            &format!("{ts:013}-{:012}", 1),
+            &vk_kernel::UsageRow {
+                arch_id: "a".into(),
+                task_id: None,
+                step_index: None,
+                tokens_in: 1,
+                tokens_in_measured: 1,
+                tokens_out: 1,
+                cost_list_usd: None,
+                duration_ms: 1,
+                ts_ms: ts,
+            },
+        )
+        .unwrap();
+    let rows = |k: &Arc<Mutex<vk_kernel::RealKernel>>| {
+        k.lock()
+            .unwrap()
+            .usage(&local_ctx(), &vk_kernel::UsageFilter::All)
+            .unwrap()
+            .len()
+    };
+    assert_eq!(rows(&k), 1);
+    let sweeper = tokio::spawn(vk_ipc::server::sweep_retention_every(
+        k.clone(),
+        std::time::Duration::from_millis(20),
+    ));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while rows(&k) != 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(rows(&k), 0, "the sweep ran on its interval");
+    sweeper.abort();
+    let _ = sweeper.await;
+    drop(k);
+    d.close().unwrap();
+}
+
 fn kernel(dir: &std::path::Path) -> Arc<Mutex<vk_kernel::RealKernel>> {
     Arc::new(Mutex::new(
         vk_kernel::RealKernel::open(

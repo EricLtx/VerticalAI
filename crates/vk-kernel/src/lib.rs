@@ -565,8 +565,33 @@ pub struct FsckRebase {
 const REBASE_PREFIX: &str = "ledger.head.rebase.";
 /// The key of the newest rebase row a `boot` event has already named. A
 /// watermark, because the rows are the record and must not be cleared to
-/// mark them read.
+/// mark them read. It shares the rows' prefix, so `rebase_rows` excludes it
+/// by name.
 const REBASE_REPORTED_THROUGH: &str = "ledger.head.rebase.reported-through";
+
+/// How long a per-call usage row is kept: the ledger's operational class,
+/// `Operational90d`, and no longer (Task 8 deferred minor, Task 10 group
+/// C). A row is metadata about a call — ids, counts, a duration — and the
+/// counters it adds up to (`ArchStats`) are kept for good; the rows behind
+/// them are what `vk top --calls` and `vk task show` read, and ninety days
+/// is as far back as either has any business showing.
+pub const USAGE_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+
+/// How long a `--keep` harness workspace stays after its run: a day. It
+/// holds label-projected plaintext, kept for the operator to look at after
+/// the run, and "after the run" is not a fortnight. Swept by the daemon's
+/// scheduled sweep, and — as before — whole at the next boot.
+pub const KEPT_WORKSPACE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// What one retention sweep removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct RetentionSweep {
+    /// Usage rows older than [`USAGE_RETENTION_MS`].
+    pub usage_rows: u64,
+    /// Kept harness workspaces older than [`KEPT_WORKSPACE_TTL_MS`], and
+    /// directories under `harness/` that no task accounts for.
+    pub workspaces: u64,
+}
 
 /// What a harness run's Claude Code session spent, for
 /// [`RealKernel::record_harness_usage`]. A struct rather than seven
@@ -654,10 +679,18 @@ impl RealKernel {
         factory: AdapterFactory,
     ) -> Result<RealKernel> {
         let store = Store::open(state_dir, key_source)?;
+        // The clock continues from the record's newest stamp (SP1a review
+        // M3): a restart on a wall clock that went backwards must still stamp
+        // its events after everything already appended, or the HLC would be
+        // monotonic within a process and not across the record.
+        let clock = match store.ledger.events().last() {
+            Some(tail) => HlcClock::resume(node_id, &tail.hlc),
+            None => HlcClock::new(node_id),
+        };
         let mut k = RealKernel {
             node_id: node_id.into(),
             store,
-            clock: HlcClock::new(node_id),
+            clock,
             adapters: BTreeMap::new(),
             starting: BTreeMap::new(),
             unavailable: BTreeMap::new(),
@@ -979,7 +1012,36 @@ impl RealKernel {
         // swept here, so no stale token resolves and no projected plaintext
         // lingers (SP1b Task 4 review, I4).
         self.sweep_harness_state()?;
+        // And the rows past their retention (Task 10 group C). The daemon
+        // repeats this on its schedule for as long as it runs.
+        let swept = self.sweep_retention(now_ms())?;
+        if swept.usage_rows > 0 {
+            tracing::info!(
+                usage_rows = swept.usage_rows,
+                "swept usage rows older than the operational retention"
+            );
+        }
         Ok(report)
+    }
+
+    /// Remove what has outlived its retention (Task 10 group C): usage rows
+    /// older than [`USAGE_RETENTION_MS`], `--keep` harness workspaces older
+    /// than [`KEPT_WORKSPACE_TTL_MS`], and any directory under `harness/`
+    /// that no task accounts for. Never a live run's workspace or
+    /// configuration. Run at boot and, by the daemon, on a schedule; a
+    /// second sweep of the same moment removes nothing.
+    pub fn sweep_retention(&mut self, now_ms: u64) -> Result<RetentionSweep, KernelError> {
+        let cutoff = now_ms.saturating_sub(USAGE_RETENTION_MS);
+        let usage_rows = self
+            .store
+            .db
+            .delete_keys_below("usage", &format!("{cutoff:013}-"))
+            .map_err(store_failed)?;
+        let workspaces = self.sweep_kept_workspaces(now_ms)?;
+        Ok(RetentionSweep {
+            usage_rows,
+            workspaces,
+        })
     }
 
     /// Does the record hold? Both halves of the verdict `boot` reports, for
@@ -1163,6 +1225,8 @@ impl RealKernel {
     }
 
     /// The rows, with their keys, so `boot` can say which it has reported.
+    /// The watermark lives under the same prefix and is not a row: excluded
+    /// by name, not left to a parse that happens to fail.
     fn rebase_rows(&self) -> Result<Vec<(String, FsckRebase)>, KernelError> {
         Ok(self
             .store
@@ -1170,6 +1234,7 @@ impl RealKernel {
             .kv_list_prefix(REBASE_PREFIX)
             .map_err(store_failed)?
             .into_iter()
+            .filter(|(k, _)| k != REBASE_REPORTED_THROUGH)
             .filter_map(|(k, v)| serde_json::from_str(&v).ok().map(|r| (k, r)))
             .collect())
     }
@@ -2868,6 +2933,104 @@ mod tests {
             },
             ..machine(now)
         }
+    }
+
+    /// The HLC is seeded from the ledger tail on open (review M3): an event
+    /// appended after a restart on a wall clock that went backwards still
+    /// sorts after everything already on the record — same wall, next
+    /// counter — instead of restarting the clock at zero.
+    #[test]
+    fn the_clock_resumes_from_the_ledger_tail_across_a_restart() {
+        let d = tempfile::tempdir().unwrap();
+        let far_ahead = 4_000_000_000_000u64;
+        let before = {
+            let mut k = open(d.path());
+            k.submit_task(&machine(far_ahead), "before the restart", Label::bottom())
+                .unwrap();
+            k.ledger().events().last().unwrap().hlc.clone()
+        };
+        let mut k = open(d.path());
+        k.submit_task(
+            &machine(1),
+            "after the restart, clock set back",
+            Label::bottom(),
+        )
+        .unwrap();
+        let after = k.ledger().events().last().unwrap().hlc.clone();
+        assert!(after > before, "{after:?} must sort after {before:?}");
+        assert_eq!(after.wall_ms, before.wall_ms);
+        assert_eq!(after.counter, before.counter + 1);
+        assert_eq!(after.node, "n1");
+    }
+
+    /// The watermark `boot` keeps under the rebase prefix is never reported
+    /// as a rebase of its own (Task 8 deferred minor): excluded by key, not
+    /// by a parse that happens to fail.
+    #[test]
+    fn the_reported_through_watermark_is_never_a_rebase_row() {
+        let d = tempfile::tempdir().unwrap();
+        let k = open(d.path());
+        let looks_like_one = serde_json::to_string(&FsckRebase {
+            rebased_from: None,
+            rebased_to: vk_store::LedgerHead {
+                seq: 0,
+                hash: "sha256:x".into(),
+            },
+            at: 1,
+        })
+        .unwrap();
+        k.store()
+            .db
+            .kv_set(REBASE_REPORTED_THROUGH, &looks_like_one)
+            .unwrap();
+        assert!(
+            k.rebase_history().unwrap().is_empty(),
+            "the watermark is not a rebase"
+        );
+    }
+
+    /// Usage rows are operational metadata, kept for the operational
+    /// retention class — ninety days — and no longer (Task 8 deferred
+    /// minor): swept at boot and by the daemon's scheduled sweep; a row still
+    /// inside the window stays.
+    #[test]
+    fn usage_rows_past_their_retention_are_swept_and_fresh_ones_kept() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let row = |ts_ms: u64| UsageRow {
+            arch_id: "a".into(),
+            task_id: None,
+            step_index: None,
+            tokens_in: 1,
+            tokens_in_measured: 1,
+            tokens_out: 1,
+            cost_list_usd: None,
+            duration_ms: 1,
+            ts_ms,
+        };
+        let now = now_ms();
+        let stale = now - USAGE_RETENTION_MS - 1;
+        let fresh = now - USAGE_RETENTION_MS + 60_000;
+        for ts in [stale, fresh] {
+            k.store()
+                .db
+                .put_json("usage", &format!("{ts:013}-{:012}", 1), &row(ts))
+                .unwrap();
+        }
+        let swept = k.sweep_retention(now).unwrap();
+        assert_eq!(swept.usage_rows, 1, "{swept:?}");
+        let left = k.usage(&machine(now), &UsageFilter::All).unwrap();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].ts_ms, fresh);
+        assert_eq!(k.sweep_retention(now).unwrap().usage_rows, 0);
+
+        // Boot sweeps the same way.
+        k.store()
+            .db
+            .put_json("usage", &format!("{:013}-{:012}", 1u64, 2u64), &row(1))
+            .unwrap();
+        k.boot().unwrap();
+        assert_eq!(k.usage(&machine(now), &UsageFilter::All).unwrap().len(), 1);
     }
 
     #[test]

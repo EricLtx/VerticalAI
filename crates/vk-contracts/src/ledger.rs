@@ -36,6 +36,22 @@ impl HlcClock {
         }
     }
 
+    /// A clock that continues from `last` — the newest stamp on this node's
+    /// record — so that after a restart on a wall clock that went backwards
+    /// the next `now` still sorts after everything already appended (SP1a
+    /// review M3). The stamp is taken as the clock's own: same wall, same
+    /// counter, this node's name.
+    pub fn resume(node: &str, last: &Hlc) -> Self {
+        Self {
+            node: node.into(),
+            last: Hlc {
+                wall_ms: last.wall_ms,
+                counter: last.counter,
+                node: node.into(),
+            },
+        }
+    }
+
     pub fn now(&mut self, wall_ms: u64) -> Hlc {
         if wall_ms > self.last.wall_ms {
             self.last = Hlc {
@@ -177,8 +193,21 @@ impl Ledger {
     }
 
     pub fn verify_chain(&self) -> bool {
-        let mut prev = "sha256:genesis".to_string();
-        for e in &self.events {
+        self.verify_from(0)
+    }
+
+    /// Does the chain hold from `from` on, given a prefix that does? Every
+    /// link and every hash of `events[from..]` is recomputed, the first of
+    /// them against the hash of `events[from - 1]` (or genesis). A store that
+    /// has already verified a prefix asks only about what was appended since
+    /// (SP1a review M13); `verify_chain` is this from zero.
+    pub fn verify_from(&self, from: usize) -> bool {
+        let from = from.min(self.events.len());
+        let mut prev = match from.checked_sub(1) {
+            None => "sha256:genesis".to_string(),
+            Some(i) => self.events[i].hash.clone(),
+        };
+        for e in &self.events[from..] {
             if e.prev_hash != prev {
                 return false;
             }
@@ -288,6 +317,62 @@ mod tests {
             node: "peer".into(),
         };
         assert!(c.receive(&ok, 1_000, 5_000).is_ok());
+    }
+
+    /// M3: a resumed clock never hands out a stamp below the one it was
+    /// resumed from, whatever the wall clock says.
+    #[test]
+    fn a_resumed_clock_continues_from_the_stamp_it_was_given() {
+        let last = Hlc {
+            wall_ms: 5_000,
+            counter: 3,
+            node: "n1".into(),
+        };
+        let mut c = HlcClock::resume("n1", &last);
+        let next = c.now(900);
+        assert!(next > last, "{next:?} must sort after {last:?}");
+        assert_eq!((next.wall_ms, next.counter), (5_000, 4));
+        let later = c.now(6_000);
+        assert_eq!((later.wall_ms, later.counter), (6_000, 0));
+        // The clock keeps its own name even when resumed from another's stamp.
+        let mut other = HlcClock::resume(
+            "n2",
+            &Hlc {
+                wall_ms: 1,
+                counter: 0,
+                node: "n1".into(),
+            },
+        );
+        assert_eq!(other.now(1).node, "n2");
+    }
+
+    /// M13: a chain verified from `from` checks the link into the prefix it
+    /// was given and everything after it, and nothing before.
+    #[test]
+    fn verify_from_checks_the_suffix_and_its_link_into_the_prefix() {
+        let mut l = Ledger::default();
+        let mut c = HlcClock::new("n1");
+        for n in 1..=4 {
+            l.append(
+                "boot",
+                RetentionClass::Operational90d,
+                n,
+                ClockQuality::Synced,
+                c.now(n),
+                vec![],
+                format!("sha256:p{n}"),
+            );
+        }
+        assert!(l.verify_from(0));
+        assert!(l.verify_from(2));
+        assert!(l.verify_from(4), "an empty suffix holds");
+        assert!(l.verify_from(9), "past the end is an empty suffix");
+        l.tamper_for_test(1, "sha256:evil");
+        assert!(!l.verify_from(0));
+        assert!(!l.verify_from(1));
+        // Rewritten event 1 changes nothing about events 2..: their links
+        // and hashes still recompute among themselves.
+        assert!(l.verify_from(2));
     }
 
     #[test]

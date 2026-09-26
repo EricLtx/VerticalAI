@@ -1,6 +1,7 @@
 //! Per-node hash-chained ledger on disk (spec §3.9): JSONL segments of
 //! `LedgerEvent`, one line per event, the SP0 `Ledger` chain logic underneath.
 use anyhow::{Context, Result};
+use std::cell::Cell;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use vk_contracts::ledger::{ClockQuality, Hlc, Ledger, LedgerEvent, RetentionClass};
@@ -11,6 +12,15 @@ pub struct LedgerFs {
     dir: PathBuf,
     chain: Ledger,
     pub recovered_partial_line: bool,
+    /// How much of the chain `verify` has read, and what it found: `holds`
+    /// is the verdict on `events[..verified_through]` (SP1a review M13). An
+    /// event this store appended itself was computed by the chain and
+    /// extends the verdict at once, so `boot.info` — which `vk boot` polls
+    /// every 100 ms — asks `verify` and reads nothing. `verify_work` is what
+    /// the last call had to read, for the test that pins this.
+    verified_through: Cell<usize>,
+    holds: Cell<bool>,
+    verify_work: Cell<usize>,
 }
 
 impl LedgerFs {
@@ -87,6 +97,9 @@ impl LedgerFs {
             dir: dir.to_path_buf(),
             chain,
             recovered_partial_line,
+            verified_through: Cell::new(0),
+            holds: Cell::new(true),
+            verify_work: Cell::new(0),
         })
     }
 
@@ -135,6 +148,12 @@ impl LedgerFs {
             self.roll_back(e.seq);
             return Err(err);
         }
+        // The chain computed this event from its own head, so a verdict that
+        // reached the head reaches it too: nothing for `verify` to read.
+        let seq = usize::try_from(e.seq).unwrap_or(usize::MAX);
+        if self.holds.get() && self.verified_through.get() == seq {
+            self.verified_through.set(seq + 1);
+        }
         Ok(e)
     }
 
@@ -177,14 +196,37 @@ impl LedgerFs {
             chain.push_verified(e);
         }
         self.chain = chain;
+        self.verified_through
+            .set(self.verified_through.get().min(seq as usize));
     }
 
     pub fn tail(&self, n: usize) -> Vec<LedgerEvent> {
         let ev = self.chain.events();
         ev[ev.len().saturating_sub(n)..].to_vec()
     }
+    /// Does the chain hold? Cached per append (review M13): only what has
+    /// not been verified before is read — everything on the first call, the
+    /// events appended behind this store's back never (there are none: the
+    /// store is the single writer), and a chain once found broken is not
+    /// read again, because a segment is only ever appended to.
     pub fn verify(&self) -> bool {
-        self.chain.verify_chain()
+        let n = self.chain.events().len();
+        let from = self.verified_through.get().min(n);
+        if !self.holds.get() {
+            self.verify_work.set(0);
+            return false;
+        }
+        let ok = self.chain.verify_from(from);
+        self.verify_work.set(n - from);
+        self.holds.set(ok);
+        self.verified_through.set(n);
+        ok
+    }
+    /// How many events the last `verify` had to read: what it had not
+    /// verified before. For the test that pins the caching (review M13).
+    #[doc(hidden)]
+    pub fn verify_work(&self) -> usize {
+        self.verify_work.get()
     }
     pub fn len(&self) -> usize {
         self.chain.events().len()
@@ -301,6 +343,65 @@ mod tests {
         assert_eq!(l.len(), 1);
         assert!(l.recovered_partial_line);
         assert!(l.verify());
+    }
+
+    /// `verify` is cached per append (review M13): the first call reads the
+    /// whole chain, a second call reads nothing, an append extends the verdict
+    /// rather than voiding it, and a chain found broken stays broken without
+    /// being re-read. Nothing survives a reopen: a fresh `LedgerFs` reads it
+    /// all once, which is what boot does.
+    #[test]
+    fn verify_reads_only_what_it_has_not_verified_yet() {
+        let d = tempfile::tempdir().unwrap();
+        let append = |l: &mut LedgerFs, n: u64| {
+            l.append(
+                "boot",
+                RetentionClass::Operational90d,
+                n,
+                ClockQuality::Synced,
+                hlc(n),
+                vec![],
+                format!("sha256:p{n}"),
+            )
+            .unwrap();
+        };
+        let mut l = LedgerFs::open(d.path()).unwrap();
+        for n in 1..=3 {
+            append(&mut l, n);
+        }
+        assert!(l.verify());
+        assert_eq!(
+            l.verify_work(),
+            0,
+            "every event was computed by this chain from an empty prefix: nothing to read"
+        );
+        drop(l);
+
+        let mut l = LedgerFs::open(d.path()).unwrap();
+        assert!(l.verify());
+        assert_eq!(l.verify_work(), 3, "a reopen remembers nothing: read once");
+        assert!(l.verify());
+        assert_eq!(l.verify_work(), 0, "the second call reads nothing");
+        append(&mut l, 4);
+        assert!(l.verify());
+        assert_eq!(
+            l.verify_work(),
+            0,
+            "an event the chain computed itself extends the verdict"
+        );
+        drop(l);
+
+        // A rewritten line: found once, then remembered.
+        let seg = d.path().join("seg-000000.jsonl");
+        let text = std::fs::read_to_string(&seg)
+            .unwrap()
+            .replace("sha256:p2", "sha256:evil");
+        std::fs::write(&seg, text).unwrap();
+        let l = LedgerFs::open(d.path()).unwrap();
+        assert!(!l.verify());
+        assert_eq!(l.verify_work(), 4);
+        assert!(!l.verify());
+        assert_eq!(l.verify_work(), 0, "a broken chain is not re-read");
     }
 
     #[test]

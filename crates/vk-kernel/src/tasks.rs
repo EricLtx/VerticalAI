@@ -1303,6 +1303,63 @@ impl RealKernel {
         Ok(())
     }
 
+    /// The `--keep` workspaces whose day is up (Task 10 group C), and any
+    /// directory under `harness/` — a workspace or a run's `.mcp`
+    /// configuration — that no task accounts for. A live run's directories
+    /// are never touched: its token is in the map and its step has not ended.
+    /// A `.mcp` directory with no live run is a leftover of a settle that
+    /// never ran, and it held the token: it goes at once.
+    pub(crate) fn sweep_kept_workspaces(&mut self, now_ms: u64) -> Result<u64, KernelError> {
+        let root = self.store.state_dir.join("harness");
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(KernelError::Store(format!("read {}: {e}", root.display()))),
+        };
+        let mut removed = 0u64;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| KernelError::Store(format!("read {}: {e}", root.display())))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let (task_id, is_config) = match name.strip_suffix(".mcp") {
+                Some(task_id) => (task_id.to_string(), true),
+                None => (name.clone(), false),
+            };
+            if self.harness_running(&task_id) {
+                continue;
+            }
+            let expired = match self.task_row(&task_id) {
+                // Nothing accounts for it.
+                None => true,
+                Some(t) => {
+                    if t.steps
+                        .iter()
+                        .any(|s| matches!(s.status, StepStatus::Running))
+                    {
+                        false
+                    } else if is_config {
+                        true
+                    } else {
+                        match t.steps.iter().filter_map(|s| s.ended_ms).max() {
+                            Some(ended) => {
+                                now_ms.saturating_sub(ended) >= crate::KEPT_WORKSPACE_TTL_MS
+                            }
+                            None => true,
+                        }
+                    }
+                }
+            };
+            if expired {
+                let path = entry.path();
+                remove_tree(&path, "kept harness workspace");
+                if !path.exists() {
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     /// The operator's one screen. Everything here is read back from disk, so it
     /// says the same thing after a restart as it did before one. The tasks on
     /// it are the ones `ctx` may see (I2); arches, STOPs and liveness carry no

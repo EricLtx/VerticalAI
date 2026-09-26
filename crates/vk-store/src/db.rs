@@ -167,6 +167,19 @@ impl Db {
         Ok(out)
     }
 
+    /// Remove every row of `table` whose key sorts below `bound`, and say
+    /// how many went. For a table whose keys begin with a zero-padded
+    /// timestamp (`usage`: `<ts>-<seq>`) that is "everything older than",
+    /// which is the retention sweep's one query (Task 10 group C).
+    pub fn delete_keys_below(&self, table: &str, bound: &str) -> Result<u64> {
+        Self::check_table(table)?;
+        let n = self.conn.execute(
+            &format!("DELETE FROM {table} WHERE key < ?1"),
+            params![bound],
+        )?;
+        Ok(n as u64)
+    }
+
     pub fn delete(&self, table: &str, key: &str) -> Result<()> {
         Self::check_table(table)?;
         self.conn
@@ -276,6 +289,26 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
         assert_eq!(journal, "wal");
+    }
+
+    /// `delete_keys_below` is a key-order cut: rows below the bound go, the
+    /// bound itself and everything above it stay, and the count is exact.
+    #[test]
+    fn delete_keys_below_removes_the_older_rows_and_counts_them() {
+        let d = tempfile::tempdir().unwrap();
+        let db = Db::open(&d.path().join("vk.sqlite")).unwrap();
+        for (i, key) in ["0000000000001-1", "0000000000002-1", "0000000000003-1"]
+            .iter()
+            .enumerate()
+        {
+            db.put_json("usage", key, &Thing { n: i as u32 }).unwrap();
+        }
+        assert_eq!(db.delete_keys_below("usage", "0000000000003-").unwrap(), 2);
+        let left = db.list_json::<Thing>("usage").unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].0, "0000000000003-1");
+        assert_eq!(db.delete_keys_below("usage", "0000000000003-").unwrap(), 0);
+        assert!(db.delete_keys_below("no-such-table", "x").is_err());
     }
 
     #[test]

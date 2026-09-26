@@ -513,6 +513,13 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
     // container to start would otherwise be dark for minutes, which is what
     // made `vk boot` kill the daemon it had just started.
     tokio::spawn(vk_ipc::server::start_arches(kernel.clone()));
+    // The retention sweep, hourly (Task 10 group C): usage rows past the
+    // operational class and `--keep` workspaces past their day. `boot()`
+    // has just done the first one.
+    tokio::spawn(vk_ipc::server::sweep_retention_every(
+        kernel.clone(),
+        std::time::Duration::from_secs(60 * 60),
+    ));
     // The endpoint travels with the server so a harness run can write it into the
     // run's `mcp.json` for the harness's `vk-mcp` to dial back on; the harness
     // settings travel with it because they are this daemon's, never a request's.
