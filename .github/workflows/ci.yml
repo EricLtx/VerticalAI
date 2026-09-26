@@ -11,15 +11,15 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    # No debug info and no incremental cache. The Windows Server 2025 image
-    # behind `windows-latest` lost its D: drive in 2025 and has about 33 GB
-    # free; this workspace's test build with full debug info is ~29 GB on
-    # Windows, so the feature builds below (the AWS SDK on top of it) ran the
-    # runner out of disk the first time the workspace tests let them run
-    # (Ruling 35). Measured locally with both settings: 3.7 GB for the
-    # workspace *and* the `bedrock` build. Panic messages keep their file and
-    # line — those are compiled in regardless — and a one-shot CI build has no
-    # use for an incremental cache.
+    # No debug info and no incremental cache: the workspace test build with
+    # full debug info is ~29 GB on Windows, against 3.7 GB for the workspace
+    # *and* the `bedrock` build with both settings (measured locally), and
+    # much less for the linker to hold in memory. Panic messages keep their
+    # file and line — those are compiled in regardless — and a one-shot CI
+    # build has no use for an incremental cache. (Disk was suspected when the
+    # first feature-build step failed on Windows, and was not it: the runner
+    # this repository gets still has a D: drive with 217 GB free. That step
+    # has passed since, under these settings.)
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
@@ -28,6 +28,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # vk-web builds OpenSSL from source (`openssl/vendored`), and on MSVC
+      # OpenSSL's `Configure` needs a Windows-native Perl — the README's own
+      # recipe for Windows builds. Under `shell: bash` the `perl` on PATH is
+      # Git's MSYS one (`$^O` is `cygwin`), which `Configure` refuses for
+      # VC-WIN64A; openssl-src then exits 1 with nothing but "failed to run
+      # custom build command for openssl-sys". Pinned here, for every step,
+      # to the Perl pwsh resolves (Strawberry, on the image), and refused by
+      # name if it is not a Windows Perl.
+      - name: A Windows-native Perl for the vendored OpenSSL
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $perl = (Get-Command perl.exe -ErrorAction Stop).Source
+          $os = & $perl -e 'print $^O'
+          if ($os -ne 'MSWin32') {
+            Write-Output "::error title=perl::$perl reports '$os'; OpenSSL's Configure needs an MSWin32 Perl"
+            exit 1
+          }
+          "OPENSSL_SRC_PERL=$perl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Output "OPENSSL_SRC_PERL=$perl ($os)"
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test --workspace
@@ -88,10 +108,15 @@ jobs:
         run: |
           [ -f feature-builds.log ] || exit 0
           printf '::error title=disk::%s\n' "$(df -h . | tail -1)"
-          grep -E -m 1 -A 5 "panicked at|^error(\[E[0-9]+\])?:|could not compile|failed to run custom build command|LNK[0-9]+|No space left|not enough space" feature-builds.log | head -6 | while IFS= read -r line; do
+          # openssl-src says *why* on its own lines, well below cargo's
+          # "failed to run custom build command"; look for those first.
+          grep -E -m 3 "openssl-src:|Error (configuring|building|installing) OpenSSL|perl implementation" feature-builds.log | while IFS= read -r line; do
+            printf '::error title=openssl::%s\n' "$line"
+          done
+          grep -E -m 1 -A 3 "panicked at|^error(\[E[0-9]+\])?:|could not compile|failed to run custom build command|LNK[0-9]+|No space left|not enough space" feature-builds.log | head -4 | while IFS= read -r line; do
             printf '::error title=feature build::%s\n' "$line"
           done
-          tail -3 feature-builds.log | while IFS= read -r line; do
+          tail -2 feature-builds.log | while IFS= read -r line; do
             printf '::error title=feature build tail::%s\n' "$line"
           done
   arch-ollama:
