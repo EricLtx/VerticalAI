@@ -259,8 +259,8 @@ fn remove_tree(dir: &Path, what: &str) {
     }
 }
 
-fn is_zero(n: &usize) -> bool {
-    *n == 0
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// A locality as the wire spells it (`on_prem`, not `OnPrem`), so the screen
@@ -329,10 +329,12 @@ pub struct TopView {
     /// script that wants them all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calls: Vec<crate::UsageRow>,
-    /// How many there are in all, so the screen can say what it is not
-    /// showing rather than quietly ending.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub calls_total: usize,
+    /// Were there older calls than the ones in `calls`? The screen says so
+    /// rather than quietly ending. Not a count: counting them would mean
+    /// reading the whole table, which is exactly what the bound exists to
+    /// avoid (SP1b Task 8 review, Minor 2).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub calls_truncated: bool,
     pub tasks: BTreeMap<String, TaskStatus>,
     pub stopped_scopes: Vec<String>,
     pub liveness: BTreeMap<String, u64>,

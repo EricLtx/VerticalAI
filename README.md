@@ -331,13 +331,20 @@ the store verifies
 | tier | what it checks | what a failure means |
 |---|---|---|
 | `ledger` | every link and every hash recomputes; the first event that does not is named | a line was rewritten since this node wrote it |
-| `head` | the chain still reaches the head this store last recorded | the tail was cut — by a restore, or by somebody |
+| `head` | the chain still reaches the head this store last recorded, **and there is one** | the tail was cut — by a restore, or by somebody. A record with *no* head recorded for it is the same failure: the head is written on every append, so the row was removed |
 | `blobs` | every blob opens **at the address it is filed under**: the envelope names it, the AEAD tag binds the ciphertext to it, and the plaintext derives it again | a `.bin` was swapped, restored from the wrong copy, or has a flipped byte |
 | `keys` | every wrapped DEK still unwraps under the master key | the keyring entry or key file is not the one the blobs were written with |
 | `mounts` | every mounted arch still has the spec the next boot would make it from | that arch comes back `unavailable` at the next restart |
 
 A shredded subject is **skipped**, not failed: its DEK was deleted on purpose
 and its ciphertext is meant to stay unreadable for ever.
+
+A node with a record and **no recorded head** does not serve without `--force`
+either. Cutting a tail is caught by the head; cutting a tail *and* deleting the
+head row would otherwise be caught by nothing, and one `DELETE` would turn a
+detectable tamper into a node that attests itself clean. The only innocent
+version of "no head" is a store nothing has ever been appended to, which has no
+record either.
 
 `vk fsck` exits non-zero if any tier fails, so `vk fsck && …` gates on it, and
 `vk fsck --json` is the whole report for a script. Reading every blob on the
@@ -364,10 +371,15 @@ guard it: a chain that does not itself verify is **not** rebased — re-recordin
 a head onto a record known to be rewritten would only make the next open call
 it intact — and neither is an empty record.
 
-The override goes on the record. There is no new event kind for it: the next
-`boot` event's payload is that boot's report, and the report names both heads
-and when the rebase was done, the same way `boot.forced` names the verdict a
-`--force` overrode.
+The override goes on the record, and stays there. Each rebase is its own row —
+append-only, never overwritten and never cleared, so a second rebase cannot
+erase the first. There is no new event kind for it: the next `boot` event's
+payload is that boot's report, and the report names every rebase since the
+previous boot, the same way `boot.forced` names the verdict a `--force`
+overrode. Because a `boot` event is a commitment to a report and not the report
+itself, the rows are also on the surfaces a live operator reads — `vk status`
+marks the node `head rebased`, `vk status --json` and `vk fsck --json` carry
+the whole history — for as long as the node exists.
 
 ### The SP1 demo
 

@@ -138,6 +138,35 @@ impl Db {
         Ok(out)
     }
 
+    /// The newest `limit` rows of a table, by key, returned oldest-first.
+    ///
+    /// `LIMIT` in the query, not a truncation of the answer: the `usage`
+    /// table grows for the life of a node, and a screen that shows its last
+    /// two hundred calls must not deserialize a hundred thousand rows to do
+    /// it (SP1b Task 8 review, Minor 2). The keys of every table that uses
+    /// this are ordered — `usage` is `<ts>-<seq>`, both zero-padded — so
+    /// "newest by key" is newest.
+    pub fn list_json_last<T: serde::de::DeserializeOwned>(
+        &self,
+        table: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, T)>> {
+        Self::check_table(table)?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT key, json FROM {table} ORDER BY key DESC LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (k, j) = row?;
+            out.push((k, serde_json::from_str(&j)?));
+        }
+        out.reverse();
+        Ok(out)
+    }
+
     pub fn delete(&self, table: &str, key: &str) -> Result<()> {
         Self::check_table(table)?;
         self.conn
@@ -192,6 +221,16 @@ impl Db {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Remove a `kv` entry. The counterpart `kv_set` has always needed:
+    /// without it a caller that wants a key gone has to leave an empty
+    /// value behind, and "empty" and "absent" then have to mean the same
+    /// thing everywhere that reads it.
+    pub fn kv_delete(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM kv WHERE key = ?1", params![key])?;
+        Ok(())
     }
 
     pub fn kv_set(&self, key: &str, value: &str) -> Result<()> {

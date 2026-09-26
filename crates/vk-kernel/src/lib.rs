@@ -181,14 +181,15 @@ pub struct BootReport {
     /// unchanged afterwards. It exists so that the first policy set has a
     /// predecessor to migrate from.
     pub policies_version: String,
-    /// A `vk fsck --rebase-head` done since the last boot (SP1b Task 8).
-    /// Present on exactly one report — the first boot after the rebase — and
-    /// absent everywhere else, including on every report written before this
-    /// field existed, so the canonical hash of an ordinary report is
-    /// unchanged and an auditor's recomputation of an old `boot` event still
-    /// matches.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fsck: Option<FsckRebase>,
+    /// Every `vk fsck --rebase-head` done since the last boot that reported
+    /// one (SP1b Task 8; review Important 1 made it a list — two rebases
+    /// between two boots are two overrides and both belong on the record).
+    ///
+    /// Empty on an ordinary boot, and skipped when empty, so the canonical
+    /// hash of an ordinary report is unchanged and an auditor's
+    /// recomputation of an old `boot` event still matches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fsck: Vec<FsckRebase>,
 }
 
 /// Cumulative per-arch call counters, persisted under the `kv` key
@@ -557,9 +558,15 @@ pub struct FsckRebase {
     pub at: u64,
 }
 
-/// Where the pending rebase waits between `vk fsck --rebase-head` and the
-/// next boot that reports it.
-const PENDING_REBASE: &str = "fsck.rebase.pending";
+/// The `kv` prefix every head rebase is recorded under, one row per rebase,
+/// keyed by when it happened. **Append-only**: nothing overwrites a row and
+/// nothing deletes one, so the history of a node's overrides is the history
+/// (review Important 1).
+const REBASE_PREFIX: &str = "ledger.head.rebase.";
+/// The key of the newest rebase row a `boot` event has already named. A
+/// watermark, because the rows are the record and must not be cleared to
+/// mark them read.
+const REBASE_REPORTED_THROUGH: &str = "ledger.head.rebase.reported-through";
 
 /// What a harness run's Claude Code session spent, for
 /// [`RealKernel::record_harness_usage`]. A struct rather than seven
@@ -921,15 +928,25 @@ impl RealKernel {
     /// the tail cut off the newest segment would still "verify" — and the
     /// tail is where the latest STOP, approval or release lives.
     pub fn boot(&mut self) -> Result<BootReport, KernelError> {
-        if let HeadVerdict::Diverged { recorded, found } = &self.store.ledger_head {
-            tracing::warn!(
+        match &self.store.ledger_head {
+            HeadVerdict::Diverged { recorded, found } => tracing::warn!(
                 recorded_seq = recorded.seq,
                 recorded_hash = %recorded.hash,
                 found_seq = found.as_ref().map(|h| h.seq),
                 "the ledger on disk no longer contains the head this node last recorded: \
                  its tail was cut or rewritten"
-            );
+            ),
+            // The head is written on every append, so a record with no head
+            // recorded for it is a row somebody removed — the quiet half of
+            // cutting a tail (review Critical 1).
+            HeadVerdict::Missing { found } => tracing::warn!(
+                found_seq = found.seq,
+                "this node has a record and nothing saying where it ended: the recorded head \
+                 is gone. `vk fsck` says so; `vk fsck --rebase-head --force` re-records it"
+            ),
+            HeadVerdict::Unrecorded | HeadVerdict::Intact => {}
         }
+        let unreported = self.unreported_rebases()?;
         let report = BootReport {
             ledger_ok: self.ledger_holds(),
             ledger_len: self.store.ledger.len(),
@@ -940,16 +957,18 @@ impl RealKernel {
             devices: self.device_ids(),
             stopped_scopes: self.stops.stopped_scopes(),
             policies_version: self.load_policies_version()?,
-            // The rebase belongs to the *next* boot, and this is it. Read
-            // here so the event commits to it, cleared below once that event
-            // is durable — ledger before the row, as everywhere else: an
-            // append that fails must leave the rebase still waiting to be
-            // reported rather than silently dropped.
-            fsck: self.pending_rebase()?,
+            // Every rebase since the last boot that named one. Read here so
+            // the event commits to them; the watermark moves below, once
+            // that event is durable — ledger before the row, as everywhere
+            // else, so a failed append leaves them still to be reported.
+            fsck: unreported.iter().map(|(_, r)| r.clone()).collect(),
         };
         self.log("boot", now_ms(), &report)?;
-        if report.fsck.is_some() {
-            self.clear_pending_rebase()?;
+        if let Some((newest, _)) = unreported.last() {
+            self.store
+                .db
+                .kv_set(REBASE_REPORTED_THROUGH, newest)
+                .map_err(store_failed)?;
         }
         // After the `boot` event, so the record reads in the order things
         // happened: this node came up, and then it found what the last one
@@ -972,7 +991,10 @@ impl RealKernel {
     /// long as it runs.
     pub fn ledger_holds(&self) -> bool {
         self.store.ledger.verify()
-            && !matches!(self.store.ledger_head, HeadVerdict::Diverged { .. })
+            && !matches!(
+                self.store.ledger_head,
+                HeadVerdict::Diverged { .. } | HeadVerdict::Missing { .. }
+            )
     }
 
     /// Ledger event for a daemon that decided to serve `report` anyway
@@ -990,7 +1012,10 @@ impl RealKernel {
     /// Callers: `vkd`, exactly on the path where it has already decided to
     /// serve under `--force`; never when `report.ledger_ok` is true.
     pub fn record_forced_boot(&mut self, report: &BootReport) -> Result<(), KernelError> {
-        let head_ok = !matches!(self.store.ledger_head, HeadVerdict::Diverged { .. });
+        let head_ok = !matches!(
+            self.store.ledger_head,
+            HeadVerdict::Diverged { .. } | HeadVerdict::Missing { .. }
+        );
         let report_hash = hash_canonical(report);
         self.log(
             "boot.forced",
@@ -1060,14 +1085,20 @@ impl RealKernel {
                 }
             }
         }
+        let mut orphans = 0u64;
         for id in specs.keys() {
             if !manifests.iter().any(|(m, _)| m == id) {
+                orphans += 1;
                 problems.push(format!(
                     "{id}: a mount spec with no arch beside it, left by a half-written mount"
                 ));
             }
         }
-        vk_store::FsckTier::new("mounts", manifests.len() as u64, 0, problems)
+        // Manifests **and** orphan specs: a store with two orphan specs and
+        // no manifests reported `checked 0 / failed 2`, which reads like a
+        // tier that did not run (review Minor 4). Everything this tier looked
+        // at is counted.
+        vk_store::FsckTier::new("mounts", manifests.len() as u64 + orphans, 0, problems)
     }
 
     /// Re-record the ledger head from the chain as it is on disk — the
@@ -1082,9 +1113,16 @@ impl RealKernel {
     /// no new event kind, so an auditor reading the chain finds the override
     /// without being told to look for it.
     ///
-    /// Parked rather than appended here, because an append *now* would land
-    /// on the very chain whose head is in question, in the middle of the one
-    /// operation that is about to redefine where that chain ends.
+    /// Written rather than appended to the chain, because an append *now*
+    /// would land on the very chain whose head is in question, in the middle
+    /// of the one operation that is about to redefine where that chain ends.
+    ///
+    /// **Append-only** (review Important 1). Each rebase is its own row under
+    /// `ledger.head.rebase.<ts>`; nothing here overwrites a row and nothing
+    /// anywhere deletes one, so a second rebase cannot erase the first —
+    /// which was the whole gap, since the person who did the first one
+    /// already holds the presence the second one needs. The rows are the
+    /// history `boot.info`, `vk status` and `vk fsck` all read.
     pub fn rebase_ledger_head(&mut self, at: u64) -> Result<FsckRebase, KernelError> {
         let done = self.store.rebase_head().map_err(store_failed)?;
         let rebase = FsckRebase {
@@ -1092,39 +1130,65 @@ impl RealKernel {
             rebased_to: done.to,
             at,
         };
+        // `<ts>` zero-padded so the rows sort in the order they happened, and
+        // the kernel's own id counter behind it so two rebases in one
+        // millisecond are two rows rather than one overwriting the other.
+        self.counter += 1;
         self.store
             .db
-            .kv_set(
-                PENDING_REBASE,
-                &serde_json::to_string(&rebase).map_err(store_failed)?,
-            )
+            .kv_set("counter", &self.counter.to_string())
+            .map_err(store_failed)?;
+        let key = format!("{REBASE_PREFIX}{at:013}-{:012}", self.counter);
+        self.store
+            .db
+            .kv_set(&key, &serde_json::to_string(&rebase).map_err(store_failed)?)
             .map_err(store_failed)?;
         tracing::warn!(
+            from_seq = rebase.rebased_from.as_ref().map(|h| h.seq),
             to_seq = rebase.rebased_to.seq,
-            "the ledger head was re-recorded by hand; the next boot event names it"
+            "the ledger head was re-recorded by hand; the next boot event names it, and \
+             `vk status` names it from now on"
         );
         Ok(rebase)
     }
 
-    /// The parked rebase, if one is waiting for a boot to report it.
-    fn pending_rebase(&self) -> Result<Option<FsckRebase>, KernelError> {
+    /// Every head rebase this node has ever had, oldest first.
+    ///
+    /// The readable surface the review asked for (Important 2): `boot.info`
+    /// carries it, so `vk status` marks a rebased node the way it marks a
+    /// forced one, and `vk fsck` prints it. Nothing clears it — an override
+    /// of the store's own refusal is not a thing that stops being true.
+    pub fn rebase_history(&self) -> Result<Vec<FsckRebase>, KernelError> {
+        Ok(self.rebase_rows()?.into_iter().map(|(_, r)| r).collect())
+    }
+
+    /// The rows, with their keys, so `boot` can say which it has reported.
+    fn rebase_rows(&self) -> Result<Vec<(String, FsckRebase)>, KernelError> {
         Ok(self
             .store
             .db
-            .kv_get(PENDING_REBASE)
+            .kv_list_prefix(REBASE_PREFIX)
             .map_err(store_failed)?
-            .filter(|j| !j.is_empty())
-            .and_then(|j| serde_json::from_str(&j).ok()))
+            .into_iter()
+            .filter_map(|(k, v)| serde_json::from_str(&v).ok().map(|r| (k, r)))
+            .collect())
     }
 
-    /// Reported: the next boot is an ordinary boot. Emptied rather than
-    /// deleted, because `kv` has no delete and an empty value reads back as
-    /// "nothing parked".
-    fn clear_pending_rebase(&mut self) -> Result<(), KernelError> {
-        self.store
+    /// The rebases no `boot` event has named yet — every one since the last
+    /// boot that reported any. A watermark rather than a delete: the rows
+    /// themselves are the history and are never removed.
+    fn unreported_rebases(&self) -> Result<Vec<(String, FsckRebase)>, KernelError> {
+        let through = self
+            .store
             .db
-            .kv_set(PENDING_REBASE, "")
-            .map_err(store_failed)
+            .kv_get(REBASE_REPORTED_THROUGH)
+            .map_err(store_failed)?
+            .unwrap_or_default();
+        Ok(self
+            .rebase_rows()?
+            .into_iter()
+            .filter(|(k, _)| k.as_str() > through.as_str())
+            .collect())
     }
 
     /// The per-call usage rows this node has, as `ctx` may see them (SP1b
@@ -1163,6 +1227,45 @@ impl RealKernel {
                 UsageFilter::Arch(id) => &row.arch_id == id,
             })
             .collect())
+    }
+
+    /// The newest calls, as `ctx` may see them, and whether there are older
+    /// ones behind them.
+    ///
+    /// What `vk top --calls` reads. The bound is in the query (`LIMIT`), not
+    /// a truncation of the answer: the `usage` table grows for the life of a
+    /// node, and a screen must not get slower every day to print the same
+    /// two hundred lines (review Minor 2). `usage` — unbounded, and filtered
+    /// by task or arch — is the surface for a caller that wants them all.
+    ///
+    /// The same I2 filter as [`RealKernel::usage`], applied after the read:
+    /// a row naming a task this caller may not see is not a row it may read,
+    /// so the answer can come back shorter than `limit` even when there are
+    /// older rows.
+    pub fn usage_recent(
+        &self,
+        ctx: &Ctx,
+        limit: usize,
+    ) -> Result<(Vec<UsageRow>, bool), KernelError> {
+        let newest = self
+            .store
+            .db
+            .list_json_last::<UsageRow>("usage", limit)
+            .map_err(store_failed)?;
+        // Exactly `limit` back means the table may well hold more.
+        let more = newest.len() == limit;
+        let visible: BTreeSet<String> = self.tasks(ctx).into_iter().map(|t| t.id).collect();
+        Ok((
+            newest
+                .into_iter()
+                .map(|(_, row)| row)
+                .filter(|row| match &row.task_id {
+                    None => true,
+                    Some(id) => visible.contains(id),
+                })
+                .collect(),
+            more,
+        ))
     }
 
     /// One completed call, written down. Keyed `<ts>-<seq>`, both zero-padded,
@@ -2407,6 +2510,18 @@ impl Kernel for RealKernel {
         // second half). Only a call that came back: an attempt that never
         // did is the `infer`/`requested` event, which is already on the
         // record, and a usage row for it would be a charge nobody incurred.
+        //
+        // **This runs after the `infer`/`completed` append, and the order is
+        // load-bearing** (review Minor 1, and the ruling that kept the `?`).
+        // A failure here is a `KernelError` and fails the call — Ruling 8's
+        // discipline: a node that cannot write down what it spent must not
+        // go on spending. What makes that safe rather than lossy is that the
+        // completion is *already on the ledger* by this line: the two `infer`
+        // events, `requested` and `completed`, are appended above, so an
+        // auditor can see exactly what was paid for even when the row that
+        // would have accounted for it could not be written. The register is
+        // not raised, so nothing acts on an answer the node could not
+        // account for — which is the whole of the discipline.
         let (task_id, step_index) = match &self.usage_step {
             Some((task, step)) => (Some(task.clone()), Some(*step)),
             None => (None, None),
@@ -4999,7 +5114,8 @@ mod tests {
         // that carries it.
         let mut k = open(d.path());
         let report = k.boot().unwrap();
-        let named = report.fsck.as_ref().expect("the rebase is in the report");
+        assert_eq!(report.fsck.len(), 1, "{report:?}");
+        let named = &report.fsck[0];
         assert_eq!(named.rebased_to, rebase.rebased_to, "{named:?}");
         assert_eq!(named.rebased_from, rebase.rebased_from, "{named:?}");
         let last = k
@@ -5011,9 +5127,131 @@ mod tests {
             .expect("a boot event");
         assert_eq!(last.payload_hash, hash_canonical(&report));
 
-        // And the boot after it is an ordinary boot.
+        // And the boot after it is an ordinary boot — the *event* names a
+        // rebase once, when it happened.
         drop(k);
         let mut k = open(d.path());
-        assert!(k.boot().unwrap().fsck.is_none());
+        assert!(k.boot().unwrap().fsck.is_empty());
+        // But the node does not stop having been rebased: the rows are the
+        // history, and `boot.info`/`vk status`/`vk fsck` read them for as
+        // long as the node exists (review Important 2).
+        assert_eq!(k.rebase_history().unwrap().len(), 1);
+    }
+
+    /// Review Important 1: a second rebase before the reporting boot must
+    /// not erase the first one's evidence — the person who did the first
+    /// already holds the presence the second needs, and the mechanism exists
+    /// to stop exactly them from being able to deny it.
+    #[test]
+    fn a_second_rebase_adds_a_row_rather_than_replacing_the_first() {
+        let d = tempfile::tempdir().unwrap();
+        {
+            let mut k = open(d.path());
+            k.boot().unwrap();
+            k.register_arch(local(personal()));
+            k.register_arch(local_named("second", personal()));
+        }
+        let seg = d.path().join("ledger").join("seg-000000.jsonl");
+        let text = std::fs::read_to_string(&seg).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        assert!(lines.len() >= 3, "{}", lines.len());
+        lines.truncate(lines.len() - 2);
+        std::fs::write(&seg, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let mut k = open(d.path());
+        // The real one: it discards the two events the cut removed.
+        let first = k.rebase_ledger_head(1_000).expect("the first rebase");
+        assert!(first.rebased_from.is_some(), "{first:?}");
+        // And a second, on a now-healthy store, which is a no-op. It used to
+        // overwrite the row above, so the boot afterwards reported the no-op
+        // and the real override was gone.
+        let second = k.rebase_ledger_head(2_000).expect("the second rebase");
+        assert_eq!(second.rebased_from.as_ref(), Some(&second.rebased_to));
+
+        let history = k.rebase_history().unwrap();
+        assert_eq!(history.len(), 2, "both rebases are on record: {history:?}");
+        assert_eq!(history[0], first, "the first is unchanged: {history:?}");
+        assert_eq!(history[1], second, "{history:?}");
+        drop(k);
+
+        // And the reporting boot names both, in order.
+        let mut k = open(d.path());
+        let report = k.boot().unwrap();
+        assert_eq!(report.fsck, vec![first, second], "{report:?}");
+        // Reported once; still history for ever.
+        drop(k);
+        let mut k = open(d.path());
+        assert!(k.boot().unwrap().fsck.is_empty());
+        assert_eq!(k.rebase_history().unwrap().len(), 2);
+    }
+
+    /// Review Critical 1. Cutting the tail is caught by the recorded head;
+    /// cutting the tail *and deleting the head row* used to be caught by
+    /// nothing — the node served without `--force` and `vk fsck` printed
+    /// "the store verifies". A head is written on every append, so a record
+    /// with no head recorded for it is a row somebody removed.
+    #[test]
+    fn a_record_with_no_recorded_head_does_not_hold_and_fails_the_head_tier() {
+        let d = tempfile::tempdir().unwrap();
+        {
+            let mut k = open(d.path());
+            k.boot().unwrap();
+            k.register_arch(local(personal()));
+        }
+        // The cut, and then the row that would have caught it.
+        let seg = d.path().join("ledger").join("seg-000000.jsonl");
+        let text = std::fs::read_to_string(&seg).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines.truncate(lines.len() - 1);
+        std::fs::write(&seg, format!("{}\n", lines.join("\n"))).unwrap();
+        {
+            let s = vk_store::Store::open(d.path(), KeySource::File(d.path().join("master.key")))
+                .unwrap();
+            // Exactly the reviewer's reproduction: one `DELETE` of one row.
+            s.db.kv_delete(vk_store::LEDGER_HEAD).unwrap();
+            assert!(s.db.kv_get(vk_store::LEDGER_HEAD).unwrap().is_none());
+        }
+        let mut k = open(d.path());
+        assert!(
+            !k.ledger_holds(),
+            "a record with no head recorded for it does not hold"
+        );
+        let report = k.fsck();
+        assert!(!report.ok, "{report:?}");
+        let head = report
+            .tiers
+            .iter()
+            .find(|t| t.tier == "head")
+            .expect("a head tier");
+        assert!(!head.ok, "{head:?}");
+        assert!(
+            head.problems
+                .iter()
+                .any(|p| p.contains("no recorded head for a non-empty chain")),
+            "{head:?}"
+        );
+        // And appending does not quietly record one over it: only a human's
+        // rebase does, so the state survives until somebody says so.
+        k.boot().unwrap();
+        assert!(!k.ledger_holds(), "an append must not paper over it");
+        assert!(!k.fsck().ok);
+
+        // The rebase is the way out, and it names no previous head because
+        // there was none on record.
+        let done = k.rebase_ledger_head(now_ms()).expect("rebase");
+        assert_eq!(done.rebased_from, None, "{done:?}");
+        assert!(k.ledger_holds());
+        assert!(k.fsck().ok, "{:?}", k.fsck());
+    }
+
+    /// And the innocent case stays innocent: a store nothing has been
+    /// appended to has no head and no record, and that is not damage.
+    #[test]
+    fn a_fresh_store_with_no_record_and_no_head_verifies() {
+        let d = tempfile::tempdir().unwrap();
+        let k = open(d.path());
+        assert!(k.ledger_holds(), "a fresh store holds");
+        let report = k.fsck();
+        assert!(report.ok, "{report:?}");
     }
 }

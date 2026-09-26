@@ -44,9 +44,27 @@ impl LedgerHead {
 /// be repaired from a backup, not by the process that found it short.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeadVerdict {
-    /// No head on record: a first open, or a store from before heads were
-    /// kept. The next append records one.
+    /// No head on record and no record either: a store nothing has ever
+    /// been appended to. The first append records a head.
     Unrecorded,
+    /// A record, and **no head recorded for it** (SP1b Task 8 review,
+    /// Critical 1).
+    ///
+    /// This cannot arise honestly. `append_event` records the head on every
+    /// single append, so a non-empty chain always has one — unless the row
+    /// was removed, which is precisely how somebody cuts a tail without
+    /// being caught: the chain still links, and the one thing that knows how
+    /// long it should be is gone. Treated exactly like `Diverged`: the node
+    /// does not serve on it without `--force`, `fsck` fails the head tier,
+    /// and later appends do not record a head over it — only a human's
+    /// `vk fsck --rebase-head` does.
+    ///
+    /// (A store written by a build from before heads were recorded at all
+    /// lands here too, and is told so by name rather than waved through.)
+    Missing {
+        /// Where the chain now ends, which is what a rebase would record.
+        found: LedgerHead,
+    },
     /// The chain contains the recorded head, at its seq and with its hash.
     /// It may be longer by the event a crash cut off between the append
     /// (already synced) and the record of it.
@@ -102,8 +120,11 @@ impl Store {
     /// leaves the chain one event ahead of the record, which `open` accepts.
     ///
     /// On a store whose chain was found to have diverged from its recorded
-    /// head, the head is left where it was: recording the head of a chain
-    /// already known to be cut would make the next open call it intact.
+    /// head — or to have no recorded head at all — the head is left as it
+    /// was: recording the head of a chain already known to be cut, or
+    /// writing a fresh one over a row somebody removed, would make the next
+    /// open call it intact. Only `rebase_head`, which is a human act, moves
+    /// it from either state.
     ///
     /// The seven parameters are the event's own fields as the contract
     /// orders them, the same signature as `LedgerFs::append` underneath.
@@ -127,7 +148,10 @@ impl Store {
             causal_heads,
             payload_hash,
         )?;
-        if !matches!(self.ledger_head, HeadVerdict::Diverged { .. }) {
+        if !matches!(
+            self.ledger_head,
+            HeadVerdict::Diverged { .. } | HeadVerdict::Missing { .. }
+        ) {
             self.db
                 .kv_set(LEDGER_HEAD, &serde_json::to_string(&LedgerHead::of(&e))?)
                 .context("record the ledger head")?;
@@ -260,6 +284,17 @@ impl Store {
         let problems = match head_verdict(&self.db, &self.ledger) {
             Err(e) => vec![format!("the recorded ledger head cannot be read: {e:#}")],
             Ok(HeadVerdict::Unrecorded | HeadVerdict::Intact) => vec![],
+            // The row is written on every append, so a record with no head
+            // recorded for it is a row that was removed — the second half of
+            // cutting a tail without being caught (review Critical 1).
+            Ok(HeadVerdict::Missing { found }) => vec![format!(
+                "no recorded head for a non-empty chain: this node has {} events and nothing \
+                 saying where its record ended. The head is written on every append, so the \
+                 row has been removed; the chain now ends at seq {} ({})",
+                self.ledger.len(),
+                found.seq,
+                short(&found.hash)
+            )],
             Ok(HeadVerdict::Diverged { recorded, found }) => vec![format!(
                 "the record no longer contains the head this node last wrote (seq {}, {}); \
                  it now ends at {}",
@@ -411,8 +446,19 @@ fn short(hash: &str) -> String {
 }
 
 fn head_verdict(db: &db::Db, ledger: &ledger_fs::LedgerFs) -> Result<HeadVerdict> {
-    let Some(json) = db.kv_get(LEDGER_HEAD)? else {
-        return Ok(HeadVerdict::Unrecorded);
+    // An empty value counts as absent: `kv_set(k, "")` is how this store
+    // has always emptied a key, and a head that is gone is gone however it
+    // was removed.
+    let Some(json) = db.kv_get(LEDGER_HEAD)?.filter(|j| !j.trim().is_empty()) else {
+        // No row. Whether that is innocent depends entirely on whether there
+        // is a record: a fresh store has neither, and a store with a chain
+        // and no head has had the head taken off it.
+        return Ok(match ledger.events().last() {
+            None => HeadVerdict::Unrecorded,
+            Some(e) => HeadVerdict::Missing {
+                found: LedgerHead::of(e),
+            },
+        });
     };
     let recorded: LedgerHead =
         serde_json::from_str(&json).with_context(|| format!("malformed {LEDGER_HEAD} record"))?;
@@ -816,10 +862,18 @@ mod tests {
         assert!(matches!(s.ledger_head, HeadVerdict::Diverged { .. }));
     }
 
-    /// A store written before heads were recorded opens as `Unrecorded`, is
-    /// served, and has a head from its first append onwards.
+    /// A record with no head recorded for it is `Missing`, not `Unrecorded`
+    /// (SP1b Task 8 review, Critical 1).
+    ///
+    /// The head is written on every append, so this state cannot arise
+    /// honestly — the row was removed, which is exactly how a cut tail is
+    /// hidden. It is therefore treated like a divergence: later appends do
+    /// **not** quietly record a head over it, and only a human's
+    /// `rebase_head` moves it. A store written by a build from before heads
+    /// existed lands here too and is told so rather than waved through; the
+    /// same one command lets it in.
     #[test]
-    fn a_ledger_from_before_heads_were_recorded_is_accepted_and_then_recorded() {
+    fn a_record_with_no_recorded_head_is_missing_and_stays_missing() {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("ledger")).unwrap();
         {
@@ -840,13 +894,51 @@ mod tests {
             .unwrap();
         }
         let mut s = open(d.path());
-        assert_eq!(s.ledger_head, HeadVerdict::Unrecorded);
+        assert!(
+            matches!(s.ledger_head, HeadVerdict::Missing { .. }),
+            "{:?}",
+            s.ledger_head
+        );
         assert!(s.db.kv_get(LEDGER_HEAD).unwrap().is_none());
+        let r = s.fsck();
+        assert!(!r.ok, "{r:?}");
+        assert!(
+            tier(&r, "head")
+                .problems
+                .iter()
+                .any(|p| p.contains("no recorded head for a non-empty chain")),
+            "{r:?}"
+        );
+
+        // Appending does not paper over it: the head stays unrecorded, so a
+        // second open finds the same thing rather than an intact store.
         let e = append(&mut s, "boot", 2);
+        assert_eq!(e.seq, 1);
+        assert!(s.db.kv_get(LEDGER_HEAD).unwrap().is_none());
+        drop(s);
+        let mut s = open(d.path());
+        assert!(matches!(s.ledger_head, HeadVerdict::Missing { .. }));
+
+        // The rebase is the way in, and it names no previous head.
+        let done = s.rebase_head().expect("a chain that links is rebased");
+        assert_eq!(done.from, None, "{done:?}");
+        assert_eq!(done.to.seq, 1, "{done:?}");
+        assert!(s.fsck().ok, "{:?}", s.fsck());
+    }
+
+    /// And an empty store, which has neither a record nor a head, is not
+    /// damage: that is `Unrecorded`, and the first append records a head.
+    #[test]
+    fn a_store_with_no_record_at_all_is_unrecorded_and_verifies() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = open(d.path());
+        assert_eq!(s.ledger_head, HeadVerdict::Unrecorded);
+        assert!(s.fsck().ok, "{:?}", s.fsck());
+        let e = append(&mut s, "boot", 1);
         let recorded: LedgerHead =
             serde_json::from_str(&s.db.kv_get(LEDGER_HEAD).unwrap().unwrap()).unwrap();
         assert_eq!(recorded, LedgerHead::of(&e));
-        assert_eq!(e.seq, 1);
+        assert!(s.fsck().ok);
     }
 
     /// Unix only: the state directory and every file the store writes are

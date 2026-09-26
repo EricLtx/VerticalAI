@@ -479,6 +479,28 @@ fn vk_fsck_reports_a_cut_record_and_the_typed_rebase_is_the_way_back() {
         screen.contains("the recorded ledger head was moved"),
         "{screen}"
     );
+
+    // A second rebase — a no-op on a store that is now healthy — must
+    // **add** to the record, not replace the real one (review Important 1).
+    // The person who did the first already holds the presence the second
+    // needs; the mechanism exists to stop exactly them from denying it.
+    let again = sh.run_with_stdin(&["fsck", "--rebase-head", "--force"], "rebase\n");
+    assert!(again.status.success(), "{:?}", again.status);
+    let report: Value = serde_json::from_slice(&sh.run(&["fsck", "--json"]).stdout).expect("json");
+    let history = report["rebases"].as_array().expect("a rebase history");
+    assert_eq!(history.len(), 2, "both are on record: {report}");
+    // The first one really moved the head — off the event the cut record
+    // used to end at, onto the one it ends at now (the same seq, since the
+    // forced boot appended two events of its own, but not the same event).
+    assert_ne!(
+        history[0]["rebased_from"]["hash"], history[0]["rebased_to"]["hash"],
+        "the first rebase is unchanged and is the real one: {report}"
+    );
+    // And the second is the no-op that used to overwrite it.
+    assert_eq!(
+        history[1]["rebased_from"]["hash"], history[1]["rebased_to"]["hash"],
+        "{report}"
+    );
     drop(_forced);
     wait_until(&sh, false, "the killed daemon still holds the endpoint");
 
@@ -507,6 +529,133 @@ fn vk_fsck_reports_a_cut_record_and_the_typed_rebase_is_the_way_back() {
         "the boot that followed the rebase says so:\n{log}"
     );
     assert_eq!(sh.json(&["fsck", "--json"])["ok"], true);
+
+    // And it is on a surface a live operator reads, not only in whatever
+    // file the daemon's stdout went to (review Important 2). Both rebases,
+    // for as long as the node exists — a boot does not clear them.
+    assert_eq!(
+        status["fsck"].as_array().map(Vec::len),
+        Some(2),
+        "`boot.info` carries the history: {status}"
+    );
+    let screen = sh.ok(&["status"]);
+    assert!(screen.contains("head rebased"), "{screen}");
+    assert_eq!(
+        sh.json(&["fsck", "--json"])["rebases"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "and so does `vk fsck --json`"
+    );
+}
+
+/// The review's Critical 1, end to end: cutting the tail **and** deleting the
+/// one SQLite row that says where the record ended.
+///
+/// Cutting alone is caught by the recorded head. Cutting and removing the head
+/// row used to be caught by nothing at all: the node served with no `--force`,
+/// `vk status` said `chain verified`, and the whole-store verifier printed
+/// "the store verifies" and exited 0 — one `DELETE` turning a detectable
+/// tamper into an attested-clean node. The head is written on every append, so
+/// a record with no head recorded for it is a row somebody removed.
+#[test]
+fn vk_fsck_refuses_a_record_whose_head_row_was_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let sh = Shell {
+        endpoint: endpoint.clone(),
+        node_key: dir.path().join("node.key"),
+    };
+    {
+        let _daemon = Daemon(
+            vkd_cmd(dir.path(), &endpoint, &[])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn vkd"),
+        );
+        wait_until(&sh, true, "vkd never answered").expect("status");
+        sh.ok(&["mount", "mock", "m1", "--ctx", "4096"]);
+        sh.ok(&["stop"]);
+    }
+    wait_until(&sh, false, "the killed daemon still holds the endpoint");
+
+    cut_ledger_tail(dir.path());
+    delete_recorded_head(dir.path());
+
+    // The node must refuse to serve on it, exactly as it refuses a cut tail
+    // whose head row is still there.
+    let refused = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let (exit, why) = exit_of(refused, "vkd is serving a record with no recorded head");
+    assert!(!exit.success(), "{exit:?}: {why}");
+    assert!(why.contains("ledger") && why.contains("--force"), "{why}");
+    assert!(serving(&sh).is_none(), "nothing is serving that store");
+
+    // Forced, so `vk fsck` can be reached at all — and it names the tier.
+    let _forced = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &["--force"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let status = wait_until(&sh, true, "--force did not start a daemon").expect("status");
+    assert_eq!(status["ledger_ok"], false, "{status}");
+    assert_eq!(status["forced"], true, "{status}");
+
+    let out = sh.run(&["fsck"]);
+    assert!(!out.status.success(), "a deleted head row must exit 1");
+    let screen = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        screen.contains("head: no recorded head for a non-empty chain"),
+        "the tier and the reason belong on the screen:\n{screen}"
+    );
+    assert!(screen.contains("the store DOES NOT verify"), "{screen}");
+    let report: Value = serde_json::from_slice(&sh.run(&["fsck", "--json"]).stdout).expect("json");
+    assert_eq!(report["ok"], false, "{report}");
+    for t in report["tiers"].as_array().expect("tiers") {
+        let expected = t["tier"] != "head";
+        assert_eq!(t["ok"], expected, "only the head tier fails: {report}");
+    }
+
+    // And the rebase is the way back here too, naming no previous head
+    // because there was none on record.
+    let done = sh.run_with_stdin(&["fsck", "--rebase-head", "--force"], "rebase\n");
+    let screen = String::from_utf8_lossy(&done.stdout).to_string();
+    assert!(done.status.success(), "{screen}");
+    assert!(screen.contains("nothing recorded"), "{screen}");
+    // On the record for good, and on the screen a live operator reads.
+    assert!(
+        screen.contains("re-recorded by hand"),
+        "the history is in the report:\n{screen}"
+    );
+    drop(_forced);
+    wait_until(&sh, false, "the killed daemon still holds the endpoint");
+    let _again = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let status = wait_until(&sh, true, "the rebased node did not serve").expect("status");
+    assert_eq!(status["ledger_ok"], true, "{status}");
+    assert_eq!(
+        status["fsck"].as_array().map(Vec::len),
+        Some(1),
+        "the rebase is on `boot.info` for good, not only in a log line: {status}"
+    );
+    assert!(
+        sh.ok(&["status"]).contains("head rebased"),
+        "and `vk status` marks it: {}",
+        sh.ok(&["status"])
+    );
 }
 
 /// A blob whose bytes are not what its address says — a `.bin` restored from
@@ -1740,6 +1889,16 @@ fn cut_ledger_tail(state_dir: &std::path::Path) {
     assert!(lines.len() >= 3, "a record worth cutting: {}", lines.len());
     lines.truncate(lines.len() - 2);
     std::fs::write(&seg, format!("{}\n", lines.join("\n"))).unwrap();
+}
+
+/// The one SQLite row that says where a node's record ended, removed — the
+/// second half of cutting a tail without being caught (review Critical 1).
+/// Done here with the store's own API, with the daemon gone, which is the
+/// same effect as the `DELETE` an attacker with the file would run.
+fn delete_recorded_head(state_dir: &std::path::Path) {
+    let db = vk_store::db::Db::open(&state_dir.join("vk.sqlite")).expect("the metadata tier");
+    db.kv_delete(vk_store::LEDGER_HEAD).expect("delete the row");
+    assert!(db.kv_get(vk_store::LEDGER_HEAD).unwrap().is_none());
 }
 
 /// One line of a node's record rewritten, exactly as an editor would leave it:

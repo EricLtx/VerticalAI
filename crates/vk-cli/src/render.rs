@@ -86,6 +86,21 @@ pub fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
     out
 }
 
+/// How a harness's spend is filed: `harness:<name>`, `vk_kernel`'s
+/// `harness_arch_id`. A literal rather than a link, so this shell does not
+/// depend on the kernel to render a screen.
+const HARNESS_PREFIX: &str = "harness:";
+
+fn is_harness(arch_id: &str) -> bool {
+    arch_id.starts_with(HARNESS_PREFIX)
+}
+
+/// A summed `f64` back as a `Value`, so it goes through `zeroless` like
+/// every other number on these screens and a zero sum reads as a dash.
+fn json_num(n: f64) -> Value {
+    serde_json::Number::from_f64(n).map_or(Value::Null, Value::Number)
+}
+
 fn array<'a>(v: &'a Value, field: &str) -> &'a [Value] {
     v[field].as_array().map_or(&[], |a| a.as_slice())
 }
@@ -162,6 +177,31 @@ pub fn status(v: &Value) -> String {
         rows.push((
             "recovered",
             "an unterminated last ledger line was dropped at boot".into(),
+        ));
+    }
+    // Somebody re-recorded where this node's record ends, by hand. Unlike
+    // `forced`, which is this run's, this is the node's for good: an
+    // override of the store's own refusal does not stop having happened at
+    // the next restart (SP1b Task 8 review, Important 2).
+    let rebases = array(v, "fsck");
+    if !rebases.is_empty() {
+        rows.push((
+            "head rebased",
+            rebases
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{} → seq {} at {}",
+                        match r["rebased_from"].as_object() {
+                            Some(from) => format!("seq {}", text(&from["seq"])),
+                            None => "nothing recorded".into(),
+                        },
+                        text(&r["rebased_to"]["seq"]),
+                        text(&r["at"])
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
         ));
     }
     fields(&rows)
@@ -311,6 +351,11 @@ pub fn top(v: &Value) -> String {
         .as_object()
         .map(|m| {
             m.iter()
+                // A harness is not an arch: nothing mounts it, it has no
+                // manifest and no state, so a row for it in this table is
+                // four dashes that read as "an arch that was unmounted"
+                // (review Minor 6). Its spend has a line of its own below.
+                .filter(|(id, _)| !is_harness(id))
                 .map(|(id, s)| {
                     vec![
                         id.clone(),
@@ -375,6 +420,32 @@ pub fn top(v: &Value) -> String {
             &arches,
         )
     });
+    // What the confined harnesses spent, under the arches rather than among
+    // them: the money is the node's and belongs on the screen that exists
+    // for cost, but a harness has no locality, no state and no governance of
+    // its own to put in those columns (review Minor 6).
+    let harnesses: Vec<Vec<String>> = v["arches"]
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter(|(id, _)| is_harness(id))
+                .map(|(id, s)| {
+                    vec![
+                        id.trim_start_matches(HARNESS_PREFIX).to_string(),
+                        text(&s["calls"]),
+                        text(&s["tokens_in"]),
+                        zeroless(&s["cost_list_usd"], |c| format!("{c:.5}")),
+                    ]
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !harnesses.is_empty() {
+        out.push(table(
+            &["HARNESS", "RUNS", "TOKENS", "COST USD"],
+            &harnesses,
+        ));
+    }
     // Why, under the table rather than in it: a reason is a sentence and a
     // sentence in a column makes every other column unreadable.
     if let Some(down) = v["unavailable"].as_object().filter(|m| !m.is_empty()) {
@@ -389,11 +460,11 @@ pub fn top(v: &Value) -> String {
     if !calls.is_empty() {
         out.push(calls_table(calls));
         // What is not on the screen, said rather than left to be inferred
-        // from a table that stops.
-        let total = v["calls_total"].as_u64().unwrap_or(calls.len() as u64);
-        if total > calls.len() as u64 {
+        // from a table that stops. Not "of N": counting them all is the work
+        // the bound exists to avoid (review Minor 2).
+        if v["calls_truncated"] == Value::Bool(true) {
             out.push(format!(
-                "showing the last {} of {total} calls; `usage.ls` has them all",
+                "showing the last {} calls; there are older ones — `usage.ls` has them all",
                 calls.len()
             ));
         }
@@ -610,17 +681,30 @@ pub fn fsck(v: &Value) -> String {
     // person who just moved one can see how far back they moved it.
     if let Some(r) = v.get("rebased").filter(|r| !r.is_null()) {
         out.push(format!(
-            "the recorded ledger head was moved from {} to seq {} ({})",
-            match r["rebased_from"].as_object() {
-                Some(from) => format!(
-                    "seq {} ({})",
-                    text(&from["seq"]),
-                    short(&text(&from["hash"]))
-                ),
-                None => "nothing recorded".into(),
-            },
-            text(&r["rebased_to"]["seq"]),
-            short(&text(&r["rebased_to"]["hash"]))
+            "the recorded ledger head was moved from {} to {}",
+            head_of(&r["rebased_from"]),
+            head_of(&r["rebased_to"])
+        ));
+    }
+    // And every rebase this node has ever had, the one just made included:
+    // `vk fsck` is where somebody looks at the store, so it is where the
+    // overrides of the store's own refusal belong (review Important 2).
+    let rebases = array(v, "rebases");
+    if !rebases.is_empty() {
+        let rows = rebases
+            .iter()
+            .map(|r| {
+                vec![
+                    text(&r["at"]),
+                    head_of(&r["rebased_from"]),
+                    head_of(&r["rebased_to"]),
+                ]
+            })
+            .collect::<Vec<_>>();
+        out.push(format!(
+            "this node's recorded head has been re-recorded by hand:
+{}",
+            table(&["AT (ms)", "FROM", "TO"], &rows)
         ));
     }
     out.push(if v["ok"] == Value::Bool(true) {
@@ -643,6 +727,15 @@ pub fn fsck(v: &Value) -> String {
         );
     }
     out.join("\n\n")
+}
+
+/// A `{seq, hash}` head as a person reads it, and `nothing recorded` where
+/// there was none.
+fn head_of(v: &Value) -> String {
+    match v.as_object() {
+        Some(h) => format!("seq {} ({})", text(&h["seq"]), short(&text(&h["hash"]))),
+        None => "nothing recorded".into(),
+    }
 }
 
 /// The ledger tail. Hashes are shown by their first 12 hex digits, which is
@@ -703,26 +796,34 @@ pub fn task(v: &Value) -> String {
                 Some("approve") => String::new(),
                 _ => text(&kind["arch_id"]),
             };
-            let call = usage
+            // **Every** call this step made, not the first one (review
+            // Minor 3): a harness step re-run after a failure writes a
+            // second usage row, and showing the older one understated what
+            // the step spent while `vk top --calls` showed both.
+            let calls: Vec<&Value> = usage
                 .iter()
-                .find(|u| u["step_index"].as_u64() == Some(i as u64));
+                .filter(|u| u["step_index"].as_u64() == Some(i as u64))
+                .collect();
+            let sum =
+                |field: &str| json_num(calls.iter().filter_map(|c| c[field].as_f64()).sum::<f64>());
             vec![
                 (i + 1).to_string(),
                 text(&kind["kind"]),
                 step_status(&s["status"]),
+                // A dash, not `0`, where the step made no call at all: an
+                // approve and a release spend nothing, and a zero there
+                // would read as a measurement that came out at zero.
+                if calls.is_empty() {
+                    "-".into()
+                } else {
+                    calls.len().to_string()
+                },
                 text(&s["tokens"]),
-                // What the call returned and what it cost (SP1b Task 8): a
-                // dash where no call was made (an approve, a release) and
-                // where the arch measured nothing, never a zero that reads
-                // as a measurement.
-                call.map_or_else(
-                    || "-".into(),
-                    |c| zeroless(&c["tokens_out"], |n| format!("{n:.0}")),
-                ),
-                call.map_or_else(
-                    || "-".into(),
-                    |c| zeroless(&c["cost_list_usd"], |n| format!("{n:.5}")),
-                ),
+                // What the calls returned and what they cost, summed (SP1b
+                // Task 8). Through `zeroless`, so an arch that measured
+                // nothing still reads as a dash.
+                zeroless(&sum("tokens_out"), |n| format!("{n:.0}")),
+                zeroless(&sum("cost_list_usd"), |n| format!("{n:.5}")),
                 decisions_cell(decisions, i),
                 detail,
             ]
@@ -735,6 +836,7 @@ pub fn task(v: &Value) -> String {
                 "#",
                 "STEP",
                 "STATUS",
+                "CALLS",
                 "TOKENS",
                 "OUT",
                 "COST USD",
@@ -1133,11 +1235,21 @@ mod tests {
         assert!(screen.contains(" 2 "), "the step is 1-based: {screen}");
         assert!(screen.contains("37"), "{screen}");
         assert!(screen.contains("910"), "{screen}");
-        // A harness run's spend is a row like any other, so it is on the
-        // screen instead of missing from the node's total.
+        // A harness run's spend is on the screen that exists for cost —
+        // but on a line of its own, not as a row of the arch table with four
+        // dashes in it, which is what an unmounted arch looks like (review
+        // Minor 6). The arch table must not claim it at all.
         let harness = top(&json!({
-            "arches": {}, "states": {}, "governed": {}, "locality": {},
-            "jurisdiction": {}, "price_eur_per_1k": {},
+            "arches": {
+                "sha256:a": {"calls": 1, "tokens_in": 1400, "tokens_in_measured": 1400,
+                             "cost_list_usd": 0.002, "projected": 0},
+                "harness:claude-code": {"calls": 2, "tokens_in": 20,
+                                        "tokens_in_measured": 20, "cost_list_usd": 0.02,
+                                        "projected": 0},
+            },
+            "states": {"sha256:a": "ready"}, "governed": {"sha256:a": true},
+            "locality": {"sha256:a": "local"}, "jurisdiction": {"sha256:a": "FR"},
+            "price_eur_per_1k": {"sha256:a": 0.0},
             "calls": [{
                 "arch_id": "harness:claude-code", "task_id": "task-n1-2", "step_index": 0,
                 "tokens_in": 20, "tokens_in_measured": 20, "tokens_out": 5,
@@ -1145,11 +1257,35 @@ mod tests {
             }],
             "tasks": {}, "stopped_scopes": [], "liveness": {},
         }));
-        assert!(harness.contains("harness:claude-code"), "{harness}");
+        assert!(
+            harness.contains("HARNESS"),
+            "its own table:
+{harness}"
+        );
+        assert!(
+            harness.contains("0.02000"),
+            "with its spend:
+{harness}"
+        );
+        // Named without the prefix on its own line, and never as an arch row.
+        assert!(
+            harness
+                .lines()
+                .any(|l| l.starts_with("claude-code") && l.contains('2')),
+            "{harness}"
+        );
+        assert!(
+            !harness
+                .lines()
+                .any(|l| l.starts_with("harness:claude-code") && l.contains("  -  ")),
+            "the arch table must not carry a ghost row for it:
+{harness}"
+        );
 
         // A node that has run for a week has more calls than a screen holds,
-        // so the daemon sends the newest few — and the screen says what it is
-        // not showing rather than just stopping.
+        // so the daemon sends the newest few — and the screen says there are
+        // older ones rather than just stopping. Not "of N": counting them all
+        // is the work the bound exists to avoid.
         let capped = top(&json!({
             "arches": {}, "states": {}, "governed": {}, "locality": {},
             "jurisdiction": {}, "price_eur_per_1k": {},
@@ -1158,13 +1294,25 @@ mod tests {
                 "tokens_in": 1, "tokens_in_measured": 1, "tokens_out": 1,
                 "cost_list_usd": null, "duration_ms": 1, "ts_ms": 1u64,
             }],
-            "calls_total": 1_482,
+            "calls_truncated": true,
             "tasks": {}, "stopped_scopes": [], "liveness": {},
         }));
         assert!(
-            capped.contains("showing the last 1 of 1482 calls"),
+            capped.contains("showing the last 1 calls; there are older ones"),
             "{capped}"
         );
+        // And a screen that is showing everything says nothing about it.
+        let whole = top(&json!({
+            "arches": {}, "states": {}, "governed": {}, "locality": {},
+            "jurisdiction": {}, "price_eur_per_1k": {},
+            "calls": [{
+                "arch_id": "sha256:a", "task_id": "task-n1-9", "step_index": 0,
+                "tokens_in": 1, "tokens_in_measured": 1, "tokens_out": 1,
+                "cost_list_usd": null, "duration_ms": 1, "ts_ms": 1u64,
+            }],
+            "tasks": {}, "stopped_scopes": [], "liveness": {},
+        }));
+        assert!(!whole.contains("older ones"), "{whole}");
     }
 
     /// `vk arch show`: the identity tuple that *is* the arch id, the
@@ -1294,6 +1442,67 @@ mod tests {
         }));
         assert!(rebased.contains("seq 12"), "{rebased}");
         assert!(rebased.contains("seq 9"), "{rebased}");
+
+        // And the whole history, not only the rebase this call made: every
+        // override of the store's own refusal, for as long as the node lives
+        // (review Important 2).
+        let history = fsck(&json!({
+            "ok": true,
+            "tiers": [{"tier": "head", "checked": 1, "skipped": 0, "failed": 0,
+                       "ok": true, "problems": []}],
+            "rebases": [
+                {"rebased_from": {"seq": 12, "hash": "sha256:aaaa"},
+                 "rebased_to": {"seq": 9, "hash": "sha256:bbbb"}, "at": 1u64},
+                {"rebased_from": null,
+                 "rebased_to": {"seq": 14, "hash": "sha256:cccc"}, "at": 2u64},
+            ],
+        }));
+        assert!(history.contains("re-recorded by hand"), "{history}");
+        assert!(history.contains("seq 12"), "{history}");
+        assert!(history.contains("seq 14"), "{history}");
+        // A rebase onto a store that had no head at all says so.
+        assert!(history.contains("nothing recorded"), "{history}");
+        // A node that has never had one says nothing.
+        let never = fsck(&json!({
+            "ok": true,
+            "tiers": [{"tier": "head", "checked": 1, "skipped": 0, "failed": 0,
+                       "ok": true, "problems": []}],
+            "rebases": [],
+        }));
+        assert!(!never.contains("re-recorded"), "{never}");
+    }
+
+    /// Review Important 2: `vk status` marks a node whose recorded head was
+    /// moved by hand, the way it marks a forced boot. Unlike `forced`, which
+    /// is this run's, this is the node's for good.
+    #[test]
+    fn status_marks_a_node_whose_head_was_rebased_by_hand() {
+        let value = |rendered: &str, label: &str| {
+            rendered
+                .lines()
+                .find_map(|l| l.split_once("  ").filter(|(k, _)| k.trim_end() == label))
+                .map(|(_, v)| v.trim_start().to_string())
+        };
+        let base = json!({
+            "node_id": "n1", "state_dir": "S", "export_root": "E",
+            "arches": 0, "devices": 1, "ledger_len": 9, "policies_version": "0",
+            "ledger_ok": true, "forced": false, "recovered_partial_line": false,
+            "stopped_scopes": [],
+        });
+        // A node that has never had one says nothing about it.
+        assert_eq!(value(&super::status(&base), "head rebased"), None);
+
+        let mut rebased = base.clone();
+        rebased["fsck"] = json!([
+            {"rebased_from": {"seq": 12, "hash": "sha256:aaaa"},
+             "rebased_to": {"seq": 9, "hash": "sha256:bbbb"}, "at": 1700u64},
+            {"rebased_from": null,
+             "rebased_to": {"seq": 14, "hash": "sha256:cccc"}, "at": 1800u64},
+        ]);
+        let line =
+            value(&super::status(&rebased), "head rebased").expect("the marker is on the screen");
+        assert!(line.contains("seq 12 → seq 9"), "{line}");
+        assert!(line.contains("nothing recorded → seq 14"), "{line}");
     }
 
     /// Ruling 8: what a step spent is on the screen that shows the step, not
@@ -1336,6 +1545,40 @@ mod tests {
         let mut bare = t.clone();
         bare.as_object_mut().unwrap().remove("usage");
         assert!(super::task(&bare).contains("arch-a"));
+
+        // A step run more than once — a harness step re-run after a failure
+        // writes a second row — shows **both** calls summed, not whichever
+        // came first (review Minor 3): the screen used to understate what
+        // the step spent while `vk top --calls` showed the lot.
+        let twice = json!({
+            "id": "task-2", "goal": "g", "artefact_type": "proposal",
+            "status": "done", "register": "reg-2",
+            "steps": [
+                {"kind": {"kind": "harness", "name": "claude-code"}, "status": "done",
+                 "tokens": 40},
+            ],
+            "usage": [
+                {"arch_id": "harness:claude-code", "task_id": "task-2", "step_index": 0,
+                 "tokens_in": 20, "tokens_in_measured": 20, "tokens_out": 5,
+                 "cost_list_usd": 0.01, "duration_ms": 9, "ts_ms": 1u64},
+                {"arch_id": "harness:claude-code", "task_id": "task-2", "step_index": 0,
+                 "tokens_in": 20, "tokens_in_measured": 20, "tokens_out": 7,
+                 "cost_list_usd": 0.02, "duration_ms": 9, "ts_ms": 2u64},
+            ],
+        });
+        let rendered = super::task(&twice);
+        let row = rendered
+            .lines()
+            .find(|l| l.starts_with('1'))
+            .expect("the step's row");
+        let cells: Vec<&str> = row
+            .split("  ")
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .collect();
+        assert_eq!(cells[3], "2", "two calls: {row:?}");
+        assert_eq!(cells[5], "12", "5 + 7 out: {row:?}");
+        assert_eq!(cells[6], "0.03000", "0.01 + 0.02: {row:?}");
     }
 
     #[test]

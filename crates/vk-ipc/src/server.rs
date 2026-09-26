@@ -617,6 +617,13 @@ fn dispatch(
             // verify. The event naming why is on the record; this is the
             // live marker so `vk status` need not go read it.
             "forced": k.forced_boot(),
+            // Every `vk fsck --rebase-head` this node has ever had, oldest
+            // first (SP1b Task 8 review, Important 2). Unlike `forced`, which
+            // is this run's, these are the node's for good: somebody
+            // overrode its store's refusal to say where its record ended,
+            // and `vk status` marks the node the way it marks a forced boot
+            // rather than leaving the only trace in a log file.
+            "fsck": k.rebase_history().map_err(kerr)?,
             // Fixed when this daemon opened its store: one event short of its
             // record is a thing every caller is told, not only the log line
             // nobody read.
@@ -888,8 +895,18 @@ fn dispatch(
             // After the rebase, so the report is the store as it now is
             // rather than the store the operator has just repaired.
             let mut out = to_value(k.fsck())?;
-            if let (Some(o), Some(r)) = (out.as_object_mut(), rebased) {
-                o.insert("rebased".into(), to_value(r)?);
+            if let Some(o) = out.as_object_mut() {
+                if let Some(r) = rebased {
+                    o.insert("rebased".into(), to_value(r)?);
+                }
+                // And every rebase this node has ever had, not only the one
+                // this call made (review Important 2): `vk fsck` is where an
+                // auditor looks at the store, so it is where the overrides
+                // of the store's own refusal belong.
+                o.insert(
+                    "rebases".into(),
+                    to_value(k.rebase_history().map_err(kerr)?)?,
+                );
             }
             Ok(out)
         }
@@ -1039,16 +1056,14 @@ fn dispatch(
             let ctx = ctx_for(&k, presence, now)?;
             let mut view = k.top(&ctx);
             if p["calls"] == Value::Bool(true) {
-                let mut rows = k.usage(&ctx, &vk_kernel::UsageFilter::All).map_err(kerr)?;
-                // The newest `MAX_TOP_CALLS`, not all of them: a node that
-                // has run for a week has more calls than a screen holds, and
-                // an answer nobody can read is not an answer. `usage.ls` is
+                // The newest `MAX_TOP_CALLS`, bounded **in the query**: a
+                // node that has run for a week has more calls than a screen
+                // holds, and reading them all to print two hundred would make
+                // this verb slower every day (review Minor 2). `usage.ls` is
                 // the surface for a caller that wants every row.
-                view.calls_total = rows.len();
-                if rows.len() > MAX_TOP_CALLS {
-                    rows.drain(..rows.len() - MAX_TOP_CALLS);
-                }
+                let (rows, more) = k.usage_recent(&ctx, MAX_TOP_CALLS).map_err(kerr)?;
                 view.calls = rows;
+                view.calls_truncated = more;
             }
             to_value(view)
         }
