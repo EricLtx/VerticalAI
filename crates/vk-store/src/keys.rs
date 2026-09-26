@@ -124,13 +124,18 @@ pub fn check_private_file(path: &std::path::Path, allowed_owners: &[&str]) -> Re
     {
         // Whatever the caller named, plus the three every VerticalAI object
         // admits, so a caller that passes nothing still gets the old rule.
-        let mut allowed: Vec<String> = allowed_owners.iter().map(|s| s.to_string()).collect();
+        // Canonicalised on the way in, so a duplicate is recognised by value
+        // (Ruling 35) — the audit below compares canonical SIDs too.
+        let mut allowed: Vec<String> = allowed_owners
+            .iter()
+            .map(|s| crate::win_acl::canonical_sid(s))
+            .collect::<Result<_>>()?;
         for fixed in [
             crate::win_acl::LOCAL_SYSTEM_SID.to_string(),
             crate::win_acl::ADMINISTRATORS_SID.to_string(),
             crate::win_acl::current_process_sid()?,
         ] {
-            if !allowed.iter().any(|a| a.eq_ignore_ascii_case(&fixed)) {
+            if !allowed.contains(&fixed) {
                 allowed.push(fixed);
             }
         }

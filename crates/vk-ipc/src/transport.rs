@@ -571,49 +571,21 @@ pub mod os {
         }
     }
 
-    /// The DACL a pipe instance actually carries, as SDDL. Used by the tests
-    /// to prove that what `bind_with_descriptor` was given is what the kernel
-    /// put on the object — a descriptor silently ignored would otherwise look
-    /// exactly like one that took.
+    /// The DACL a pipe instance actually carries, **by value**: each entry's
+    /// type, flags, mask and canonical `S-1-…` SID, read off the handle. Used
+    /// by the tests to prove that what `bind_with_descriptor` was given is
+    /// what the kernel put on the object — a descriptor silently ignored would
+    /// otherwise look exactly like one that took.
+    ///
+    /// Not the SDDL *rendering* of it (Ruling 35): that prints this account as
+    /// `LA` on a GitHub Windows runner, which runs as the built-in local
+    /// Administrator, and prints the `GA` that was written as the `FA` the
+    /// kernel stored after generic mapping — a string comparison was a test of
+    /// the renderer, and failed on the one machine whose account has an alias.
     #[cfg(test)]
-    fn dacl_of(pipe: &NamedPipeServer) -> Result<String> {
+    fn dacl_of(pipe: &NamedPipeServer) -> Result<vk_store::win_acl::DaclView> {
         use std::os::windows::io::AsRawHandle;
-        use windows::core::PWSTR;
-        use windows::Win32::Security::Authorization::{
-            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SE_KERNEL_OBJECT,
-        };
-        use windows::Win32::Security::DACL_SECURITY_INFORMATION;
-
-        // SAFETY: `pipe` owns the handle for the whole call; the descriptor
-        // `GetSecurityInfo` allocates is freed once, after it has been read.
-        unsafe {
-            let mut psd = PSECURITY_DESCRIPTOR::default();
-            let rc = GetSecurityInfo(
-                HANDLE(pipe.as_raw_handle()),
-                SE_KERNEL_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                None,
-                None,
-                None,
-                None,
-                Some(&mut psd),
-            );
-            anyhow::ensure!(rc.is_ok(), "GetSecurityInfo: {rc:?}");
-            let mut text = PWSTR::null();
-            let converted = ConvertSecurityDescriptorToStringSecurityDescriptorW(
-                psd,
-                SDDL_REVISION_1,
-                DACL_SECURITY_INFORMATION,
-                &mut text,
-                None,
-            );
-            let sddl = converted
-                .map(|()| text.to_string().unwrap_or_default())
-                .map_err(anyhow::Error::from);
-            LocalFree(Some(HLOCAL(text.0 as *mut std::ffi::c_void)));
-            LocalFree(Some(HLOCAL(psd.0)));
-            sddl
-        }
+        vk_store::win_acl::handle_dacl(pipe.as_raw_handle())
     }
 
     impl Listener {
@@ -771,21 +743,33 @@ pub mod os {
             let ep = test_endpoint();
             let listener = bind_with_descriptor(&ep, Some(&sddl)).await.unwrap();
             let on_the_object = dacl_of(listener.next.as_ref().unwrap()).unwrap();
-            assert!(
-                on_the_object.contains(&sid),
-                "the DACL must name this account: {on_the_object}"
-            );
-            assert_eq!(
-                on_the_object.matches("(A;").count(),
-                1,
-                "exactly one allow ACE was asked for, the object carries: {on_the_object}"
-            );
+            assert_only_this_account(&on_the_object, &sid);
             // A pipe bound the ordinary way carries the default DACL, which is
             // a different, longer list — so the assertion above is about this
             // descriptor, not about every pipe.
             let plain = bind(&test_endpoint()).await.unwrap();
             let default_dacl = dacl_of(plain.next.as_ref().unwrap()).unwrap();
-            assert_ne!(default_dacl, on_the_object);
+            assert!(
+                default_dacl.entries.len() > 1,
+                "the default list names more than one account: {default_dacl:?}"
+            );
+            assert_ne!(default_dacl.entries, on_the_object.entries);
+        }
+
+        /// One entry, allow, naming `sid` by value, with the full file-object
+        /// rights — the `GA` the descriptor was written with, as the kernel
+        /// stores it after generic mapping.
+        fn assert_only_this_account(dacl: &vk_store::win_acl::DaclView, sid: &str) {
+            use vk_store::win_acl::{ACE_ALLOW, FILE_ALL_ACCESS_MASK};
+            assert_eq!(
+                dacl.entries.len(),
+                1,
+                "exactly one entry was asked for, the object carries: {dacl:?}"
+            );
+            let e = &dacl.entries[0];
+            assert_eq!(e.kind, ACE_ALLOW, "{dacl:?}");
+            assert_eq!(e.sid, sid, "the entry must name this account: {dacl:?}");
+            assert_eq!(e.mask, FILE_ALL_ACCESS_MASK, "GA, mapped: {dacl:?}");
         }
 
         /// Every instance, not only the first: the second client on a pipe
@@ -806,8 +790,7 @@ pub mod os {
             // `accept` pre-armed the next instance; that is the one to look at.
             let armed =
                 dacl_of(listener.next.as_ref().expect("an instance was pre-armed")).unwrap();
-            assert!(armed.contains(&sid), "{armed}");
-            assert_eq!(armed.matches("(A;").count(), 1, "{armed}");
+            assert_only_this_account(&armed, &sid);
         }
 
         #[tokio::test]
