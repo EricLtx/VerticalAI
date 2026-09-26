@@ -33,6 +33,11 @@ rand.workspace = true
 hex.workspace = true
 uuid.workspace = true
 
+# `geteuid`, so the socket's directory is required to be this user's and not
+# only closed to others (SP1a review M6).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 # The pipe's DACL (SP1b Task 6): turning the SDDL a caller hands `bind` into a
 # `SECURITY_ATTRIBUTES` for `CreateNamedPipe`, reading the token user's SID

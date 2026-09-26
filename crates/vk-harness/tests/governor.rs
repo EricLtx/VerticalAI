@@ -286,3 +286,35 @@ mod job_object {
         assert_eq!(governor.cpu_rate_percent(), Some(25));
     }
 }
+
+/// What a child leaves running in its process group is signalled while the
+/// child is still a zombie (Task 4 review, M18): an unreaped leader pins its
+/// pgid, so the id cannot be reused underneath the signal. After
+/// `settle_and_reap`, the group is empty and the status is the child's own.
+#[cfg(unix)]
+#[test]
+fn a_childs_process_group_is_settled_before_the_child_is_reaped() {
+    use std::os::unix::process::CommandExt;
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "sleep 30 & exit 0"])
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let pgid = i32::try_from(child.id()).unwrap();
+    let started = std::time::Instant::now();
+    let status = vk_harness::launch::settle_and_reap(&mut child).unwrap();
+    assert!(status.success(), "{status}");
+    // SAFETY: `kill(-pgid, 0)` delivers nothing; it asks whether any member is left.
+    let left = unsafe { libc::kill(-pgid, 0) };
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    assert_eq!(left, -1, "the group must be empty");
+    assert_eq!(errno, Some(libc::ESRCH), "{errno:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the helper went on SIGTERM, not on the grace timeout: {:?}",
+        started.elapsed()
+    );
+}

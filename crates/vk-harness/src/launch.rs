@@ -742,6 +742,18 @@ pub fn launch_claude_code(
     let mut samples = 0usize;
     let deadline = started + cfg.timeout;
     let exit_reason = loop {
+        // Unix: the child's exit is noticed **without reaping it** and the
+        // group is signalled first — an unreaped leader pins its pgid, so
+        // the id cannot be reused underneath the signal (Task 4 review,
+        // M18); then it is reaped, and what is left gets its grace.
+        #[cfg(unix)]
+        if exited_unreaped(pid).context("wait for claude")? {
+            term_group(pid);
+            let status = child.wait().context("reap claude")?;
+            finish_group(pid);
+            break reason_from(status);
+        }
+        #[cfg(not(unix))]
         if let Some(status) = child.try_wait().context("wait for claude")? {
             break reason_from(status);
         }
@@ -767,15 +779,6 @@ pub fn launch_claude_code(
         samples += 1;
         std::thread::sleep(SAMPLE_EVERY);
     };
-
-    // The child is gone; what it left running in its process group is not
-    // (Unix — on Windows the Job Object does this when the governor drops):
-    // TERM the group, give it a moment, then KILL what remains, so no helper
-    // outlives the settle and the removal of the workspace (Ruling 22, M16).
-    #[cfg(unix)]
-    if matches!(exit_reason, ExitReason::Exited(_) | ExitReason::Signal) {
-        settle_group(pid);
-    }
 
     let stdout_json = String::from_utf8_lossy(&out_t.join().unwrap_or_default()).into_owned();
     let stderr = String::from_utf8_lossy(&err_t.join().unwrap_or_default()).into_owned();
@@ -890,27 +893,58 @@ fn kill_tree(child: &mut Child) {
 #[cfg(unix)]
 const GROUP_GRACE: Duration = Duration::from_secs(2);
 
-/// Signal what is left of the child's process group after the child has exited
-/// on its own: `SIGTERM`, up to [`GROUP_GRACE`] for it to go, then `SIGKILL`.
-/// The group is the child's own (`spawn` made it lead one), so nothing else is
-/// in it; a group with no member left answers `ESRCH`, and there is nothing to
-/// do.
+/// Has the child exited, **without reaping it**? `waitid` with `WNOWAIT`
+/// leaves it a zombie for `Child::wait` to collect; `WNOHANG` makes this a
+/// poll. A zombie leader still pins its pgid (Task 4 review, M18), which is
+/// what lets the group be signalled before the id can be reused.
 #[cfg(unix)]
-fn settle_group(pid: u32) {
+fn exited_unreaped(pid: u32) -> std::io::Result<bool> {
+    // SAFETY: `info` is a zeroed `siginfo_t` the call fills in; the flags
+    // ask about this one child, without hanging and without reaping it.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let rc = libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        );
+        if rc == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // With `WNOHANG` and nothing to report, `si_pid` is left zero.
+        Ok(info.si_pid() == pid as libc::pid_t)
+    }
+}
+
+/// `SIGTERM` to what the child left in its process group, sent while the
+/// child is still a zombie: the group is the child's own (`spawn` made it
+/// lead one), and the unreaped leader keeps the group's id from being reused
+/// underneath the signal. A group with no live member takes the signal
+/// harmlessly (the zombie cannot receive it).
+#[cfg(unix)]
+fn term_group(pid: u32) {
     let Ok(pgid) = i32::try_from(pid) else {
         return;
     };
-    // SAFETY: `kill(2)` with a negative pid addresses the process group, which
-    // is the child's own; signal 0 delivers nothing and only asks whether any
-    // member is left.
-    let alive = || unsafe { libc::kill(-pgid, 0) == 0 };
-    if !alive() {
-        return;
-    }
-    // SAFETY: as above; SIGTERM to the child's own group.
+    // SAFETY: `kill(2)` with a negative pid addresses the process group,
+    // which is the child's own; SIGTERM to it.
     unsafe {
         libc::kill(-pgid, libc::SIGTERM);
     }
+}
+
+/// After the child is reaped: up to [`GROUP_GRACE`] for the members to go,
+/// then `SIGKILL` to whatever ignored the `SIGTERM`. The probe is honest now
+/// that the zombie is gone — a group with no member left answers `ESRCH` —
+/// and a live member pins the pgid for as long as it lives.
+#[cfg(unix)]
+fn finish_group(pid: u32) {
+    let Ok(pgid) = i32::try_from(pid) else {
+        return;
+    };
+    // SAFETY: signal 0 delivers nothing and only asks whether any member is left.
+    let alive = || unsafe { libc::kill(-pgid, 0) == 0 };
     let deadline = Instant::now() + GROUP_GRACE;
     while alive() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
@@ -925,6 +959,23 @@ fn settle_group(pid: u32) {
             libc::kill(-pgid, libc::SIGKILL);
         }
     }
+}
+
+/// Wait for a child that leads its own process group, settling the group in
+/// the order above: notice the exit without reaping, `SIGTERM` the group,
+/// reap, then the grace and the `SIGKILL`. What the launch loop does, for a
+/// test to drive on a child of its own.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn settle_and_reap(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
+    let pid = child.id();
+    while !exited_unreaped(pid)? {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    term_group(pid);
+    let status = child.wait()?;
+    finish_group(pid);
+    Ok(status)
 }
 
 fn drain<R: Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<Vec<u8>> {

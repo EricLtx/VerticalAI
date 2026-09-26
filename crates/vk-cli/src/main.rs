@@ -1327,8 +1327,21 @@ fn detach(cmd: &mut Command, state_dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // Its own process group: outside the terminal's foreground group.
-        cmd.process_group(0);
+        // Its own *session*, not only its own process group (SP1a review
+        // M7): `setsid` in the child leaves the terminal's session, so the
+        // `SIGHUP` the kernel sends to that session when the shell that ran
+        // `vk boot` closes never reaches the daemon. A new session is a new
+        // process group too.
+        // SAFETY: `setsid` is async-signal-safe and touches nothing of the
+        // parent's; it is the only call made between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
     Ok(())
 }
@@ -1491,4 +1504,34 @@ fn boot(cli: &Cli, rt: &tokio::runtime::Runtime, a: &BootArgs) -> Result<()> {
         }),
         render::booted,
     )
+}
+
+#[cfg(all(test, unix))]
+mod detach_tests {
+    use super::detach;
+    use std::process::Command;
+
+    /// A detached daemon leads its own **session**, not only its own process
+    /// group (SP1a review M7): `setsid` in the child, so the terminal's
+    /// `SIGHUP` — sent to the session when the shell that ran `vk boot`
+    /// closes — never reaches it. Read back from the child itself: `ps`
+    /// prints the session id, which is the child's own pid for a leader.
+    #[test]
+    fn a_detached_daemon_leads_its_own_session() {
+        let d = tempfile::tempdir().unwrap();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "ps -o sess= -p $$"]);
+        detach(&mut cmd, d.path()).unwrap();
+        let status = cmd.status().unwrap();
+        assert!(status.success(), "{status}");
+        let log = std::fs::read_to_string(d.path().join("vkd.log")).unwrap();
+        let sid: i32 = log
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("{e}: {log:?}"));
+        // SAFETY: `getsid(0)` reads this process's own session id.
+        let ours = unsafe { libc::getsid(0) };
+        assert_ne!(sid, ours, "the child must not be in this process's session");
+        assert!(sid > 0, "{sid}");
+    }
 }

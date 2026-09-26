@@ -1021,14 +1021,27 @@ pub mod os {
     /// us. The `0700` parent is also what closes the window between `bind`
     /// and the `0600` on the socket itself.
     fn private_dir(dir: &Path) -> Result<()> {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
         if !dir.exists() {
             std::fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
                 .create(dir)?;
         }
-        let mode = std::fs::metadata(dir)?.permissions().mode();
+        let meta = std::fs::metadata(dir)?;
+        // Ownership before mode (SP1a review M6): a `0700` directory of the
+        // same name that another account made would otherwise pass this and
+        // fail the bind with a message about permissions, when the fact is
+        // that the directory is not this user's.
+        // SAFETY: `geteuid` reads the process's effective uid and nothing else.
+        let me = unsafe { libc::geteuid() };
+        anyhow::ensure!(
+            meta.uid() == me,
+            "{} is owned by uid {}, not this user (uid {me}); refusing to listen there",
+            dir.display(),
+            meta.uid()
+        );
+        let mode = meta.permissions().mode();
         anyhow::ensure!(
             mode & 0o077 == 0,
             "{} is accessible by others; refusing to listen there",
@@ -1097,6 +1110,29 @@ pub mod os {
             let sock_mode = std::fs::metadata(&ep.0).unwrap().permissions().mode();
             assert_eq!(dir_mode & 0o777, 0o700);
             assert_eq!(sock_mode & 0o777, 0o600);
+        }
+
+        /// A socket directory another account made is "not yours" (review
+        /// M6), not a confusing chmod failure: `/tmp` is root's. Skipped as
+        /// root, where the directory would be the caller's own.
+        #[tokio::test]
+        async fn a_directory_owned_by_another_user_is_refused_by_name() {
+            // SAFETY: `geteuid` reads the process's effective uid and nothing else.
+            if unsafe { libc::geteuid() } == 0 {
+                eprintln!("running as root: skipped");
+                return;
+            }
+            let ep = Endpoint(format!(
+                "/tmp/vk-owner-test-{}.sock",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let Err(err) = bind(&ep).await else {
+                panic!("a socket directory owned by another user must not be listened in");
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("owned by uid 0"), "{msg}");
+            assert!(msg.contains("not this user"), "{msg}");
+            assert!(!Path::new(&ep.0).exists(), "nothing was bound there");
         }
 
         #[tokio::test]

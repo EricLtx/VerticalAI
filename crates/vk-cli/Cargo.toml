@@ -33,5 +33,10 @@ rpassword = "7"
 # that sees the key as a human typed it.
 zeroize = "1"
 
+# `setsid` between fork and exec, so a detached daemon leads its own session
+# (SP1a review M7).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
