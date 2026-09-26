@@ -247,6 +247,7 @@ impl ArchAdapter for ClaudeCodeAdapter {
         Ok(Completion {
             text: j.result,
             tokens_in_measured: Some(measured),
+            tokens_out: Some(u32::try_from(j.output_tokens).unwrap_or(u32::MAX)),
             cost_list_usd: Some(j.total_cost_usd),
             details: Some(serde_json::json!({
                 "input_uncached": j.input_tokens,

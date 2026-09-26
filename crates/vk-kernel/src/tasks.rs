@@ -259,6 +259,19 @@ fn remove_tree(dir: &Path, what: &str) {
     }
 }
 
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// A locality as the wire spells it (`on_prem`, not `OnPrem`), so the screen
+/// and `--json` name it the same way the manifest does.
+pub(crate) fn locality_name(l: vk_contracts::arch::Locality) -> String {
+    serde_json::to_value(l)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{l:?}"))
+}
+
 /// A status as the wire spells it (`waiting_human`, not `WaitingHuman`), so a
 /// refusal a person reads names the same state `vk ps` just showed them.
 fn status_name(s: TaskStatus) -> String {
@@ -298,6 +311,28 @@ pub struct TopView {
     /// *is*, and an arch with counters and no entry here has been unmounted.
     #[serde(default)]
     pub price_eur_per_1k: BTreeMap<String, Option<f64>>,
+    /// Where each mounted arch runs — `local`, `on_prem`, `peer`, `cloud` —
+    /// as its manifest declares it (SP1b Task 8). An operator reading this
+    /// screen is asking two things at once, what is this spending and what
+    /// is leaving the machine, and the second one has no other answer here.
+    #[serde(default)]
+    pub locality: BTreeMap<String, String>,
+    /// And under whose law the answer was produced: the manifest's
+    /// `jurisdiction`, which is what makes a €0.004 call on `US` a different
+    /// fact from the same call on `EU`.
+    #[serde(default)]
+    pub jurisdiction: BTreeMap<String, String>,
+    /// The per-call rows behind the counters, when the caller asked for them
+    /// (`vk top --calls`). Empty otherwise, and the newest few when asked
+    /// for: `top` is a screen, and a node that has run for a week has more
+    /// calls than a screen holds. `usage.ls` is the unbounded surface, for a
+    /// script that wants them all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<crate::UsageRow>,
+    /// How many there are in all, so the screen can say what it is not
+    /// showing rather than quietly ending.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub calls_total: usize,
     pub tasks: BTreeMap<String, TaskStatus>,
     pub stopped_scopes: Vec<String>,
     pub liveness: BTreeMap<String, u64>,
@@ -661,7 +696,14 @@ impl RealKernel {
             self.save_task(&t)?;
         }
         let kind = t.steps[i].kind.clone();
-        match self.run_step(ctx, task_id, &kind, &t.register, &t.artefact_type) {
+        // Which step is about to spend, for the usage row `infer` writes
+        // (SP1b Task 8). Set around this one call and cleared again below,
+        // whatever the step did: a stale value would attribute the next
+        // inference outside a task to the last step that ran.
+        self.usage_step = Some((task_id.to_string(), i));
+        let ran = self.run_step(ctx, task_id, &kind, &t.register, &t.artefact_type);
+        self.usage_step = None;
+        match ran {
             Ok((StepStatus::WaitingHuman, _)) => {
                 if was_waiting {
                     // Still waiting on the same human: nothing transitioned, so
@@ -1283,6 +1325,8 @@ impl RealKernel {
             v.governed.insert(id.clone(), m.governed);
             v.price_eur_per_1k
                 .insert(id.clone(), m.cost_per_1k_tokens_eur);
+            v.locality.insert(id.clone(), locality_name(m.locality));
+            v.jurisdiction.insert(id.clone(), m.jurisdiction.clone());
             v.states.insert(id.clone(), state.name().into());
             if let Some(why) = state.reason() {
                 v.unavailable.insert(id, why.into());
@@ -1901,6 +1945,36 @@ mod tests {
         );
         assert!(matches!(v.tasks[&id], TaskStatus::Done));
         assert!(v.stopped_scopes.is_empty());
+    }
+
+    /// Where the call went and under whose law it was answered, beside what it
+    /// cost (SP1b Task 8). An operator reading `vk top` is asking two
+    /// questions at once — what is this spending, and is any of it leaving the
+    /// Union — and a screen that answers only the first sends them to
+    /// `vk arch show` for every row.
+    #[test]
+    fn top_says_where_each_arch_is_and_under_whose_law() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let mut cloud = crate::tests::local_named("cloud", personal());
+        cloud.locality = vk_contracts::arch::Locality::Cloud;
+        cloud.jurisdiction = "US".into();
+        cloud.governed = false;
+        let cloud_id = k.register_arch(cloud);
+        let local_id = k.register_arch(crate::tests::local_named("here", personal()));
+
+        let v = k.top(&machine(0));
+        assert_eq!(v.locality[&cloud_id], "cloud");
+        assert_eq!(v.jurisdiction[&cloud_id], "US");
+        assert!(!v.governed[&cloud_id], "a cloud arch is not governed");
+        assert_eq!(v.locality[&local_id], "local");
+        assert_eq!(v.jurisdiction[&local_id], "FR");
+        // Never called, and still on the screen with a row of zeros: an
+        // operator must not have to run an arch to find out it is there.
+        assert_eq!(v.arches[&cloud_id].calls, 0);
+        assert_eq!(v.arches[&local_id].calls, 0);
+        // Nothing has been called, so there is nothing per-call to show.
+        assert!(v.calls.is_empty(), "{:?}", v.calls);
     }
 
     #[test]

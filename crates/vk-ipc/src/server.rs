@@ -136,6 +136,10 @@ const MAX_CHALLENGES: usize = 1024;
 /// Longest request line accepted. Longer, and the connection is dropped
 /// rather than buffered without bound.
 const MAX_LINE: usize = 1 << 20;
+/// How many per-call usage rows `top --calls` carries: the newest this many.
+/// `usage.ls` is unbounded, because a caller that names a task or an arch has
+/// already said how much it wants.
+const MAX_TOP_CALLS: usize = 200;
 /// Pause after a connection that could not be accepted, so a condition that
 /// is not ours to fix (a burst past the descriptor limit, say) is not spun on.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
@@ -446,6 +450,9 @@ fn takes_presence(method: &str) -> bool {
             // `dispatch` (fix round 1, Critical 1). Local kinds take a proof
             // and ignore it, as `task.step` does.
             | "arch.mount"
+            // Reading every blob on the node, and overriding its store's own
+            // refusal, are human acts (SP1b Task 8).
+            | "store.fsck"
     )
 }
 
@@ -815,6 +822,77 @@ fn dispatch(
                 "already_mounted": outcome.already_mounted,
             }))
         }
+        // One arch in full: the manifest `arch.ls` already carries, plus the
+        // two things a listing has no room for — the identity tuple that
+        // *is* the arch id, and the spec the next boot would make it from.
+        // No new information leaves the node: the manifest is public over
+        // `arch.ls`, and a mount spec is refused at the door if it carries
+        // anything credential-shaped (`MountSpec::new`).
+        "arch.show" => {
+            let id = p["arch_id"].as_str().ok_or_else(|| bad("arch_id"))?;
+            let (arch_id, manifest, state) = k
+                .arch_states()
+                .into_iter()
+                .find(|(a, _, _)| a == id)
+                .ok_or_else(|| not_found(id))?;
+            let spec = k.mount_spec(&arch_id);
+            Ok(json!({
+                "arch_id": arch_id,
+                "manifest": manifest,
+                "state": state.name(),
+                "reason": state.reason(),
+                "governed": manifest.governed,
+                "kind": spec.as_ref().map(|s| s.kind.clone()),
+                "config": spec.map(|s| s.config),
+            }))
+        }
+        // The per-call rows behind the counters (SP1b Task 8, ruling 8).
+        // Metadata only — ids, counts, a duration — and filtered by the
+        // caller's clearance through the task each row names, so a row about
+        // a register this caller may not read is not listed (I2).
+        "usage.ls" => {
+            let ctx = ctx_for(&k, presence, now)?;
+            let filter = match (p["task_id"].as_str(), p["arch_id"].as_str()) {
+                (Some(_), Some(_)) => {
+                    return Err(bad("usage.ls takes task_id or arch_id, not both"))
+                }
+                (Some(t), None) => vk_kernel::UsageFilter::Task(t.into()),
+                (None, Some(a)) => vk_kernel::UsageFilter::Arch(a.into()),
+                (None, None) => vk_kernel::UsageFilter::All,
+            };
+            k.usage(&ctx, &filter).map_err(kerr).and_then(to_value)
+        }
+        // `vk fsck`: the whole store verified, tier by tier — and, with
+        // `rebase_head`, the one write in it.
+        //
+        // A **human act**, like `stop` and `approve`: this reads every blob
+        // on the node and, on the rebase path, overrides the store's own
+        // refusal to serve a record whose tail is gone. Neither is a thing a
+        // machine principal with the pipe may do (invariant I1), so the same
+        // presence proof those verbs carry is required here. The typed
+        // confirmation of the word `rebase` is the client's half of the
+        // ceremony; this end checks the proof.
+        "store.fsck" => {
+            let ctx = ctx_for(&k, presence, now)?;
+            if !ctx.principal.is_human() {
+                return Err(invariant(
+                    "I1: fsck reads every blob this node holds, and --rebase-head overrides its \
+                     store's own refusal; both are human acts. Re-run with a presence proof",
+                ));
+            }
+            let rebased = if p["rebase_head"] == Value::Bool(true) {
+                Some(k.rebase_ledger_head(now).map_err(kerr)?)
+            } else {
+                None
+            };
+            // After the rebase, so the report is the store as it now is
+            // rather than the store the operator has just repaired.
+            let mut out = to_value(k.fsck())?;
+            if let (Some(o), Some(r)) = (out.as_object_mut(), rebased) {
+                o.insert("rebased".into(), to_value(r)?);
+            }
+            Ok(out)
+        }
         "arch.unmount" => {
             let id = p["arch_id"].as_str().ok_or_else(|| bad("arch_id"))?;
             let removed = k.unmount(id).map_err(|e| RpcError {
@@ -830,7 +908,10 @@ fn dispatch(
             // process, and every other syscall can proceed while it winds up.
             drop(k);
             drop(removed);
-            Ok(json!({ "ok": true }))
+            // The id, back to the caller: `vk umount` prints what it took
+            // away rather than a bare "ok" a reader has to match up with the
+            // argument they typed.
+            Ok(json!({ "ok": true, "arch_id": id }))
         }
         // The harness's own syscalls (SP1b Task 4). Each carries the lease token
         // `vk-mcp` was launched with; the kernel maps it to the harness principal
@@ -933,9 +1014,17 @@ fn dispatch(
             let id = p["task_id"].as_str().ok_or_else(|| bad("task_id"))?;
             let task = k.task(&ctx, id).ok_or_else(|| not_found(id))?;
             let decisions = k.task_decisions(&ctx, &task).map_err(kerr)?;
+            // And what each step spent (SP1b Task 8): the same rows
+            // `usage.ls` and `vk top --calls` serve, narrowed to this task,
+            // so the screen that shows a step's tokens also shows what came
+            // back and what it cost.
+            let usage = k
+                .usage(&ctx, &vk_kernel::UsageFilter::Task(id.into()))
+                .map_err(kerr)?;
             let mut out = to_value(task)?;
             if let Some(o) = out.as_object_mut() {
                 o.insert("decisions".into(), to_value(decisions)?);
+                o.insert("usage".into(), to_value(usage)?);
             }
             Ok(out)
         }
@@ -943,9 +1032,25 @@ fn dispatch(
             let ctx = ctx_for(&k, presence, now)?;
             to_value(k.tasks(&ctx))
         }
+        // The operator's screen. `calls: true` (`vk top --calls`) folds the
+        // per-call rows in beside the totals they add up to — one syscall,
+        // one answer, and the same I2 filter on both halves.
         "top" => {
             let ctx = ctx_for(&k, presence, now)?;
-            to_value(k.top(&ctx))
+            let mut view = k.top(&ctx);
+            if p["calls"] == Value::Bool(true) {
+                let mut rows = k.usage(&ctx, &vk_kernel::UsageFilter::All).map_err(kerr)?;
+                // The newest `MAX_TOP_CALLS`, not all of them: a node that
+                // has run for a week has more calls than a screen holds, and
+                // an answer nobody can read is not an answer. `usage.ls` is
+                // the surface for a caller that wants every row.
+                view.calls_total = rows.len();
+                if rows.len() > MAX_TOP_CALLS {
+                    rows.drain(..rows.len() - MAX_TOP_CALLS);
+                }
+                view.calls = rows;
+            }
+            to_value(view)
         }
         "stop" => {
             let ctx = ctx_for(&k, presence, now)?;
@@ -1678,6 +1783,25 @@ fn harness_run(kernel: &Shared, config: &ServerConfig, p: Value) -> Result<Value
         .map(|s| serde_json::to_value(&s.status).unwrap_or(Value::Null))
         .unwrap_or(Value::Null);
     let outcome = run.outcome.as_ref();
+    // What the session spent, filed with every other call this node made
+    // (SP1b Task 8). A harness is not an arch, but its money is the node's:
+    // without this row, a node whose only real work goes through a harness
+    // reports having spent nothing. Best effort and after the settle — a run
+    // that printed no result object has nothing to record, and a bookkeeping
+    // failure must not undo a step that is already done.
+    if let Some(o) = outcome {
+        if let Err(e) = k.record_harness_usage(&vk_kernel::HarnessUsage {
+            name: &name,
+            task_id: &task_id,
+            step_index: launch_plan.step_index,
+            tokens_in: o.tokens_in,
+            tokens_out: o.tokens_out,
+            cost_list_usd: Some(o.total_cost_usd),
+            duration_ms: run.duration_ms,
+        }) {
+            tracing::warn!(task = %task_id, error = %e, "the harness run's usage was not recorded");
+        }
+    }
     Ok(json!({
         "task_id": task.id,
         "status": serde_json::to_value(task.status).unwrap_or(Value::Null),

@@ -188,11 +188,14 @@ Two things that run exposes, in case they surprise you:
   register's *artefacts* and writes no decision, so the judge's prompt carries
   only the plan, and it judges the plan. In the arch path the draft *is* a
   decision, so the judge sees it.
-- **A harness run's model usage is not in `vk top`.** The harness is an agent,
-  not an arch, so nothing bumps the per-arch counters: both Claude arches
-  still read `calls: 0` after a harness run. The run itself is on the ledger
-  (`lease.granted`, `harness.connections`), but its cost is not on the screen
-  that exists for cost.
+- **A harness run's model usage was not in `vk top`** in the recorded runs.
+  The harness is an agent, not an arch, so nothing bumped the per-arch
+  counters: both Claude arches read `calls: 0` after a harness run, and the
+  cost of the run was not on the screen that exists for cost. Fixed since
+  (SP1b Task 8): a settled harness run records what its session spent, under
+  the pseudo-arch `harness:claude-code`, so a fresh run shows it in `vk top`
+  and `vk top --calls` names the step that spent it. The runs under
+  `runs/2026-09-25/` predate that and still read `calls: 0`.
 
 ## What is recorded, and where
 
@@ -219,10 +222,11 @@ the payload** — `payload_hash`, spec §3.9, "commits to ciphertext, never to
 plaintext". So no number appears in `vk dmesg` and none can: what `dmesg` holds
 is the *commitment* to it. The numbers themselves are read from
 `vk task show` (per call) and `vk top` (per arch), which is where the saved
-records carry them. Output tokens (`eval_count`,
-`output_tokens`) are inside that hashed payload and are not on any read
-surface today; if they should be, that is a kernel change and not a script's
-to make.
+records carry them. Output tokens (`eval_count`, `output_tokens`) were inside
+that hashed payload and on no read surface when these runs were recorded; a
+per-call `usage` row now carries them (SP1b Task 8), so `vk task show` prints
+an `OUT` column and `vk top --calls` a row per call. The saved
+`*-task.json` and `*-top.json` predate it and have neither.
 
 The per-call durations in the step table come off the chain rather than off
 the script's clock: the two `infer` events of one call are stamped with the

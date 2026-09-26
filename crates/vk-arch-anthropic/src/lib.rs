@@ -856,6 +856,7 @@ impl ArchAdapter for AnthropicAdapter {
             // The provider counted the prompt; the pre-check above only had
             // to decide whether to make the call.
             tokens_in_measured: Some(tokens_in),
+            tokens_out: Some(tokens_out),
             cost_list_usd: Self::cost_list_usd(&self.cfg.model, tokens_in, tokens_out),
             details: Some(serde_json::json!({
                 "input_tokens": tokens_in,

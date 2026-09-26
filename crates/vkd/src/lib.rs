@@ -455,6 +455,19 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
              previous run was appending when it stopped is not in the record"
         );
     }
+    // Somebody re-recorded where this node's record ends, by hand, since the
+    // last boot (`vk fsck --rebase-head --force`). The `boot` event's payload
+    // already commits to it — that is the durable half — and this is the line
+    // an operator reading the log finds without being told to look for it.
+    if let Some(r) = &report.fsck {
+        tracing::warn!(
+            rebased_from = ?r.rebased_from.as_ref().map(|h| h.seq),
+            rebased_to = r.rebased_to.seq,
+            at_ms = r.at,
+            "the recorded ledger head was rebased by hand before this boot; this boot's event \
+             names both heads"
+        );
+    }
     // A node whose record does not verify may still be looked at — `boot`
     // appended its event and `vk dmesg` reads the file — but it does not serve
     // syscalls, because everything it would append chains onto a record that is

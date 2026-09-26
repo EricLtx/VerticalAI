@@ -392,6 +392,7 @@ mod client {
             Ok(Completion {
                 text,
                 tokens_in_measured: Some(tokens_in),
+                tokens_out: Some(tokens_out),
                 // AWS prices Bedrock, not Anthropic, and this node has not
                 // read that list. `None` rather than a figure from the wrong
                 // table.

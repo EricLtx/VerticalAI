@@ -79,6 +79,29 @@ impl Shell {
             .expect("run vk")
     }
 
+    /// The same, with something on stdin: `vk fsck --rebase-head` reads the
+    /// typed confirmation from there, and a test types it the way a person
+    /// would.
+    fn run_with_stdin(&self, args: &[&str], input: &str) -> Output {
+        let mut child = Command::new(vk_exe())
+            .args(args)
+            .env("VK_ENDPOINT", &self.endpoint)
+            .env("VK_NODE_KEY_FILE", &self.node_key)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run vk");
+        use std::io::Write as _;
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(input.as_bytes())
+            .expect("write the confirmation");
+        child.wait_with_output().expect("vk")
+    }
+
     fn ok(&self, args: &[&str]) -> String {
         let o = self.run(args);
         assert!(
@@ -255,6 +278,334 @@ fn the_vk_shell_drives_a_task_from_mount_to_release() {
     assert_eq!(tail.as_array().expect("events").len(), 5, "{tail}");
 }
 
+/// The shell verbs an operator uses on the arches themselves and on the store
+/// under them: mount one, read it in full, take it away again, and verify
+/// everything the node holds.
+///
+/// `vk fsck` is the point of this test. `vk ledger verify` answers one
+/// question — does the chain recompute — and a node can pass it with every
+/// blob on disk unreadable; this is the whole store, tier by tier, and a
+/// healthy one must come back green with counts that say what was looked at.
+#[test]
+fn vk_arch_show_umount_and_fsck_cover_the_arches_and_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let node_key = dir.path().join("node.key");
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let sh = Shell { endpoint, node_key };
+    wait_until(&sh, true, "vkd did not answer").expect("status");
+
+    let arch = str_of(
+        &sh.json(&["mount", "mock", "m1", "--ctx", "4096", "--json"]),
+        "arch_id",
+    )
+    .to_string();
+
+    // `vk arch show`: the manifest, the state, and the two things a listing
+    // has no room for — the identity tuple the arch id hashes, and the
+    // clearance the arch may be handed.
+    let shown = sh.json(&["arch", "show", &arch, "--json"]);
+    assert_eq!(str_of(&shown, "arch_id"), arch, "{shown}");
+    assert_eq!(str_of(&shown, "state"), "ready", "{shown}");
+    assert_eq!(str_of(&shown, "kind"), "mock", "{shown}");
+    assert!(
+        shown["manifest"]["identity"]["engine"].is_string(),
+        "the identity tuple is on the answer: {shown}"
+    );
+    assert!(
+        shown["manifest"]["clearance"]["max_scope"].is_string(),
+        "{shown}"
+    );
+    let page = sh.ok(&["arch", "show", &arch]);
+    for named in [arch.as_str(), "identity", "clearance", "ready"] {
+        assert!(page.contains(named), "{named} missing from:\n{page}");
+    }
+    // An id nobody mounted is not found, rather than an empty page.
+    assert!(!sh.run(&["arch", "show", "sha256:nope"]).status.success());
+
+    // A task, so the store has a blob, a register and a task row to verify.
+    let task = str_of(
+        &sh.json(&[
+            "task",
+            "submit",
+            "--goal",
+            "Draft a note",
+            "--plan",
+            &arch,
+            "--draft",
+            &arch,
+            "--json",
+        ]),
+        "id",
+    )
+    .to_string();
+    assert_eq!(
+        sh.json(&["task", "step", &task, "--all", "--json"])["status"],
+        "done"
+    );
+
+    // The whole store, green, with the tiers named and counted.
+    let report = sh.json(&["fsck", "--json"]);
+    assert_eq!(report["ok"], true, "{report}");
+    let tiers: std::collections::BTreeMap<String, Value> = report["tiers"]
+        .as_array()
+        .expect("tiers")
+        .iter()
+        .map(|t| (str_of(t, "tier").to_string(), t.clone()))
+        .collect();
+    for named in ["ledger", "head", "blobs", "keys", "mounts"] {
+        let t = tiers
+            .get(named)
+            .unwrap_or_else(|| panic!("no {named} tier in {report}"));
+        assert_eq!(t["ok"], true, "{named}: {t}");
+    }
+    assert!(
+        tiers["ledger"]["checked"].as_u64().unwrap_or(0) > 0,
+        "the chain was actually walked: {report}"
+    );
+    assert!(
+        tiers["blobs"]["checked"].as_u64().unwrap_or(0) > 0,
+        "the task left a blob and it was actually opened: {report}"
+    );
+    assert_eq!(tiers["mounts"]["checked"], 1, "{report}");
+    let screen = sh.ok(&["fsck"]);
+    assert!(screen.contains("the store verifies"), "{screen}");
+    assert!(screen.contains("TIER"), "{screen}");
+
+    // And `vk umount` says what it took away, after which the arch is gone
+    // from every listing and `fsck` counts one mount fewer.
+    let gone = sh.ok(&["umount", &arch]);
+    assert!(gone.contains(&arch), "{gone}");
+    assert!(!sh.ok(&["ls", "/arches"]).contains(&arch));
+    let report = sh.json(&["fsck", "--json"]);
+    assert_eq!(report["ok"], true, "{report}");
+}
+
+/// A record whose tail was cut — what a restore of an older copy of the
+/// segment leaves, and what a tail somebody deleted leaves: the same bytes.
+/// `vk fsck` says which tier failed and exits non-zero; `--rebase-head
+/// --force`, with the word typed out, is the documented way back, and it is
+/// on the record afterwards.
+#[test]
+fn vk_fsck_reports_a_cut_record_and_the_typed_rebase_is_the_way_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let sh = Shell {
+        endpoint: endpoint.clone(),
+        node_key: dir.path().join("node.key"),
+    };
+    {
+        let _daemon = Daemon(
+            vkd_cmd(dir.path(), &endpoint, &[])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn vkd"),
+        );
+        wait_until(&sh, true, "vkd never answered").expect("status");
+        sh.ok(&["mount", "mock", "m1", "--ctx", "4096"]);
+        sh.ok(&["stop"]);
+    }
+    wait_until(&sh, false, "the killed daemon still holds the endpoint");
+    cut_ledger_tail(dir.path());
+
+    // The node will not serve a cut record, so `fsck` is reached the way an
+    // operator reaches it: under --force, which is what --force is for.
+    let _forced = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &["--force"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    wait_until(&sh, true, "--force did not start a daemon").expect("status");
+
+    let refused = sh.run(&["fsck"]);
+    assert!(
+        !refused.status.success(),
+        "a store that does not verify must exit non-zero"
+    );
+    let screen = String::from_utf8_lossy(&refused.stdout).to_string();
+    assert!(screen.contains("FAILED"), "{screen}");
+    assert!(
+        screen.contains("head: the record no longer contains"),
+        "the failing tier and its reason belong on the screen:\n{screen}"
+    );
+    assert!(
+        screen.contains("--rebase-head"),
+        "and the way back:\n{screen}"
+    );
+    // The chain that is left still links: this is a head failure, not a
+    // rewritten record, and the two must not read the same.
+    let report: Value = serde_json::from_slice(&sh.run(&["fsck", "--json"]).stdout).expect("json");
+    let tier = |name: &str| {
+        report["tiers"]
+            .as_array()
+            .expect("tiers")
+            .iter()
+            .find(|t| t["tier"] == name)
+            .unwrap_or_else(|| panic!("no {name} tier in {report}"))
+            .clone()
+    };
+    assert_eq!(report["ok"], false, "{report}");
+    assert_eq!(tier("ledger")["ok"], true, "{report}");
+    assert_eq!(tier("head")["ok"], false, "{report}");
+
+    // A flag is not a confirmation: the word has to be typed, and anything
+    // else leaves the head exactly where it was.
+    let mistyped = sh.run_with_stdin(&["fsck", "--rebase-head", "--force"], "yes\n");
+    assert!(!mistyped.status.success(), "a mistyped word must refuse");
+    let why = String::from_utf8_lossy(&mistyped.stderr);
+    assert!(why.contains("not confirmed"), "{why}");
+    let report: Value = serde_json::from_slice(&sh.run(&["fsck", "--json"]).stdout).expect("json");
+    assert_eq!(report["ok"], false, "the head was not touched: {report}");
+
+    // Typed out: the head moves, both ends are named, and the store verifies.
+    let done = sh.run_with_stdin(&["fsck", "--rebase-head", "--force"], "rebase\n");
+    let screen = String::from_utf8_lossy(&done.stdout).to_string();
+    assert!(
+        done.status.success(),
+        "{screen}{}",
+        String::from_utf8_lossy(&done.stderr)
+    );
+    assert!(screen.contains("the store verifies"), "{screen}");
+    assert!(
+        screen.contains("the recorded ledger head was moved"),
+        "{screen}"
+    );
+    drop(_forced);
+    wait_until(&sh, false, "the killed daemon still holds the endpoint");
+
+    // And the node serves again without --force, because the record and the
+    // head now agree. The override is in what that boot said, beside the
+    // `boot` event whose payload commits to it.
+    let log_path = dir.path().join("boot.log");
+    let log_file = std::fs::File::create(&log_path).expect("a log to read back");
+    let _again = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            // The daemon's own log goes to stdout (`vkd::init_tracing`), and
+            // `vk boot` is what usually redirects it into `vkd.log`; here the
+            // test does the redirecting, because the daemon was spawned
+            // directly.
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let status = wait_until(&sh, true, "the rebased node did not serve").expect("status");
+    assert_eq!(status["ledger_ok"], true, "{status}");
+    assert_eq!(status["forced"], false, "{status}");
+    let log = std::fs::read_to_string(&log_path).expect("the boot log");
+    assert!(
+        log.contains("rebased by hand"),
+        "the boot that followed the rebase says so:\n{log}"
+    );
+    assert_eq!(sh.json(&["fsck", "--json"])["ok"], true);
+}
+
+/// A blob whose bytes are not what its address says — a `.bin` restored from
+/// the wrong backup, a flipped byte on a failing disk. Nothing else on the
+/// node notices until somebody reads that one artefact; `fsck` reads all of
+/// them.
+#[test]
+fn vk_fsck_finds_a_tampered_blob_and_exits_non_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = vk_ipc::transport::test_endpoint().0;
+    let sh = Shell {
+        endpoint: endpoint.clone(),
+        node_key: dir.path().join("node.key"),
+    };
+    {
+        let _daemon = Daemon(
+            vkd_cmd(dir.path(), &endpoint, &[])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn vkd"),
+        );
+        wait_until(&sh, true, "vkd never answered").expect("status");
+        let arch = str_of(
+            &sh.json(&["mount", "mock", "m1", "--ctx", "4096", "--json"]),
+            "arch_id",
+        )
+        .to_string();
+        let task = str_of(
+            &sh.json(&[
+                "task",
+                "submit",
+                "--goal",
+                "Draft a note",
+                "--plan",
+                &arch,
+                "--draft",
+                &arch,
+                "--json",
+            ]),
+            "id",
+        )
+        .to_string();
+        assert_eq!(
+            sh.json(&["task", "step", &task, "--all", "--json"])["status"],
+            "done"
+        );
+        assert_eq!(sh.json(&["fsck", "--json"])["ok"], true);
+    }
+    wait_until(&sh, false, "the killed daemon still holds the endpoint");
+
+    // One ciphertext byte flipped, with the node gone — as a bad restore or
+    // a failing disk would leave it.
+    let blobs = dir.path().join("blobs");
+    let bin = std::fs::read_dir(&blobs)
+        .expect("a blob directory")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|e| e == "bin"))
+        .expect("the task left a blob");
+    let mut bytes = std::fs::read(&bin).expect("read the blob");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&bin, bytes).expect("write the blob");
+
+    // The node still boots — a damaged blob is not a damaged chain — and
+    // that is exactly why `fsck` has to be the thing that finds it.
+    let _daemon = Daemon(
+        vkd_cmd(dir.path(), &endpoint, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vkd"),
+    );
+    let status = wait_until(&sh, true, "vkd did not answer").expect("status");
+    assert_eq!(
+        status["ledger_ok"], true,
+        "the record is untouched; the payload tier is not: {status}"
+    );
+    assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
+
+    let refused = sh.run(&["fsck"]);
+    assert!(!refused.status.success(), "a damaged blob must exit 1");
+    let screen = String::from_utf8_lossy(&refused.stdout).to_string();
+    assert!(screen.contains("FAILED"), "{screen}");
+    assert!(
+        screen.contains("blobs: sha256:") && screen.contains("integrity"),
+        "the failing blob is named, by address:\n{screen}"
+    );
+    let report: Value = serde_json::from_slice(&sh.run(&["fsck", "--json"]).stdout).expect("json");
+    assert_eq!(report["ok"], false, "{report}");
+    for t in report["tiers"].as_array().expect("tiers") {
+        let expected = t["tier"] != "blobs";
+        assert_eq!(
+            t["ok"], expected,
+            "only the payload tier is damaged: {report}"
+        );
+    }
+}
+
 /// A scripted stand-in for `claude` at `dir/fake-claude.{cmd,sh}`: it answers
 /// `--version`, swallows the prompt on stdin and prints one canned result
 /// object. Enough for `vk mount claude-code --bin` to mount a real adapter and
@@ -391,6 +742,14 @@ fn vk_mounts_two_claude_code_arches_and_a_task_runs_through_one() {
     let cost = stats["cost_list_usd"].as_f64().unwrap_or_default();
     assert!((cost - 0.004).abs() < 1e-9, "{top}");
 
+    // A cloud arch says so, and says under whose law it answered, on the
+    // same row as what it cost (SP1b Task 8).
+    assert_eq!(top["locality"][&draft], "cloud", "{top}");
+    assert_eq!(top["jurisdiction"][&draft], "US", "{top}");
+    // The judge arch was never called, and is on the screen all the same:
+    // an operator must not have to run an arch to find out it is mounted.
+    assert_eq!(top["arches"][&judge]["calls"], 0, "{top}");
+
     // And a person reading `vk top` sees both, not only the hash of them.
     let screen = sh.ok(&["top"]);
     assert!(
@@ -398,9 +757,52 @@ fn vk_mounts_two_claude_code_arches_and_a_task_runs_through_one() {
         "{screen}"
     );
     assert!(
+        screen.contains("LOCALITY") && screen.contains("JURISDICTION"),
+        "{screen}"
+    );
+    assert!(
         screen.contains("0.00400"),
         "the cost belongs on the screen:\n{screen}"
     );
+    assert!(
+        screen.lines().any(|l| l.starts_with(&judge)),
+        "the never-called arch has a row of its own:\n{screen}"
+    );
+
+    // `--calls`: the rows behind the totals, each naming the step that spent
+    // it — which the totals alone can never say (ruling 8).
+    let calls = sh.json(&["top", "--calls", "--json"]);
+    let rows = calls["calls"].as_array().expect("calls");
+    assert_eq!(rows.len(), 2, "one row per completed call: {calls}");
+    for r in rows {
+        assert_eq!(str_of(r, "arch_id"), draft, "{r}");
+        assert_eq!(str_of(r, "task_id"), task, "{r}");
+        assert_eq!(r["tokens_in_measured"], 7 + 11 + 23, "{r}");
+        assert_eq!(r["tokens_out"], 5, "{r}");
+    }
+    assert_eq!(
+        rows.iter().map(|r| &r["step_index"]).collect::<Vec<_>>(),
+        [&serde_json::json!(0), &serde_json::json!(1)],
+        "in the order the steps ran: {calls}"
+    );
+    let screen = sh.ok(&["top", "--calls"]);
+    assert!(
+        screen.contains("CALL") && screen.contains(&task),
+        "{screen}"
+    );
+
+    // And the task's own screen carries what each of its steps returned and
+    // cost, beside the tokens it sent.
+    let shown = sh.json(&["task", "show", &task, "--json"]);
+    assert_eq!(
+        shown["usage"].as_array().expect("usage").len(),
+        2,
+        "{shown}"
+    );
+    let page = sh.ok(&["task", "show", &task]);
+    assert!(page.contains("OUT") && page.contains("COST"), "{page}");
+    assert!(page.contains("0.00200"), "{page}");
+
     assert_eq!(sh.json(&["ledger", "verify", "--json"])["ok"], true);
 }
 

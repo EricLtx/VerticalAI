@@ -58,15 +58,17 @@ table or, with `--json`, as the daemon's own answer.
 | `vk boot [--force]` | `init`: start `vkd` over a state directory and wait until it answers |
 | `vk status` | `uname`: what this node is, and what its boot sequence found |
 | `vk ls PATH` | the namespace: `/arches`, `/tasks`, `/artefacts`, `/devices`, `/ledger` as directories |
-| `vk ps`, `vk top` | the scheduler: what every task is doing, what each arch has cost |
+| `vk ps`, `vk top [--calls]` | the scheduler: what every task is doing, and per arch where it runs, under whose law, whether this kernel governs it, its calls, tokens, measured tokens and cost — `--calls` adds one row per call, naming the step that spent it |
 | `vk mount mock NAME`, `vk mount claude-code`, `vk mount anthropic`, `vk mount bedrock`, `vk mount ollama --model TAG`, `vk umount ID` | drivers: an arch is a device this kernel drives — and, for `ollama`, a process it starts and caps |
+| `vk arch show ID` | one arch in full: its manifest, the identity tuple the arch id hashes, the clearance it may be handed, and what the next boot would make it from |
 | `vk secret set NAME` | the credential store: a secret this node's daemon reads, put in this account's OS keyring without ever being echoed or printed |
 | `vk task submit` / `step` / `show` | processes: a task is the unit of work, its register is its address space |
 | `vk stop [SCOPE]`, `vk resume ID` | signals: a STOP halts a scope until a human lifts it |
 | `vk approve ID [--passkey]` | the human ceremony: an approval of a kernel-minted challenge, signed by this node's device key or by a passkey in the browser (invariant I1) |
 | `vk passkey enroll [--open]`, `vk passkey ls` | the human's own device: a passkey (Windows Hello, a phone) enrolled through the browser |
 | `vk dmesg -n N` | the kernel ring buffer: the tail of the hash-chained ledger |
-| `vk ledger verify` | `fsck` for the record |
+| `vk ledger verify` | `fsck` for the record: does the hash chain recompute |
+| `vk fsck [--json]` | `fsck` for the **whole store**: the chain, the recorded head, every blob against its own address, every wrapped key, and the mounts. Exits non-zero if any tier fails |
 | `vk man [NAME]` | the contracts this kernel speaks — the syscall ABI, out of `contracts/schemas/` |
 
 ### Arches: this machine's Claude, and a customer's
@@ -306,6 +308,66 @@ refused comes back with the daemon's own last words, not with a timeout.
 Serving under `--force` is itself on the record: the daemon appends a
 `boot.forced` event naming the verdict it overrode, and `vk status` marks the
 node `forced boot`, next to the chain line, for as long as that process runs.
+
+### Verifying the store
+
+`vk ledger verify` answers one question: does the hash chain recompute. A node
+can pass it with every blob on disk unreadable, every wrapped key stale and
+every arch unmountable — so `vk fsck` asks the other questions, over the whole
+store, and prints one line per tier:
+
+```
+$ vk fsck
+TIER    VERDICT  CHECKED  FAILED
+ledger  ok       412      0
+head    ok       1        0
+blobs   ok       57 (2 skipped)  0
+keys    ok       9        0
+mounts  ok       3        0
+
+the store verifies
+```
+
+| tier | what it checks | what a failure means |
+|---|---|---|
+| `ledger` | every link and every hash recomputes; the first event that does not is named | a line was rewritten since this node wrote it |
+| `head` | the chain still reaches the head this store last recorded | the tail was cut — by a restore, or by somebody |
+| `blobs` | every blob opens **at the address it is filed under**: the envelope names it, the AEAD tag binds the ciphertext to it, and the plaintext derives it again | a `.bin` was swapped, restored from the wrong copy, or has a flipped byte |
+| `keys` | every wrapped DEK still unwraps under the master key | the keyring entry or key file is not the one the blobs were written with |
+| `mounts` | every mounted arch still has the spec the next boot would make it from | that arch comes back `unavailable` at the next restart |
+
+A shredded subject is **skipped**, not failed: its DEK was deleted on purpose
+and its ciphertext is meant to stay unreadable for ever.
+
+`vk fsck` exits non-zero if any tier fails, so `vk fsck && …` gates on it, and
+`vk fsck --json` is the whole report for a script. Reading every blob on the
+node is a human act, so the call carries a presence proof by this node's device
+key, exactly as `vk stop` and `vk approve` do.
+
+**Recovering after a legitimate restore.** Restoring an older copy of the
+ledger segment leaves a record that links perfectly and is *shorter* than the
+head this store recorded — which is byte for byte what a tail somebody cut
+looks like. The node cannot tell them apart and refuses to serve on either
+(`vkd --force` serves anyway, and says so). When it was your restore:
+
+```
+$ vk boot --force            # so the node serves and vk can reach it
+$ vk fsck                    # head: FAILED — confirm this is the restore you made
+$ vk fsck --rebase-head --force
+Type `rebase` to confirm: rebase
+```
+
+The word is typed out, on the client, before any syscall is made; `--yes`
+takes it as given for a script. The head is re-recorded from the record as it
+now stands, and the node serves without `--force` from then on. Two refusals
+guard it: a chain that does not itself verify is **not** rebased — re-recording
+a head onto a record known to be rewritten would only make the next open call
+it intact — and neither is an empty record.
+
+The override goes on the record. There is no new event kind for it: the next
+`boot` event's payload is that boot's report, and the report names both heads
+and when the rebase was done, the same way `boot.forced` names the verdict a
+`--force` overrode.
 
 ### The SP1 demo
 

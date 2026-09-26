@@ -64,7 +64,12 @@ enum Cmd {
     /// Tasks and how far each has got.
     Ps,
     /// Per-arch calls and tokens, stopped scopes, liveness.
-    Top,
+    Top {
+        /// Also list every call behind those totals: which arch, which task's
+        /// which step, what came back and what it cost.
+        #[arg(long)]
+        calls: bool,
+    },
     /// Mount an arch.
     Mount {
         #[command(subcommand)]
@@ -72,6 +77,11 @@ enum Cmd {
     },
     /// Unmount an arch by id.
     Umount { arch_id: String },
+    /// One arch in full: its manifest, its identity tuple and its clearance.
+    Arch {
+        #[command(subcommand)]
+        what: ArchCmd,
+    },
     /// Submit, step and inspect tasks.
     Task {
         #[command(subcommand)]
@@ -123,6 +133,36 @@ enum Cmd {
     Ledger {
         #[command(subcommand)]
         what: LedgerCmd,
+    },
+    /// Verify the whole store: the chain, the recorded head, every blob
+    /// against its own address, every wrapped key, and the mounts.
+    ///
+    /// `vk ledger verify` answers one question — does the chain recompute.
+    /// This answers whether the state this node says it has is the state it
+    /// has. Exits non-zero if any tier fails, so a script can gate on it.
+    ///
+    /// A human act, like `stop` and `approve`: it reads every blob on the
+    /// node, so it is signed with this node's device key.
+    Fsck {
+        /// Re-record the ledger head from the record as it is on disk.
+        ///
+        /// **The recovery path after a legitimate restore**, and nothing
+        /// else. A restored backup is a shorter record than the one this
+        /// store last wrote, which is the same shape as a tail somebody cut
+        /// — the node cannot tell them apart and refuses to serve on either.
+        /// This is a human saying which it was, and it goes on the record:
+        /// the next `boot` event's report names both heads.
+        ///
+        /// Needs `--force` and the word `rebase` typed at the prompt.
+        #[arg(long, requires = "force")]
+        rebase_head: bool,
+        /// Required beside `--rebase-head`. On its own it does nothing.
+        #[arg(long)]
+        force: bool,
+        /// Take the typed confirmation as given, for scripts. The ceremony
+        /// is still a presence proof by this node's device key.
+        #[arg(long, requires = "rebase_head")]
+        yes: bool,
     },
     /// The contracts this kernel speaks: no name lists them, a name renders
     /// one. Needs no daemon — the schemas are in this binary.
@@ -403,6 +443,14 @@ enum HarnessCmd {
 }
 
 #[derive(Subcommand)]
+enum ArchCmd {
+    /// One arch in full, by id: what it is, whether it would answer a prompt,
+    /// the identity tuple the arch id hashes, the clearance it may be handed,
+    /// and what the next boot would make it from.
+    Show { arch_id: String },
+}
+
+#[derive(Subcommand)]
 enum LedgerCmd {
     /// Verify the hash chain.
     Verify,
@@ -550,7 +598,11 @@ async fn call(cli: &Cli) -> Result<()> {
             render::ls,
         ),
         Cmd::Ps => show(cli, c.call("task.ls", json!({}), None).await?, render::ps),
-        Cmd::Top => show(cli, c.call("top", json!({}), None).await?, render::top),
+        Cmd::Top { calls } => show(
+            cli,
+            c.call("top", json!({ "calls": calls }), None).await?,
+            render::top,
+        ),
         Cmd::Mount {
             what: MountCmd::Mock { name, ctx },
         } => show(
@@ -745,7 +797,15 @@ async fn call(cli: &Cli) -> Result<()> {
             cli,
             c.call("arch.unmount", json!({ "arch_id": arch_id }), None)
                 .await?,
-            render::ok,
+            render::unmounted,
+        ),
+        Cmd::Arch {
+            what: ArchCmd::Show { arch_id },
+        } => show(
+            cli,
+            c.call("arch.show", json!({ "arch_id": arch_id }), None)
+                .await?,
+            render::arch_show,
         ),
         Cmd::Task { what } => task(cli, &c, what).await,
         Cmd::Harness { what } => harness(cli, &c, what).await,
@@ -791,7 +851,64 @@ async fn call(cli: &Cli) -> Result<()> {
             c.call("ledger.verify", json!({}), None).await?,
             render::verified,
         ),
+        Cmd::Fsck {
+            rebase_head,
+            force: _,
+            yes,
+        } => fsck(cli, &c, *rebase_head, *yes).await,
     }
+}
+
+/// `vk fsck`, and the one write in it.
+///
+/// Three things happen here and nowhere else. The **typed confirmation**: a
+/// rebase re-records where this node's record ends, and a flag is too easy to
+/// pass by accident for that — so the word is typed, on this end, before a
+/// syscall is made. The **presence proof**: reading every blob on the node,
+/// and overriding its store's own refusal, are human acts (invariant I1), so
+/// the call is signed with this node's device key like `stop` and `approve`.
+/// And the **exit code**: the report is printed either way — a person running
+/// `fsck` wants to see what failed — and then a store that does not verify
+/// leaves by the error path, so `vk fsck && deploy` does what it looks like.
+async fn fsck(cli: &Cli, c: &Client, rebase_head: bool, yes: bool) -> Result<()> {
+    if rebase_head && !yes {
+        confirm_rebase()?;
+    }
+    let proof = presence(c).await?;
+    let answer = c
+        .call(
+            "store.fsck",
+            json!({ "rebase_head": rebase_head }),
+            Some(proof),
+        )
+        .await?;
+    show(cli, answer.clone(), render::fsck)?;
+    anyhow::ensure!(
+        answer["ok"] == Value::Bool(true),
+        "this store does not verify; the tiers above say which part of it"
+    );
+    Ok(())
+}
+
+/// The word, typed out. Refused on anything else, including an empty line and
+/// a closed stdin — a confirmation nobody typed is not a confirmation.
+fn confirm_rebase() -> Result<()> {
+    // To stderr, so a `--json` run's stdout is still only the answer.
+    eprint!(
+        "This re-records where this node's record ends. Do it only if that record was \
+         restored from a backup on purpose.\nType `rebase` to confirm: "
+    );
+    use std::io::Write as _;
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("read the confirmation from stdin")?;
+    anyhow::ensure!(
+        line.trim() == "rebase",
+        "not confirmed: the ledger head was not touched"
+    );
+    Ok(())
 }
 
 async fn task(cli: &Cli, c: &Client, what: &TaskCmd) -> Result<()> {
@@ -1338,7 +1455,15 @@ fn boot(cli: &Cli, rt: &tokio::runtime::Runtime, a: &BootArgs) -> Result<()> {
                 _ => format!("; see {}", log.display()),
             }
         ),
-        Started::Lost(e) => anyhow::bail!("lost track of vkd (pid {pid}): {e}"),
+        // The OS will not say whether it is still running, so assume it is:
+        // a daemon nobody knows the pid of would sit on the endpoint and make
+        // every later `vk boot` refuse, blaming a daemon the user never sees
+        // — the same reason `Silent` kills (SP1b Task 8, deferred minor).
+        Started::Lost(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("lost track of vkd (pid {pid}), and killed it: {e}")
+        }
         Started::Silent => {
             // It is ours and nobody else knows its pid, so it does not outlive
             // the call that started it: otherwise it would sit on the endpoint

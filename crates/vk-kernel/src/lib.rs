@@ -5,7 +5,7 @@ pub mod presence;
 pub mod tasks;
 
 use anyhow::{Context, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use vk_contracts::arch::{ArchManifest, Capability};
@@ -181,6 +181,14 @@ pub struct BootReport {
     /// unchanged afterwards. It exists so that the first policy set has a
     /// predecessor to migrate from.
     pub policies_version: String,
+    /// A `vk fsck --rebase-head` done since the last boot (SP1b Task 8).
+    /// Present on exactly one report — the first boot after the rebase — and
+    /// absent everywhere else, including on every report written before this
+    /// field existed, so the canonical hash of an ordinary report is
+    /// unchanged and an auditor's recomputation of an old `boot` event still
+    /// matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fsck: Option<FsckRebase>,
 }
 
 /// Cumulative per-arch call counters, persisted under the `kv` key
@@ -462,6 +470,111 @@ pub struct RealKernel {
     /// and one that was open when this process stopped is rightly unknown to
     /// the next — the person mints another.
     approval_challenges: BTreeMap<String, PendingApproval>,
+    /// Which step of which task the call now in flight belongs to (SP1b Task
+    /// 8, ruling 8). Set by `run_task_step` around the one step it runs and
+    /// cleared again afterwards, so the usage row `infer` writes can name the
+    /// step that spent the money.
+    ///
+    /// A field rather than a parameter because `infer` is a **contract**
+    /// method (`vk_contracts::syscalls::Kernel`) and its signature is not
+    /// this task's to change. The scheduler runs one step at a time, in the
+    /// call that asked for it, so there is exactly one of these at a time;
+    /// an inference outside a task leaves it `None` and the row names no
+    /// task rather than the last one that happened to run.
+    usage_step: Option<(String, usize)>,
+}
+
+/// One completed call on an arch: which arch, which step of which task, what
+/// it spent and how long it took (SP1b Task 8, ruling 8's second half).
+///
+/// The per-arch counters in [`ArchStats`] are the sum of these rows, and a sum
+/// cannot answer the two questions an operator actually has — *which task cost
+/// that* and *is this call slower than the last one*. It is metadata
+/// throughout: ids, counts and a timestamp. Nothing of the register, of the
+/// prompt or of the completion is in here, which is why it can be read without
+/// the register's own label (invariant I2); what it does carry is a task id, so
+/// a row about a task the caller may not see is not listed at all.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct UsageRow {
+    pub arch_id: String,
+    /// The task whose step made the call, or `None` for an inference made
+    /// outside one.
+    pub task_id: Option<String>,
+    pub step_index: Option<usize>,
+    /// Prompt tokens as accounted: the arch's own count where it reported
+    /// one, this node's estimate otherwise.
+    pub tokens_in: u64,
+    /// How much of `tokens_in` was measured rather than estimated — `0` for
+    /// an arch that reports no usage, so a reader can tell a figure they
+    /// could bill against from a heuristic.
+    pub tokens_in_measured: u64,
+    /// Completion tokens as the arch counted them; `0` where it counted none.
+    /// The kernel never estimates this: it does not see the answer being
+    /// produced.
+    pub tokens_out: u64,
+    /// List price of this one call in USD, where the arch reported one.
+    /// `None` is not zero — see `ArchManifest::cost_per_1k_tokens_eur`.
+    pub cost_list_usd: Option<f64>,
+    /// How long the arch was away, wall-clock, for this call alone.
+    pub duration_ms: u64,
+    /// When the call came back. Named `ts_ms` rather than `ts` like every
+    /// other instant in this kernel (`wall_ms`, `now_ms`, `enrolled_ms`).
+    pub ts_ms: u64,
+}
+
+/// Which usage rows a caller is asking for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum UsageFilter {
+    #[default]
+    All,
+    Task(String),
+    Arch(String),
+}
+
+/// The arch id a harness run's usage is filed under. A harness is not an arch
+/// — nothing mounts it, it has no manifest and no id of its own — but the
+/// money it spends is Claude's all the same, and an operator reading
+/// `vk top --calls` must see it beside the arches or the node's spend is
+/// simply wrong (SP1b Task 8; the Task 4 deferred minor).
+pub fn harness_arch_id(name: &str) -> String {
+    format!("harness:{name}")
+}
+
+/// What a `--rebase-head` did, as the next `boot` event's report names it
+/// (SP1b Task 8). `boot.forced`'s style and `boot.forced`'s reason: an
+/// operator overrode a refusal of this node's own store, and an auditor must
+/// find it in the record without having to be told to look.
+///
+/// No new ledger kind: it rides the `boot` report, whose canonical hash is
+/// already the `boot` event's payload — so the event that says this node
+/// started is the same event that says what it started over.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FsckRebase {
+    /// The head that was on record before, `None` if none was.
+    pub rebased_from: Option<vk_store::LedgerHead>,
+    pub rebased_to: vk_store::LedgerHead,
+    /// When the rebase was done, in wall-clock milliseconds.
+    pub at: u64,
+}
+
+/// Where the pending rebase waits between `vk fsck --rebase-head` and the
+/// next boot that reports it.
+const PENDING_REBASE: &str = "fsck.rebase.pending";
+
+/// What a harness run's Claude Code session spent, for
+/// [`RealKernel::record_harness_usage`]. A struct rather than seven
+/// parameters, because six of them are numbers and a caller that swapped two
+/// would be reporting somebody else's spend with no compiler to say so.
+#[derive(Debug, Clone)]
+pub struct HarnessUsage<'a> {
+    /// Which harness: the name `vk harness run --name` was given.
+    pub name: &'a str,
+    pub task_id: &'a str,
+    pub step_index: usize,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cost_list_usd: Option<f64>,
+    pub duration_ms: u64,
 }
 
 /// One live harness run, as the token map holds it: which lease and task the
@@ -552,6 +665,7 @@ impl RealKernel {
             counter: 0,
             harness_tokens: BTreeMap::new(),
             approval_challenges: BTreeMap::new(),
+            usage_step: None,
         };
         k.load()?;
         Ok(k)
@@ -826,8 +940,17 @@ impl RealKernel {
             devices: self.device_ids(),
             stopped_scopes: self.stops.stopped_scopes(),
             policies_version: self.load_policies_version()?,
+            // The rebase belongs to the *next* boot, and this is it. Read
+            // here so the event commits to it, cleared below once that event
+            // is durable — ledger before the row, as everywhere else: an
+            // append that fails must leave the rebase still waiting to be
+            // reported rather than silently dropped.
+            fsck: self.pending_rebase()?,
         };
         self.log("boot", now_ms(), &report)?;
+        if report.fsck.is_some() {
+            self.clear_pending_rebase()?;
+        }
         // After the `boot` event, so the record reads in the order things
         // happened: this node came up, and then it found what the last one
         // left half-done (SP1b review, M11).
@@ -888,6 +1011,215 @@ impl RealKernel {
     /// status` surface it as `forced`/`forced boot`.
     pub fn forced_boot(&self) -> bool {
         self.forced_boot
+    }
+
+    /// The whole store, verified: the four storage tiers
+    /// ([`vk_store::Store::fsck`]) plus the one only the kernel can check.
+    ///
+    /// `vk ledger verify` answers "does the chain recompute". This answers
+    /// "is this node's state the state it says it has": the chain, the
+    /// recorded head, every blob against its own address, every wrapped DEK
+    /// — and the **mounts**, because an arch whose spec has gone is an arch
+    /// the next boot cannot make again, and being told that at the restart
+    /// is being told it too late.
+    ///
+    /// Read-only, and it takes only `&self`: an operator can run it on a
+    /// store they are afraid of, with the node still serving.
+    pub fn fsck(&self) -> vk_store::FsckReport {
+        self.store.fsck().with([self.fsck_mounts()])
+    }
+
+    /// The kernel's own tier: every mounted arch can be made again.
+    ///
+    /// Two failures, both of them a node that will come up differently from
+    /// how it is now — an arch with a manifest and no spec (nothing to build
+    /// it from; `load_arches` marks it unavailable), and a spec whose
+    /// manifest has gone (a mount half-written, which `load_arches` sweeps).
+    fn fsck_mounts(&self) -> vk_store::FsckTier {
+        let manifests: Vec<(String, ArchManifest)> =
+            self.store.db.list_json("arches").unwrap_or_default();
+        let specs: BTreeMap<String, arch::MountSpec> = self
+            .store
+            .db
+            .list_json("mounts")
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let mut problems = Vec::new();
+        for (id, m) in &manifests {
+            match specs.get(id) {
+                None => problems.push(format!(
+                    "{id} ({}): no mount spec, so the next boot cannot make this arch again; \
+                     mount it again",
+                    m.name
+                )),
+                Some(spec) => {
+                    if let Err(e) = spec.validate() {
+                        problems.push(format!("{id} ({}): its mount spec is bad: {e:#}", m.name));
+                    }
+                }
+            }
+        }
+        for id in specs.keys() {
+            if !manifests.iter().any(|(m, _)| m == id) {
+                problems.push(format!(
+                    "{id}: a mount spec with no arch beside it, left by a half-written mount"
+                ));
+            }
+        }
+        vk_store::FsckTier::new("mounts", manifests.len() as u64, 0, problems)
+    }
+
+    /// Re-record the ledger head from the chain as it is on disk — the
+    /// recovery path after a **legitimate** restore (SP1b Task 8).
+    ///
+    /// The store refuses to tell a restored-from-backup record from a tail
+    /// somebody cut, and rightly: they are the same bytes. This is the human
+    /// saying which it was. The ceremony belongs to the caller — `vk fsck
+    /// --rebase-head --force`, a presence proof and the word `rebase` typed
+    /// out — and what this adds is the record of it: the operation is parked
+    /// for the next `boot` event's report, in `boot.forced`'s style and with
+    /// no new event kind, so an auditor reading the chain finds the override
+    /// without being told to look for it.
+    ///
+    /// Parked rather than appended here, because an append *now* would land
+    /// on the very chain whose head is in question, in the middle of the one
+    /// operation that is about to redefine where that chain ends.
+    pub fn rebase_ledger_head(&mut self, at: u64) -> Result<FsckRebase, KernelError> {
+        let done = self.store.rebase_head().map_err(store_failed)?;
+        let rebase = FsckRebase {
+            rebased_from: done.from,
+            rebased_to: done.to,
+            at,
+        };
+        self.store
+            .db
+            .kv_set(
+                PENDING_REBASE,
+                &serde_json::to_string(&rebase).map_err(store_failed)?,
+            )
+            .map_err(store_failed)?;
+        tracing::warn!(
+            to_seq = rebase.rebased_to.seq,
+            "the ledger head was re-recorded by hand; the next boot event names it"
+        );
+        Ok(rebase)
+    }
+
+    /// The parked rebase, if one is waiting for a boot to report it.
+    fn pending_rebase(&self) -> Result<Option<FsckRebase>, KernelError> {
+        Ok(self
+            .store
+            .db
+            .kv_get(PENDING_REBASE)
+            .map_err(store_failed)?
+            .filter(|j| !j.is_empty())
+            .and_then(|j| serde_json::from_str(&j).ok()))
+    }
+
+    /// Reported: the next boot is an ordinary boot. Emptied rather than
+    /// deleted, because `kv` has no delete and an empty value reads back as
+    /// "nothing parked".
+    fn clear_pending_rebase(&mut self) -> Result<(), KernelError> {
+        self.store
+            .db
+            .kv_set(PENDING_REBASE, "")
+            .map_err(store_failed)
+    }
+
+    /// The per-call usage rows this node has, as `ctx` may see them (SP1b
+    /// Task 8, ruling 8).
+    ///
+    /// **I2 in one rule**: a row naming a task is shown only to a caller who
+    /// could see that task, because "there is a task that spent 40 000 tokens
+    /// on the cloud arch" is a fact about a register, and the register's
+    /// label is what decides who may learn facts about it. A row naming no
+    /// task — an inference made outside one — carries nothing labelled and is
+    /// shown to everyone. Nothing here is register content: ids, counts, a
+    /// duration and a timestamp.
+    pub fn usage(&self, ctx: &Ctx, filter: &UsageFilter) -> Result<Vec<UsageRow>, KernelError> {
+        // A named task is resolved through the same read the rest of the
+        // kernel uses, so a task above this caller's clearance is "not found"
+        // rather than "no rows" — which would say it exists and was idle.
+        if let UsageFilter::Task(id) = filter {
+            self.task(ctx, id)
+                .ok_or_else(|| KernelError::NotFound(id.clone()))?;
+        }
+        let visible: BTreeSet<String> = self.tasks(ctx).into_iter().map(|t| t.id).collect();
+        Ok(self
+            .store
+            .db
+            .list_json::<UsageRow>("usage")
+            .map_err(store_failed)?
+            .into_iter()
+            .map(|(_, row)| row)
+            .filter(|row| match &row.task_id {
+                None => true,
+                Some(id) => visible.contains(id),
+            })
+            .filter(|row| match filter {
+                UsageFilter::All => true,
+                UsageFilter::Task(id) => row.task_id.as_deref() == Some(id.as_str()),
+                UsageFilter::Arch(id) => &row.arch_id == id,
+            })
+            .collect())
+    }
+
+    /// One completed call, written down. Keyed `<ts>-<seq>`, both zero-padded,
+    /// so the table's own key order is the order the calls came back in and a
+    /// reader never has to sort.
+    ///
+    /// `seq` is this kernel's own id counter, the one `next_id` mints from:
+    /// one counter means one source of uniqueness, and two rows written in
+    /// the same millisecond still order and still do not collide. Ids skip
+    /// numbers as a result, which nothing depends on — an id has to be
+    /// unique, not consecutive.
+    fn record_usage(&mut self, row: &UsageRow) -> Result<(), KernelError> {
+        self.counter += 1;
+        self.store
+            .db
+            .kv_set("counter", &self.counter.to_string())
+            .map_err(store_failed)?;
+        let key = format!("{:013}-{:012}", row.ts_ms, self.counter);
+        self.store
+            .db
+            .put_json("usage", &key, row)
+            .map_err(store_failed)
+    }
+
+    /// Record what a harness run's Claude Code session spent (SP1b Task 8).
+    ///
+    /// A harness is not an arch — nothing mounts it and it has no manifest —
+    /// but its calls are Claude's and its money is the node's, so the spend
+    /// goes in the same place every other call's does, under
+    /// [`harness_arch_id`]. Without this, `vk top` would show a node whose
+    /// only real work went through a harness as having spent nothing.
+    pub fn record_harness_usage(&mut self, u: &HarnessUsage) -> Result<(), KernelError> {
+        let arch_id = harness_arch_id(u.name);
+        let measured = u32::try_from(u.tokens_in).unwrap_or(u32::MAX);
+        // The same counters an arch's calls bump, so `vk top`'s arch table
+        // has a row for the harness rather than a hole where its spend was.
+        // Measured throughout: these are the CLI's own counts, not an
+        // estimate this node made.
+        self.bump_stats(&arch_id, measured, Some(measured), u.cost_list_usd, false)?;
+        self.record_usage(&UsageRow {
+            arch_id,
+            task_id: Some(u.task_id.into()),
+            step_index: Some(u.step_index),
+            tokens_in: u.tokens_in,
+            tokens_in_measured: u.tokens_in,
+            tokens_out: u.tokens_out,
+            cost_list_usd: u.cost_list_usd.filter(|c| c.is_finite()),
+            duration_ms: u.duration_ms,
+            ts_ms: now_ms(),
+        })
+    }
+
+    /// The mount spec an arch was made from, for `arch.show`. `None` for an
+    /// arch this node has never mounted, and for one mounted before specs
+    /// were recorded.
+    pub fn mount_spec(&self, arch_id: &str) -> Option<arch::MountSpec> {
+        self.store.db.get_json("mounts", arch_id).ok().flatten()
     }
 
     /// The policy set this node runs under, as the store has it — `None` on a
@@ -2031,9 +2363,14 @@ impl Kernel for RealKernel {
                 details: None,
             },
         )?;
+        // Timed here and nowhere else: this is the only span in the kernel
+        // that is the arch's own, and it is what the per-call usage row
+        // reports as `duration_ms` (ruling 8).
+        let called_at = std::time::Instant::now();
         let completion = adapter
             .complete(&prompt, budget.min(1024))
             .map_err(|e| adapter_failed(arch_id, e))?;
+        let duration_ms = u64::try_from(called_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         // An arch that counted the prompt itself has the number; the estimate
         // was only ever a stand-in for it (ruling 7).
         let tokens_in = completion.tokens_in_measured.unwrap_or(estimated);
@@ -2066,6 +2403,25 @@ impl Kernel for RealKernel {
             completion.cost_list_usd,
             projected,
         )?;
+        // And the call itself, beside the total it just moved (ruling 8's
+        // second half). Only a call that came back: an attempt that never
+        // did is the `infer`/`requested` event, which is already on the
+        // record, and a usage row for it would be a charge nobody incurred.
+        let (task_id, step_index) = match &self.usage_step {
+            Some((task, step)) => (Some(task.clone()), Some(*step)),
+            None => (None, None),
+        };
+        self.record_usage(&UsageRow {
+            arch_id: arch_id.into(),
+            task_id,
+            step_index,
+            tokens_in: u64::from(tokens_in),
+            tokens_in_measured: u64::from(completion.tokens_in_measured.unwrap_or(0)),
+            tokens_out: u64::from(completion.tokens_out.unwrap_or(0)),
+            cost_list_usd: completion.cost_list_usd.filter(|c| c.is_finite()),
+            duration_ms,
+            ts_ms: now_ms(),
+        })?;
         arch::raise(&mut reg, role, &completion.text);
         self.write_register(ctx, reg)?;
         Ok(InferOutcome {
@@ -2797,6 +3153,7 @@ mod tests {
             Ok(arch::Completion {
                 text: "ok".into(),
                 tokens_in_measured: Some(14_435),
+                tokens_out: Some(812),
                 cost_list_usd: Some(0.0148193),
                 details: Some(serde_json::json!({ "session_id": "s-1" })),
             })
@@ -3056,6 +3413,7 @@ mod tests {
             Ok(arch::Completion {
                 text: "ok".into(),
                 tokens_in_measured: Some(12),
+                tokens_out: None,
                 cost_list_usd: None,
                 details: None,
             })
@@ -4424,5 +4782,238 @@ mod tests {
             .list_json::<arch::MountSpec>("mounts")
             .unwrap()
             .is_empty());
+    }
+
+    /// Ruling 8's second half: the counters say what an arch has spent in
+    /// total, and a per-call row says what each call was. A total cannot be
+    /// attributed to a task, compared with the next call or read after the
+    /// fact; the row can, and it is the only place `tokens_out` and the
+    /// duration of one call survive at all.
+    #[test]
+    fn every_completed_infer_leaves_one_usage_row() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let arch = scripted(&mut k, "measured", || {
+            Ok(arch::Completion {
+                text: "ok".into(),
+                tokens_in_measured: Some(1_400),
+                tokens_out: Some(37),
+                cost_list_usd: Some(0.002),
+                details: None,
+            })
+        });
+        let reg = k
+            .submit_task(&machine(1), "a goal", Label::bottom())
+            .unwrap();
+        k.infer(&machine(2), &arch, Capability::Plan, &reg).unwrap();
+
+        let rows = k.usage(&machine(3), &UsageFilter::All).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let r = &rows[0];
+        assert_eq!(r.arch_id, arch);
+        assert_eq!(r.tokens_in, 1_400);
+        assert_eq!(r.tokens_in_measured, 1_400);
+        assert_eq!(r.tokens_out, 37);
+        assert_eq!(r.cost_list_usd, Some(0.002));
+        assert!(r.ts_ms > 0, "{r:?}");
+        // An inference outside a task names no task and no step, rather than
+        // inventing one.
+        assert_eq!(r.task_id, None, "{r:?}");
+        assert_eq!(r.step_index, None, "{r:?}");
+
+        // A failed call leaves no row: `usage` is what was spent and came
+        // back, and the `infer`/`requested` event is where an attempt lives.
+        let dies = scripted(&mut k, "dies", || {
+            Err(arch::AdapterError::Other(anyhow::anyhow!("engine gone")))
+        });
+        assert!(k.infer(&machine(4), &dies, Capability::Plan, &reg).is_err());
+        assert_eq!(k.usage(&machine(5), &UsageFilter::All).unwrap().len(), 1);
+
+        // On disk, like the counters beside them.
+        drop(k);
+        let k = open(d.path());
+        assert_eq!(k.usage(&machine(6), &UsageFilter::All).unwrap().len(), 1);
+        assert_eq!(
+            k.usage(&machine(6), &UsageFilter::Arch(arch.clone()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(k
+            .usage(&machine(6), &UsageFilter::Arch("sha256:nope".into()))
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A usage row says which step of which task spent the money, which is
+    /// the whole reason it is not just another counter.
+    #[test]
+    fn a_task_step_names_itself_on_the_call_it_made() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let arch = k.register_arch(local(personal()));
+        let t = k
+            .create_task(
+                &machine(1),
+                "draft a proposal",
+                "note",
+                Label::bottom(),
+                vec![
+                    tasks::StepKind::Plan {
+                        arch_id: arch.clone(),
+                    },
+                    tasks::StepKind::Draft {
+                        arch_id: arch.clone(),
+                    },
+                ],
+            )
+            .unwrap();
+        k.run_task_step(&machine(2), &t.id).unwrap();
+        k.run_task_step(&machine(3), &t.id).unwrap();
+
+        let rows = k
+            .usage(&machine(4), &UsageFilter::Task(t.id.clone()))
+            .unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(
+            rows.iter().map(|r| r.step_index).collect::<Vec<_>>(),
+            [Some(0), Some(1)],
+            "in the order the steps ran: {rows:?}"
+        );
+        for r in &rows {
+            assert_eq!(r.task_id.as_deref(), Some(t.id.as_str()), "{r:?}");
+            assert_eq!(r.arch_id, arch);
+        }
+        // A task nobody has heard of is not an empty answer.
+        assert!(k
+            .usage(&machine(5), &UsageFilter::Task("task-nope".into()))
+            .is_err());
+    }
+
+    /// I2: a usage row is metadata about a task, and a caller who may not see
+    /// the task may not see what it spent either — a row naming a register
+    /// above the caller's clearance would leak that it exists and how big it
+    /// was.
+    #[test]
+    fn usage_rows_of_a_task_the_caller_cannot_see_are_not_listed() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let arch = k.register_arch(local(personal()));
+        let secret = Label {
+            scope: Scope::Personal,
+            data_class: DataClass::Own,
+            origins: Default::default(),
+        };
+        let t = k
+            .create_task(
+                &machine(1),
+                "a private goal",
+                "note",
+                secret,
+                vec![tasks::StepKind::Plan {
+                    arch_id: arch.clone(),
+                }],
+            )
+            .unwrap();
+        k.run_task_step(&machine(2), &t.id).unwrap();
+        assert_eq!(k.usage(&machine(3), &UsageFilter::All).unwrap().len(), 1);
+
+        let outsider = Ctx {
+            clearance: Clearance {
+                max_scope: Scope::Vertical,
+                third_party_allowed: true,
+            },
+            ..machine(4)
+        };
+        assert!(
+            k.usage(&outsider, &UsageFilter::All).unwrap().is_empty(),
+            "a row about a task this caller cannot see is not a row it may read"
+        );
+        assert!(k.usage(&outsider, &UsageFilter::Task(t.id)).is_err());
+    }
+
+    /// `fsck` is the whole store, and the kernel's own tier is the one the
+    /// store cannot check: an arch whose mount spec has gone is an arch the
+    /// next boot cannot make again, which is exactly the thing an operator
+    /// wants told before the restart rather than after it.
+    #[test]
+    fn fsck_adds_the_kernels_own_tier_and_finds_an_arch_with_no_spec() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let arch = k.register_arch(local(personal()));
+        let report = k.fsck();
+        assert!(report.ok, "{report:?}");
+        let mounts = report
+            .tiers
+            .iter()
+            .find(|t| t.tier == "mounts")
+            .expect("a mounts tier");
+        assert_eq!(mounts.checked, 1, "{mounts:?}");
+
+        k.store().db.delete("mounts", &arch).unwrap();
+        let report = k.fsck();
+        assert!(!report.ok, "{report:?}");
+        let mounts = report
+            .tiers
+            .iter()
+            .find(|t| t.tier == "mounts")
+            .expect("a mounts tier");
+        assert_eq!(mounts.failed, 1, "{mounts:?}");
+        assert!(
+            mounts.problems.iter().any(|p| p.contains(&arch)),
+            "{mounts:?}"
+        );
+    }
+
+    /// The rebase is a human overriding the store's own refusal, so it goes on
+    /// the record — on the next `boot` event's report, in `boot.forced`'s
+    /// style, rather than as a new event kind. Once: the boot after it is an
+    /// ordinary boot and must not keep restating an override that happened
+    /// two restarts ago.
+    #[test]
+    fn a_rebase_is_named_in_the_next_boot_report_and_only_that_one() {
+        let d = tempfile::tempdir().unwrap();
+        // A record worth cutting, then the cut, as a restore of an older copy
+        // of the segment leaves it.
+        {
+            let mut k = open(d.path());
+            k.boot().unwrap();
+            k.register_arch(local(personal()));
+        }
+        let seg = d.path().join("ledger").join("seg-000000.jsonl");
+        let text = std::fs::read_to_string(&seg).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        assert!(lines.len() >= 2, "{}", lines.len());
+        lines.truncate(lines.len() - 1);
+        std::fs::write(&seg, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let rebase = {
+            let mut k = open(d.path());
+            assert!(!k.ledger_holds(), "a cut record does not hold");
+            let rebase = k.rebase_ledger_head(now_ms()).expect("rebase");
+            assert!(k.ledger_holds(), "and holds once the head is re-recorded");
+            rebase
+        };
+
+        // The next boot says so, and its `boot` event commits to a report
+        // that carries it.
+        let mut k = open(d.path());
+        let report = k.boot().unwrap();
+        let named = report.fsck.as_ref().expect("the rebase is in the report");
+        assert_eq!(named.rebased_to, rebase.rebased_to, "{named:?}");
+        assert_eq!(named.rebased_from, rebase.rebased_from, "{named:?}");
+        let last = k
+            .ledger()
+            .events()
+            .iter()
+            .rev()
+            .find(|e| e.kind == "boot")
+            .expect("a boot event");
+        assert_eq!(last.payload_hash, hash_canonical(&report));
+
+        // And the boot after it is an ordinary boot.
+        drop(k);
+        let mut k = open(d.path());
+        assert!(k.boot().unwrap().fsck.is_none());
     }
 }

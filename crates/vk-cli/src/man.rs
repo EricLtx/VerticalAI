@@ -327,10 +327,37 @@ mod tests {
         );
     }
 
+    /// The `(field, type)` pairs a page states one level *in*: the lines a
+    /// resolved `$ref` contributes, indented by eight spaces. These are the
+    /// ones a reader relies on to avoid chasing a `$ref` out of the page, and
+    /// the sweep below holds them to the same rule as the top-level ones.
+    fn nested_fields(page: &str) -> Vec<(String, String)> {
+        page.lines()
+            .filter_map(|l| l.strip_prefix("        ").filter(|r| !r.starts_with(' ')))
+            // A description or an enum line is not a `name  type` pair.
+            .filter(|r| r.contains("  ") && !r.starts_with("values: "))
+            .map(|row| {
+                let ty = row.rsplit("  ").next().unwrap_or(row).trim();
+                let name = row[..row.len() - ty.len()].trim();
+                (name.to_string(), ty.to_string())
+            })
+            .filter(|(name, _)| !name.contains(' '))
+            .collect()
+    }
+
     /// Every embedded schema parses and renders, so `vk man <anything in the
     /// list>` cannot be the call that discovers a malformed one.
+    ///
+    /// The sweep covers the **nested** rendering too (SP1b Task 8, deferred
+    /// minor): a `$ref` resolved one level deep is the part of a page a
+    /// reader depends on most — it is why they do not have to open the
+    /// schema — and it is rendered by a different path from the top-level
+    /// fields, so a page whose nested block says `any` would otherwise pass
+    /// every check here.
     #[test]
     fn every_contract_renders() {
+        let mut nested_seen = 0usize;
+        let mut enums_seen = 0usize;
         for name in names() {
             let page = render(name).unwrap_or_else(|e| panic!("vk man {name}: {e}"));
             assert!(page.contains(name), "{name} page does not name its file");
@@ -341,7 +368,17 @@ mod tests {
                     "trailing whitespace in {name}: {line:?}"
                 );
             }
+            for (field, ty) in nested_fields(&page) {
+                assert_ne!(ty, "any", "vk man {name}: nested {field} has no type");
+                nested_seen += 1;
+            }
+            enums_seen += page.lines().filter(|l| l.contains("values: ")).count();
         }
+        // The sweep must not be vacuous: if a change ever stopped resolving
+        // `$defs`, every page would still render and every assertion above
+        // would still hold.
+        assert!(nested_seen > 0, "no page rendered a resolved $ref");
+        assert!(enums_seen > 0, "no page rendered an enum's values");
     }
 
     #[test]

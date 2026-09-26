@@ -206,6 +206,100 @@ impl BlobStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains(key_id)
     }
+
+    /// The envelope `put(key_id, _, plaintext)` wrote, found by re-deriving
+    /// the address rather than by remembering it. What a caller that still
+    /// has the bytes uses to name the blob again.
+    pub fn envelope_of(
+        &self,
+        key_id: &str,
+        plaintext: &[u8],
+    ) -> Result<BlobEnvelope, StorageError> {
+        self.envelope(&address(key_id, plaintext))
+    }
+
+    /// Every blob this store holds, by address, in the order the filesystem
+    /// gives them. Read off the envelopes, which are the tier's index: a
+    /// `.bin` with no `.json` beside it is a blob nothing can name, and is
+    /// reported by [`BlobStore::orphans`] rather than silently walked.
+    ///
+    /// For `fsck`, which is the only caller that has any business enumerating
+    /// the payload tier: every other read comes by an address a register
+    /// already holds.
+    pub fn addresses(&self) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for entry in
+            std::fs::read_dir(&self.dir).with_context(|| format!("read {}", self.dir.display()))?
+        {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "json") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    out.push(format!("sha256:{stem}"));
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Ciphertext with no envelope beside it: bytes this store cannot name,
+    /// let alone open. Not an integrity failure of any blob — there is no
+    /// blob — but a leftover of a crash between the two writes `put` makes,
+    /// and `fsck` says so rather than counting nothing.
+    pub fn orphans(&self) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for entry in
+            std::fs::read_dir(&self.dir).with_context(|| format!("read {}", self.dir.display()))?
+        {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "bin") && !path.with_extension("json").exists()
+            {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    out.push(format!("sha256:{stem}"));
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Every subject this store holds a wrapped DEK for. The filenames are
+    /// hex of the key id, exactly as [`BlobStore::dek_path`] writes them.
+    pub fn key_ids(&self) -> Result<Vec<String>> {
+        let dir = self.dir.join("keys");
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "dek") {
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .with_context(|| format!("non-utf8 DEK filename {}", path.display()))?;
+                let bytes =
+                    hex::decode(stem).with_context(|| format!("malformed DEK filename {stem}"))?;
+                out.push(
+                    String::from_utf8(bytes)
+                        .with_context(|| format!("DEK filename {stem} is not hex-of-utf8"))?,
+                );
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Does this subject's DEK still come back out of its wrapping under the
+    /// master key? The one question `fsck`'s key tier asks, and the one a
+    /// replaced keyring entry or a restored-from-the-wrong-backup key file
+    /// answers `no` to — which otherwise shows up as every blob of that
+    /// subject having gone missing.
+    pub fn dek_unwraps(&self, key_id: &str) -> Result<()> {
+        let p = self.dek_path(key_id);
+        let wrapped = std::fs::read(&p).with_context(|| format!("read {}", p.display()))?;
+        self.master
+            .unwrap_dek(&wrapped)
+            .with_context(|| format!("the DEK of {key_id} does not unwrap under the master key"))?;
+        Ok(())
+    }
 }
 
 /// The storage address of `plaintext` under `key_id`: `sha256(key_id || 0x00

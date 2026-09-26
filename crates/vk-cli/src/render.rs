@@ -314,6 +314,13 @@ pub fn top(v: &Value) -> String {
                 .map(|(id, s)| {
                     vec![
                         id.clone(),
+                        // Where the call goes and under whose law it is
+                        // answered (SP1b Task 8). Both off the manifest, so
+                        // both are a dash for an arch that has been
+                        // unmounted since — its counters outlive it, what it
+                        // *was* does not.
+                        v["locality"][id].as_str().unwrap_or("-").to_string(),
+                        v["jurisdiction"][id].as_str().unwrap_or("-").to_string(),
                         // Would a prompt sent to it be answered? A dash for
                         // an arch that is no longer mounted — its counters
                         // outlive it — and `unavailable` for one whose engine
@@ -354,12 +361,14 @@ pub fn top(v: &Value) -> String {
         table(
             &[
                 "ARCH",
+                "LOCALITY",
+                "JURISDICTION",
                 "STATE",
                 "GOVERNED",
                 "CALLS",
                 "TOKENS",
                 "MEASURED",
-                "COST (LIST USD)",
+                "COST USD",
                 "EUR/1K",
                 "PROJECTED",
             ],
@@ -371,6 +380,22 @@ pub fn top(v: &Value) -> String {
     if let Some(down) = v["unavailable"].as_object().filter(|m| !m.is_empty()) {
         for (id, why) in down {
             out.push(format!("{id} is unavailable: {}", text(why)));
+        }
+    }
+    // `--calls`: the rows the totals above are the sum of. Under them, not
+    // in them — a total is per arch and a call is per step, and the two do
+    // not share a shape (SP1b Task 8, ruling 8).
+    let calls = array(v, "calls");
+    if !calls.is_empty() {
+        out.push(calls_table(calls));
+        // What is not on the screen, said rather than left to be inferred
+        // from a table that stops.
+        let total = v["calls_total"].as_u64().unwrap_or(calls.len() as u64);
+        if total > calls.len() as u64 {
+            out.push(format!(
+                "showing the last {} of {total} calls; `usage.ls` has them all",
+                calls.len()
+            ));
         }
     }
     let tasks: Vec<Vec<String>> = v["tasks"]
@@ -395,6 +420,227 @@ pub fn top(v: &Value) -> String {
             .map(|(b, exp)| vec![b.clone(), text(exp)])
             .collect::<Vec<_>>();
         out.push(table(&["BUSINESS", "UNATTENDED UNTIL (ms)"], &rows));
+    }
+    out.join("\n\n")
+}
+
+/// The per-call usage rows: one line per completed call, in the order they
+/// came back. `STEP` is 1-based, like the numbers `vk task show` prints, so
+/// the two screens name the same step the same way.
+fn calls_table(calls: &[Value]) -> String {
+    let rows = calls
+        .iter()
+        .map(|c| {
+            vec![
+                text(&c["arch_id"]),
+                c["task_id"].as_str().unwrap_or("-").to_string(),
+                c["step_index"]
+                    .as_u64()
+                    .map_or_else(|| "-".into(), |i| (i + 1).to_string()),
+                text(&c["tokens_in"]),
+                zeroless(&c["tokens_out"], |n| format!("{n:.0}")),
+                zeroless(&c["cost_list_usd"], |n| format!("{n:.5}")),
+                text(&c["duration_ms"]),
+            ]
+        })
+        .collect::<Vec<_>>();
+    table(
+        &["CALL", "TASK", "STEP", "TOKENS", "OUT", "COST USD", "MS"],
+        &rows,
+    )
+}
+
+/// `vk arch show`: one arch in full.
+///
+/// Three blocks, because an operator reads them for three different reasons:
+/// what this arch *is* and whether it would answer; the **identity tuple**,
+/// which is what the arch id hashes — so two arches that differ anywhere in
+/// it are two arches, and this is where you look to see how; and what it is
+/// made of, which for an arch the kernel governs is the image and the caps
+/// the process runs under.
+pub fn arch_show(v: &Value) -> String {
+    let m = &v["manifest"];
+    let clearance = &m["clearance"];
+    let mut head = vec![
+        ("arch", text(&v["arch_id"])),
+        ("name", text(&m["name"])),
+        (
+            "state",
+            match v["reason"].as_str() {
+                Some(why) => format!("{} ({why})", text(&v["state"])),
+                None => text(&v["state"]),
+            },
+        ),
+        ("locality", text(&m["locality"])),
+        ("jurisdiction", text(&m["jurisdiction"])),
+        (
+            "governed",
+            match m["governed"].as_bool() {
+                Some(true) => "yes — this kernel started the process and caps it".into(),
+                Some(false) => {
+                    "no — the inference runs somewhere this node does not contain".into()
+                }
+                None => "-".into(),
+            },
+        ),
+        (
+            "capabilities",
+            match m["capabilities"].as_array() {
+                Some(c) if !c.is_empty() => c.iter().map(text).collect::<Vec<_>>().join(", "),
+                _ => "-".into(),
+            },
+        ),
+        ("context ceiling", text(&m["context_ceiling"])),
+        ("determinism", text(&m["determinism"])),
+        (
+            "retention",
+            match m["retention_days"].as_u64() {
+                Some(d) => format!("{d} days"),
+                // Not "0 days": a manifest that claims no retention window
+                // and one this node has no figure for read differently.
+                None => "none declared".into(),
+            },
+        ),
+        ("price (EUR/1k in)", price(&m["cost_per_1k_tokens_eur"])),
+        (
+            "clearance",
+            format!(
+                "up to {}, third-party data {}",
+                text(&clearance["max_scope"]),
+                if clearance["third_party_allowed"] == Value::Bool(true) {
+                    "allowed"
+                } else {
+                    "refused"
+                }
+            ),
+        ),
+    ];
+    // What the next boot would make it from. `kind` and the fields a person
+    // acts on — the image and the caps — never the whole config: a spec
+    // carries no credential (`MountSpec::new` refuses one) but a printed
+    // blob is still a thing nobody reads.
+    if let Some(kind) = v["kind"].as_str() {
+        head.push(("mounted as", kind.to_string()));
+        for (label, field) in [
+            ("image", "image"),
+            ("memory cap", "memory"),
+            ("cpu cap", "cpus"),
+            ("endpoint", "base_url"),
+            ("model", "model"),
+            ("region", "region"),
+        ] {
+            if let Some(value) = v["config"][field].as_str() {
+                head.push((label, value.to_string()));
+            }
+        }
+    } else {
+        head.push((
+            "mounted as",
+            "nothing recorded; the next boot cannot make this arch again".into(),
+        ));
+    }
+    let id = &m["identity"];
+    let sampling = match id["sampling"].as_object().filter(|s| !s.is_empty()) {
+        Some(s) => s
+            .iter()
+            .map(|(k, val)| format!("{k}={}", text(val)))
+            .collect::<Vec<_>>()
+            .join(" "),
+        None => "-".into(),
+    };
+    let identity = fields(&[
+        ("weights", text(&id["weights_sha256"])),
+        (
+            "engine",
+            format!("{} {}", text(&id["engine"]), text(&id["engine_version"])),
+        ),
+        ("backend", text(&id["backend"])),
+        ("quant", text(&id["quant"])),
+        ("kv cache", text(&id["kv_cache"])),
+        (
+            "threads/batch",
+            format!("{} / {}", text(&id["threads"]), text(&id["batch"])),
+        ),
+        ("sampling", sampling),
+        ("seed", text(&id["seed"])),
+    ]);
+    format!(
+        "{}\n\nidentity (this is what the arch id hashes):\n{}",
+        fields(&head),
+        identity
+            .lines()
+            .map(|l| format!("  {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+/// `vk fsck`: one line per tier, then the reasons, then the verdict.
+///
+/// The verdict is last because it is what the reader is left with, and the
+/// reasons are under the table because a reason is a sentence.
+pub fn fsck(v: &Value) -> String {
+    let tiers = array(v, "tiers");
+    let rows = tiers
+        .iter()
+        .map(|t| {
+            let checked = match t["skipped"].as_u64().unwrap_or(0) {
+                0 => text(&t["checked"]),
+                n => format!("{} ({n} skipped)", text(&t["checked"])),
+            };
+            vec![
+                text(&t["tier"]),
+                if t["ok"] == Value::Bool(true) {
+                    "ok".into()
+                } else {
+                    "FAILED".into()
+                },
+                checked,
+                text(&t["failed"]),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let mut out = vec![table(&["TIER", "VERDICT", "CHECKED", "FAILED"], &rows)];
+    for t in tiers {
+        for why in array(t, "problems") {
+            out.push(format!("{}: {}", text(&t["tier"]), text(why)));
+        }
+    }
+    // What a `--rebase-head` did, if one was asked for: both heads, so the
+    // person who just moved one can see how far back they moved it.
+    if let Some(r) = v.get("rebased").filter(|r| !r.is_null()) {
+        out.push(format!(
+            "the recorded ledger head was moved from {} to seq {} ({})",
+            match r["rebased_from"].as_object() {
+                Some(from) => format!(
+                    "seq {} ({})",
+                    text(&from["seq"]),
+                    short(&text(&from["hash"]))
+                ),
+                None => "nothing recorded".into(),
+            },
+            text(&r["rebased_to"]["seq"]),
+            short(&text(&r["rebased_to"]["hash"]))
+        ));
+    }
+    out.push(if v["ok"] == Value::Bool(true) {
+        "the store verifies".into()
+    } else {
+        "the store DOES NOT verify".into()
+    });
+    // The one failure a person can act on from here, named where they are
+    // already reading: a diverged head is what a restore leaves, and the
+    // rebase is the way back.
+    if tiers
+        .iter()
+        .any(|t| t["tier"] == "head" && t["ok"] == Value::Bool(false))
+        && v.get("rebased").is_none_or(Value::is_null)
+    {
+        out.push(
+            "if this node's record was restored from a backup on purpose, re-record the head \
+             with: vk fsck --rebase-head --force"
+                .into(),
+        );
     }
     out.join("\n\n")
 }
@@ -442,6 +688,7 @@ pub fn task(v: &Value) -> String {
     }
     let mut releases = array(v, "release_paths").iter();
     let decisions = array(v, "decisions");
+    let usage = array(v, "usage");
     let rows = steps
         .iter()
         .enumerate()
@@ -456,11 +703,26 @@ pub fn task(v: &Value) -> String {
                 Some("approve") => String::new(),
                 _ => text(&kind["arch_id"]),
             };
+            let call = usage
+                .iter()
+                .find(|u| u["step_index"].as_u64() == Some(i as u64));
             vec![
                 (i + 1).to_string(),
                 text(&kind["kind"]),
                 step_status(&s["status"]),
                 text(&s["tokens"]),
+                // What the call returned and what it cost (SP1b Task 8): a
+                // dash where no call was made (an approve, a release) and
+                // where the arch measured nothing, never a zero that reads
+                // as a measurement.
+                call.map_or_else(
+                    || "-".into(),
+                    |c| zeroless(&c["tokens_out"], |n| format!("{n:.0}")),
+                ),
+                call.map_or_else(
+                    || "-".into(),
+                    |c| zeroless(&c["cost_list_usd"], |n| format!("{n:.5}")),
+                ),
                 decisions_cell(decisions, i),
                 detail,
             ]
@@ -469,7 +731,16 @@ pub fn task(v: &Value) -> String {
     format!(
         "{head}\n\n{}",
         table(
-            &["#", "STEP", "STATUS", "TOKENS", "DECISIONS", "DETAIL"],
+            &[
+                "#",
+                "STEP",
+                "STATUS",
+                "TOKENS",
+                "OUT",
+                "COST USD",
+                "DECISIONS",
+                "DETAIL"
+            ],
             &rows
         )
     )
@@ -654,6 +925,12 @@ pub fn ok(_: &Value) -> String {
     "ok".into()
 }
 
+/// `vk umount`: what was taken away, named back. A bare "ok" leaves the
+/// reader matching the answer to the argument they typed.
+pub fn unmounted(v: &Value) -> String {
+    format!("unmounted {}", text(&v["arch_id"]))
+}
+
 /// A `--dry-run` of `vk harness run`: the launch line and the `.mcp.json` it
 /// would write, the token already redacted by the daemon.
 pub fn harness_dry_run(v: &Value) -> String {
@@ -765,6 +1042,300 @@ mod tests {
             .expect("a row for the US arch");
         assert!(us.contains("0.0046"), "{us:?}");
         assert!(rendered.contains("EUR/1K"), "{rendered}");
+    }
+
+    /// SP1b Task 8: where the call goes and under whose law it is answered,
+    /// on the same row as what it costs. Two arches that cost the same are
+    /// not the same fact if one of them is in another jurisdiction, and an
+    /// operator must not have to run `vk arch show` per row to find out.
+    #[test]
+    fn top_shows_locality_and_jurisdiction_beside_the_cost() {
+        let cells = |rendered: &str, n: usize| -> Vec<String> {
+            rendered
+                .lines()
+                .nth(n)
+                .expect("that many lines")
+                .split("  ")
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        let screen = top(&json!({
+            "arches": {
+                // Mounted this morning and never called: a row of its own,
+                // not an absence (Ruling 9d).
+                "sha256:eu": {"calls": 0, "tokens_in": 0, "tokens_in_measured": 0,
+                              "cost_list_usd": 0.0, "projected": 0},
+                "sha256:us": {"calls": 2, "tokens_in": 100, "tokens_in_measured": 100,
+                              "cost_list_usd": 0.5, "projected": 0},
+            },
+            "states": {"sha256:eu": "ready", "sha256:us": "ready"},
+            "governed": {"sha256:eu": false, "sha256:us": false},
+            "locality": {"sha256:eu": "cloud", "sha256:us": "cloud"},
+            "jurisdiction": {"sha256:eu": "EU", "sha256:us": "US"},
+            "price_eur_per_1k": {"sha256:eu": null, "sha256:us": 0.0046},
+            "tasks": {}, "stopped_scopes": [], "liveness": {},
+        }));
+        assert_eq!(
+            cells(&screen, 0)[..5],
+            ["ARCH", "LOCALITY", "JURISDICTION", "STATE", "GOVERNED"],
+            "{screen}"
+        );
+        let row = |id: &str| {
+            screen
+                .lines()
+                .find(|l| l.starts_with(id))
+                .unwrap_or_else(|| panic!("a row for {id}:\n{screen}"))
+                .to_string()
+        };
+        let eu = row("sha256:eu");
+        assert!(eu.contains("cloud") && eu.contains(" EU "), "{eu:?}");
+        assert!(eu.contains(" ? "), "an unknown price stays `?`: {eu:?}");
+        let us = row("sha256:us");
+        assert!(us.contains(" US "), "{us:?}");
+        assert!(us.contains("0.0046"), "{us:?}");
+        // An arch with no manifest entry — unmounted since, counters left
+        // behind — claims neither a locality nor a jurisdiction.
+        let orphan = top(&json!({
+            "arches": {"sha256:gone": {"calls": 3, "tokens_in": 9, "tokens_in_measured": 0,
+                                       "cost_list_usd": 0.0, "projected": 0}},
+            "states": {}, "governed": {}, "locality": {}, "jurisdiction": {},
+            "price_eur_per_1k": {}, "tasks": {}, "stopped_scopes": [], "liveness": {},
+        }));
+        assert_eq!(
+            cells(&orphan, 1)[..5],
+            ["sha256:gone", "-", "-", "-", "-"],
+            "{orphan}"
+        );
+    }
+
+    /// `vk top --calls`: the rows behind the totals. Without them an
+    /// operator can see that an arch has spent €4 and not which task did it.
+    #[test]
+    fn top_with_calls_lists_each_call_under_the_totals() {
+        let screen = top(&json!({
+            "arches": {"sha256:a": {"calls": 1, "tokens_in": 1400, "tokens_in_measured": 1400,
+                                    "cost_list_usd": 0.002, "projected": 0}},
+            "states": {"sha256:a": "ready"}, "governed": {"sha256:a": false},
+            "locality": {"sha256:a": "cloud"}, "jurisdiction": {"sha256:a": "US"},
+            "price_eur_per_1k": {"sha256:a": 0.0046},
+            "calls": [{
+                "arch_id": "sha256:a", "task_id": "task-n1-1", "step_index": 1,
+                "tokens_in": 1400, "tokens_in_measured": 1400, "tokens_out": 37,
+                "cost_list_usd": 0.002, "duration_ms": 910, "ts_ms": 1_700_000_000_000u64,
+            }],
+            "tasks": {}, "stopped_scopes": [], "liveness": {},
+        }));
+        assert!(screen.contains("CALL"), "{screen}");
+        assert!(screen.contains("task-n1-1"), "{screen}");
+        // The step a person counts from, not the index a machine does.
+        assert!(screen.contains(" 2 "), "the step is 1-based: {screen}");
+        assert!(screen.contains("37"), "{screen}");
+        assert!(screen.contains("910"), "{screen}");
+        // A harness run's spend is a row like any other, so it is on the
+        // screen instead of missing from the node's total.
+        let harness = top(&json!({
+            "arches": {}, "states": {}, "governed": {}, "locality": {},
+            "jurisdiction": {}, "price_eur_per_1k": {},
+            "calls": [{
+                "arch_id": "harness:claude-code", "task_id": "task-n1-2", "step_index": 0,
+                "tokens_in": 20, "tokens_in_measured": 20, "tokens_out": 5,
+                "cost_list_usd": 0.02, "duration_ms": 12, "ts_ms": 1u64,
+            }],
+            "tasks": {}, "stopped_scopes": [], "liveness": {},
+        }));
+        assert!(harness.contains("harness:claude-code"), "{harness}");
+
+        // A node that has run for a week has more calls than a screen holds,
+        // so the daemon sends the newest few — and the screen says what it is
+        // not showing rather than just stopping.
+        let capped = top(&json!({
+            "arches": {}, "states": {}, "governed": {}, "locality": {},
+            "jurisdiction": {}, "price_eur_per_1k": {},
+            "calls": [{
+                "arch_id": "sha256:a", "task_id": "task-n1-9", "step_index": 0,
+                "tokens_in": 1, "tokens_in_measured": 1, "tokens_out": 1,
+                "cost_list_usd": null, "duration_ms": 1, "ts_ms": 1u64,
+            }],
+            "calls_total": 1_482,
+            "tasks": {}, "stopped_scopes": [], "liveness": {},
+        }));
+        assert!(
+            capped.contains("showing the last 1 of 1482 calls"),
+            "{capped}"
+        );
+    }
+
+    /// `vk arch show`: the identity tuple that *is* the arch id, the
+    /// clearance it may be handed, and — for an arch this kernel governs —
+    /// the image and the caps the process runs under.
+    #[test]
+    fn arch_show_prints_the_identity_tuple_the_clearance_and_the_caps() {
+        let page = arch_show(&json!({
+            "arch_id": "sha256:aaa",
+            "state": "ready",
+            "reason": null,
+            "governed": true,
+            "kind": "ollama",
+            "config": {"model": "gemma3:1b", "image": "ollama/ollama:0.33.3",
+                       "memory": "12g", "cpus": "6", "num_ctx": 8192},
+            "manifest": {
+                "name": "ollama/gemma3:1b",
+                "capabilities": ["generate", "plan"],
+                "locality": "local",
+                "jurisdiction": "FR",
+                "retention_days": null,
+                "cost_per_1k_tokens_eur": 0.0,
+                "latency_ms_p50": 900,
+                "context_ceiling": 4096,
+                "determinism": "seeded_deterministic",
+                "identity": {
+                    "weights_sha256": "sha256:w", "engine": "ollama",
+                    "engine_version": "0.33.3", "backend": "cpu", "quant": "Q4_K_M",
+                    "kv_cache": "f16", "threads": 6, "batch": 512,
+                    "sampling": {"temperature": "0"}, "seed": 7,
+                },
+                "clearance": {"max_scope": "business", "third_party_allowed": false},
+                "governed": true,
+            },
+        }));
+        for named in [
+            "sha256:aaa",
+            "ollama/gemma3:1b",
+            "local",
+            "FR",
+            "ready",
+            // The identity tuple, which is what the id hashes.
+            "engine",
+            "0.33.3",
+            "Q4_K_M",
+            "temperature",
+            // The clearance, which is what it may be handed.
+            "business",
+            // The caps, because this one is a process the kernel contains.
+            "ollama/ollama:0.33.3",
+            "12g",
+        ] {
+            assert!(page.contains(named), "{named} missing from:\n{page}");
+        }
+        // A third-party refusal must read as a refusal, not as an absence.
+        assert!(page.contains("third-party"), "{page}");
+
+        // An arch with no spec recorded says so rather than printing a hole.
+        let bare = arch_show(&json!({
+            "arch_id": "sha256:bbb", "state": "unavailable",
+            "reason": "no mount spec was recorded", "governed": false,
+            "kind": null, "config": null,
+            "manifest": {
+                "name": "mock", "capabilities": ["generate"], "locality": "local",
+                "jurisdiction": "FR", "retention_days": 30,
+                "cost_per_1k_tokens_eur": null, "latency_ms_p50": 1,
+                "context_ceiling": 4096, "determinism": "non_deterministic",
+                "identity": {"weights_sha256": "sha256:w", "engine": "mock",
+                             "engine_version": "1", "backend": "cpu", "quant": "-",
+                             "kv_cache": "-", "threads": 1, "batch": 1,
+                             "sampling": {}, "seed": null},
+                "clearance": {"max_scope": "personal", "third_party_allowed": true},
+                "governed": false,
+            },
+        }));
+        assert!(bare.contains("no mount spec was recorded"), "{bare}");
+        assert!(bare.contains('?'), "an unknown price is `?`: {bare}");
+    }
+
+    /// `vk fsck`: one line per tier, the verdict first, and the reasons under
+    /// the table where a sentence fits.
+    #[test]
+    fn fsck_prints_one_line_per_tier_and_the_reasons_under_them() {
+        let healthy = fsck(&json!({
+            "ok": true,
+            "tiers": [
+                {"tier": "ledger", "checked": 18, "skipped": 0, "failed": 0,
+                 "ok": true, "problems": []},
+                {"tier": "blobs", "checked": 4, "skipped": 1, "failed": 0,
+                 "ok": true, "problems": []},
+            ],
+        }));
+        assert!(healthy.contains("ledger"), "{healthy}");
+        assert!(healthy.contains("18"), "{healthy}");
+        assert!(healthy.contains("1 skipped"), "{healthy}");
+        assert!(healthy.contains("the store verifies"), "{healthy}");
+
+        let broken = fsck(&json!({
+            "ok": false,
+            "tiers": [
+                {"tier": "ledger", "checked": 18, "skipped": 0, "failed": 0,
+                 "ok": true, "problems": []},
+                {"tier": "head", "checked": 1, "skipped": 0, "failed": 1, "ok": false,
+                 "problems": ["the record no longer contains the head this node last wrote"]},
+            ],
+        }));
+        assert!(broken.contains("FAILED"), "{broken}");
+        assert!(
+            broken.contains("head: the record no longer contains"),
+            "the reason belongs under the table: {broken}"
+        );
+        assert!(
+            broken.contains("--rebase-head"),
+            "a head mismatch names the recovery path: {broken}"
+        );
+
+        // And what a rebase did, when one was asked for.
+        let rebased = fsck(&json!({
+            "ok": true,
+            "tiers": [{"tier": "head", "checked": 1, "skipped": 0, "failed": 0,
+                       "ok": true, "problems": []}],
+            "rebased": {
+                "rebased_from": {"seq": 12, "hash": "sha256:aaaa"},
+                "rebased_to": {"seq": 9, "hash": "sha256:bbbb"},
+                "at": 1_700_000_000_000u64,
+            },
+        }));
+        assert!(rebased.contains("seq 12"), "{rebased}");
+        assert!(rebased.contains("seq 9"), "{rebased}");
+    }
+
+    /// Ruling 8: what a step spent is on the screen that shows the step, not
+    /// only in a separate verb. Tokens out and cost per step, dashes where
+    /// the arch measured nothing.
+    #[test]
+    fn a_step_shows_what_the_call_it_made_returned_and_cost() {
+        let t = json!({
+            "id": "task-1", "goal": "g", "artefact_type": "note",
+            "status": "done", "register": "reg-1",
+            "steps": [
+                {"kind": {"kind": "plan", "arch_id": "arch-a"}, "status": "done", "tokens": 1400},
+                {"kind": {"kind": "draft", "arch_id": "arch-b"}, "status": "done", "tokens": 40},
+                {"kind": {"kind": "approve"}, "status": "done", "tokens": 0},
+            ],
+            "usage": [
+                {"arch_id": "arch-a", "task_id": "task-1", "step_index": 0,
+                 "tokens_in": 1400, "tokens_in_measured": 1400, "tokens_out": 37,
+                 "cost_list_usd": 0.002, "duration_ms": 910, "ts_ms": 1u64},
+                {"arch_id": "arch-b", "task_id": "task-1", "step_index": 1,
+                 "tokens_in": 40, "tokens_in_measured": 0, "tokens_out": 0,
+                 "cost_list_usd": null, "duration_ms": 5, "ts_ms": 2u64},
+            ],
+        });
+        let rendered = super::task(&t);
+        assert!(rendered.contains("OUT"), "{rendered}");
+        assert!(rendered.contains("COST"), "{rendered}");
+        assert!(rendered.contains("37"), "{rendered}");
+        assert!(rendered.contains("0.00200"), "{rendered}");
+        // The step whose arch measured nothing claims nothing, and the
+        // approve step made no call at all.
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("approve") && l.contains('-')),
+            "{rendered}"
+        );
+        // A task from a daemon that does not send the field still renders.
+        let mut bare = t.clone();
+        bare.as_object_mut().unwrap().remove("usage");
+        assert!(super::task(&bare).contains("arch-a"));
     }
 
     #[test]
@@ -1027,14 +1598,19 @@ mod tests {
                                       "cost_list_usd": 0.0, "projected": 0}},
             "governed": {"sha256:bbb": true},
             "states": {"sha256:bbb": "unavailable"},
+            "locality": {"sha256:bbb": "cloud"},
+            "jurisdiction": {"sha256:bbb": "US"},
             "unavailable": {"sha256:bbb": "cannot run `claude --version`"},
             "tasks": {}, "stopped_scopes": [], "liveness": {},
         });
         let screen = super::top(&top);
-        assert_eq!(cells(&screen, 0)[..3], ["ARCH", "STATE", "GOVERNED"]);
         assert_eq!(
-            cells(&screen, 1)[..3],
-            ["sha256:bbb", "unavailable", "yes"],
+            cells(&screen, 0)[..5],
+            ["ARCH", "LOCALITY", "JURISDICTION", "STATE", "GOVERNED"]
+        );
+        assert_eq!(
+            cells(&screen, 1)[..5],
+            ["sha256:bbb", "cloud", "US", "unavailable", "yes"],
             "{screen}"
         );
         assert!(
@@ -1048,10 +1624,15 @@ mod tests {
             "arches": {"sha256:ccc": {"calls": 3, "tokens_in": 9, "tokens_in_measured": 0,
                                       "cost_list_usd": 0.0, "projected": 0}},
             "governed": {}, "states": {}, "unavailable": {},
+            "locality": {}, "jurisdiction": {},
             "tasks": {}, "stopped_scopes": [], "liveness": {},
         });
         let screen = super::top(&unmounted);
-        assert_eq!(cells(&screen, 1)[..3], ["sha256:ccc", "-", "-"], "{screen}");
+        assert_eq!(
+            cells(&screen, 1)[..5],
+            ["sha256:ccc", "-", "-", "-", "-"],
+            "{screen}"
+        );
     }
 
     /// `vk status` counts the arches a node has, and says how many of them

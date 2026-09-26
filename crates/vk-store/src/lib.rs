@@ -136,6 +136,280 @@ impl Store {
     }
 }
 
+/// One tier of the whole-store check `vk fsck` runs.
+///
+/// A tier is a kind of damage, not a directory: which repair an operator
+/// has to reach for depends entirely on *which* of these failed, and a single
+/// "the store is broken" would tell them nothing. `checked` is what was
+/// actually looked at, `skipped` what was deliberately not (a shredded
+/// subject's ciphertext is meant to be unreadable), and `problems` is a
+/// bounded sample — `failed` is the true count.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FsckTier {
+    pub tier: String,
+    pub checked: u64,
+    pub skipped: u64,
+    pub failed: u64,
+    pub ok: bool,
+    pub problems: Vec<String>,
+}
+
+/// How many problems one tier reports in full. A store with ten thousand
+/// damaged blobs has one fault, not ten thousand answers: the count is exact
+/// and the list is a sample, so an answer stays a thing a person can read and
+/// a pipe can carry.
+const MAX_PROBLEMS: usize = 16;
+
+impl FsckTier {
+    /// A tier's verdict from what went wrong in it. Public because the
+    /// kernel adds a tier of its own (`mounts`) that the store cannot check.
+    pub fn new(tier: &str, checked: u64, skipped: u64, mut problems: Vec<String>) -> FsckTier {
+        let failed = problems.len() as u64;
+        if problems.len() > MAX_PROBLEMS {
+            let rest = problems.len() - MAX_PROBLEMS;
+            problems.truncate(MAX_PROBLEMS);
+            problems.push(format!("… and {rest} more"));
+        }
+        FsckTier {
+            tier: tier.into(),
+            checked,
+            skipped,
+            failed,
+            ok: failed == 0,
+            problems,
+        }
+    }
+}
+
+/// What `fsck` found, tier by tier. `ok` is the conjunction: one failing tier
+/// is a store that does not verify, and `vk fsck` exits non-zero on it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FsckReport {
+    pub ok: bool,
+    pub tiers: Vec<FsckTier>,
+}
+
+impl FsckReport {
+    /// Fold more tiers in — the kernel's own (`mounts`), which the store
+    /// cannot check because it does not know what a mount is.
+    pub fn with(mut self, tiers: impl IntoIterator<Item = FsckTier>) -> FsckReport {
+        self.tiers.extend(tiers);
+        self.ok = self.tiers.iter().all(|t| t.ok);
+        self
+    }
+}
+
+/// What a `--rebase-head` did: the head that was on record and the one now
+/// recorded in its place.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HeadRebase {
+    /// `None` on a store that had no head recorded at all.
+    pub from: Option<LedgerHead>,
+    pub to: LedgerHead,
+}
+
+impl Store {
+    /// Verify the whole store, tier by tier (SP1b Task 8, review
+    /// recommendation 8 / N1).
+    ///
+    /// `vk ledger verify` answers one question — does the chain recompute —
+    /// and a node can pass it with every blob on disk unreadable. This is the
+    /// other three:
+    ///
+    /// - **ledger**: every link and every hash recomputes, and the first
+    ///   event that does not is named.
+    /// - **head**: the chain still reaches the head this store last recorded,
+    ///   so a tail cut off by a restore is caught even though what is left
+    ///   links perfectly.
+    /// - **blobs**: every blob opens *at the address it is filed under* —
+    ///   `BlobStore::get`'s own three checks (the envelope names it, the AEAD
+    ///   tag binds the ciphertext to it, the plaintext derives it again), run
+    ///   over everything rather than over the one blob somebody read.
+    /// - **keys**: every wrapped DEK still unwraps under the master key.
+    ///
+    /// Read-only. Nothing here writes, so an operator can run it on a store
+    /// they are afraid of.
+    pub fn fsck(&self) -> FsckReport {
+        let tiers = vec![
+            self.fsck_ledger(),
+            self.fsck_head(),
+            self.fsck_blobs(),
+            self.fsck_keys(),
+        ];
+        FsckReport {
+            ok: tiers.iter().all(|t| t.ok),
+            tiers,
+        }
+    }
+
+    fn fsck_ledger(&self) -> FsckTier {
+        let events = self.ledger.events();
+        let problems = match first_bad_seq(events) {
+            None => vec![],
+            Some(seq) => vec![format!(
+                "the hash chain does not recompute from seq {seq} on; the record has been \
+                 rewritten since this node wrote it"
+            )],
+        };
+        FsckTier::new("ledger", events.len() as u64, 0, problems)
+    }
+
+    fn fsck_head(&self) -> FsckTier {
+        // Recomputed rather than read off `self.ledger_head`, so a rebase in
+        // this same process is reflected instead of the verdict `open` froze.
+        let problems = match head_verdict(&self.db, &self.ledger) {
+            Err(e) => vec![format!("the recorded ledger head cannot be read: {e:#}")],
+            Ok(HeadVerdict::Unrecorded | HeadVerdict::Intact) => vec![],
+            Ok(HeadVerdict::Diverged { recorded, found }) => vec![format!(
+                "the record no longer contains the head this node last wrote (seq {}, {}); \
+                 it now ends at {}",
+                recorded.seq,
+                short(&recorded.hash),
+                match &found {
+                    Some(h) => format!("seq {} ({})", h.seq, short(&h.hash)),
+                    None => "nothing at all".into(),
+                }
+            )],
+        };
+        FsckTier::new("head", 1, 0, problems)
+    }
+
+    fn fsck_blobs(&self) -> FsckTier {
+        let (mut checked, mut skipped, mut problems) = (0u64, 0u64, Vec::new());
+        match self.blobs.addresses() {
+            Err(e) => problems.push(format!("the payload tier cannot be listed: {e:#}")),
+            Ok(addresses) => {
+                for hash in addresses {
+                    // A shredded subject is not damage: its DEK was deleted on
+                    // purpose and its ciphertext is meant to stay unreadable.
+                    // Counting erasure as corruption would make every lawful
+                    // erasure request break `fsck` for ever.
+                    if self
+                        .blobs
+                        .envelope(&hash)
+                        .is_ok_and(|e| self.blobs.is_shredded(&e.key_id))
+                    {
+                        skipped += 1;
+                        continue;
+                    }
+                    checked += 1;
+                    if let Err(e) = self.blobs.get(&hash) {
+                        problems.push(format!("{hash}: {e}"));
+                    }
+                }
+            }
+        }
+        match self.blobs.orphans() {
+            Err(e) => problems.push(format!("the payload tier cannot be listed: {e:#}")),
+            Ok(orphans) => problems.extend(
+                orphans
+                    .into_iter()
+                    .map(|h| format!("{h}: ciphertext with no envelope beside it")),
+            ),
+        }
+        FsckTier::new("blobs", checked, skipped, problems)
+    }
+
+    fn fsck_keys(&self) -> FsckTier {
+        let (mut checked, mut problems) = (0u64, Vec::new());
+        match self.blobs.key_ids() {
+            Err(e) => problems.push(format!("the key tier cannot be listed: {e:#}")),
+            Ok(ids) => {
+                for key_id in ids {
+                    checked += 1;
+                    if let Err(e) = self.blobs.dek_unwraps(&key_id) {
+                        problems.push(format!("{key_id}: {e}"));
+                    }
+                }
+            }
+        }
+        FsckTier::new("keys", checked, 0, problems)
+    }
+
+    /// Re-record the ledger head from the chain as it is on disk now — the
+    /// recovery path after a **legitimate** restore, and nothing else.
+    ///
+    /// A restore from a backup puts back a shorter record than the one this
+    /// store last wrote, which is exactly the shape of a tail somebody cut:
+    /// the store cannot tell them apart, so it refuses to serve on either
+    /// until a human says which this is. That is what this is — the human's
+    /// statement, written down.
+    ///
+    /// Refused on a chain that does not itself verify: re-recording a head
+    /// onto a record already known to be rewritten would make the next open
+    /// call it intact, which is the one outcome this whole mechanism exists
+    /// to prevent. Refused on an empty record for the same reason — there is
+    /// no head to name.
+    ///
+    /// The caller is responsible for the ceremony (`vk fsck --rebase-head
+    /// --force`, a presence proof and a typed confirmation) and for putting
+    /// the operation on the record.
+    pub fn rebase_head(&mut self) -> Result<HeadRebase> {
+        anyhow::ensure!(
+            self.ledger.verify(),
+            "the ledger chain does not verify, so there is no head worth recording: rebasing \
+             one would only make the next open call a rewritten record intact. Restore the \
+             record itself"
+        );
+        let to = self
+            .ledger
+            .events()
+            .last()
+            .map(LedgerHead::of)
+            .context("the ledger has no events, so there is no head to record")?;
+        let from = match self.db.kv_get(LEDGER_HEAD)? {
+            Some(json) => serde_json::from_str(&json).ok(),
+            None => None,
+        };
+        self.db
+            .kv_set(LEDGER_HEAD, &serde_json::to_string(&to)?)
+            .context("record the rebased ledger head")?;
+        // The verdict this store has been carrying since `open` is now
+        // wrong: without this, every append for the rest of this process
+        // would still refuse to move the head (see `append_event`).
+        self.ledger_head = HeadVerdict::Intact;
+        Ok(HeadRebase { from, to })
+    }
+}
+
+/// The seq of the first event whose chain no longer recomputes, or `None`
+/// when the whole chain holds.
+///
+/// Found by bisection on the prefix: `verify_chain` is a whole-chain verdict
+/// and the hashing rule lives in the contract, so the way to ask "how far
+/// does it hold?" without a second copy of that rule here is to ask the
+/// contract about prefixes. `log₂ n` verifications rather than `n`, because
+/// `fsck` runs on stores whose record is the whole history of a node.
+fn first_bad_seq(events: &[vk_contracts::ledger::LedgerEvent]) -> Option<u64> {
+    let holds = |n: usize| {
+        let mut chain = vk_contracts::ledger::Ledger::default();
+        for e in &events[..n] {
+            chain.push_verified(e.clone());
+        }
+        chain.verify_chain()
+    };
+    if events.is_empty() || holds(events.len()) {
+        return None;
+    }
+    // `holds(lo)` is true (the empty prefix always is), `holds(hi)` is false.
+    let (mut lo, mut hi) = (0usize, events.len());
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if holds(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Some(events[hi - 1].seq)
+}
+
+/// A hash as a person compares it: the first twelve hex digits.
+fn short(hash: &str) -> String {
+    let hex = hash.trim_start_matches("sha256:");
+    hex.get(..12).unwrap_or(hex).to_string()
+}
+
 fn head_verdict(db: &db::Db, ledger: &ledger_fs::LedgerFs) -> Result<HeadVerdict> {
     let Some(json) = db.kv_get(LEDGER_HEAD)? else {
         return Ok(HeadVerdict::Unrecorded);
@@ -163,6 +437,231 @@ mod tests {
 
     fn open(dir: &std::path::Path) -> Store {
         Store::open(dir, keys::KeySource::File(dir.join("master.key"))).unwrap()
+    }
+
+    /// One tier of a report, by name.
+    fn tier<'a>(r: &'a FsckReport, name: &str) -> &'a FsckTier {
+        r.tiers
+            .iter()
+            .find(|t| t.tier == name)
+            .unwrap_or_else(|| panic!("no {name} tier in {r:?}"))
+    }
+
+    /// A store with something in every tier: a chain, two subjects' blobs and
+    /// therefore two DEKs.
+    fn furnished(dir: &std::path::Path) -> Store {
+        let mut s = open(dir);
+        append(&mut s, "boot", 1);
+        append(&mut s, "stop", 2);
+        s.blobs
+            .put("subject-a", vk_contracts::labels::Label::bottom(), b"alpha")
+            .unwrap();
+        s.blobs
+            .put("subject-b", vk_contracts::labels::Label::bottom(), b"beta")
+            .unwrap();
+        s
+    }
+
+    /// The healthy case, which is the one an operator runs first: every tier
+    /// is named, every tier is `ok`, and the counts are the things that were
+    /// actually looked at rather than a bare "fine".
+    #[test]
+    fn fsck_checks_every_tier_of_a_healthy_store() {
+        let d = tempfile::tempdir().unwrap();
+        let s = furnished(d.path());
+        let r = s.fsck();
+        assert!(r.ok, "{r:?}");
+        let names: Vec<&str> = r.tiers.iter().map(|t| t.tier.as_str()).collect();
+        assert_eq!(names, ["ledger", "head", "blobs", "keys"], "{r:?}");
+        assert_eq!(tier(&r, "ledger").checked, 2, "{r:?}");
+        assert_eq!(tier(&r, "head").checked, 1, "{r:?}");
+        assert_eq!(tier(&r, "blobs").checked, 2, "{r:?}");
+        assert_eq!(tier(&r, "keys").checked, 2, "{r:?}");
+        for t in &r.tiers {
+            assert_eq!(t.failed, 0, "{t:?}");
+            assert!(t.problems.is_empty(), "{t:?}");
+        }
+    }
+
+    /// The two ways a record goes wrong are two different tiers, and each must
+    /// name its own: a cut tail links perfectly and only the recorded head
+    /// catches it, while a rewritten line breaks the chain itself.
+    #[test]
+    fn fsck_tells_a_cut_tail_from_a_rewritten_line() {
+        let d = tempfile::tempdir().unwrap();
+        drop(furnished(d.path()));
+        let seg = d.path().join("ledger").join("seg-000000.jsonl");
+        let text = std::fs::read_to_string(&seg).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+
+        // Cut: the chain still verifies, the head no longer matches.
+        std::fs::write(&seg, format!("{}\n", lines[0])).unwrap();
+        let r = open(d.path()).fsck();
+        assert!(!r.ok, "a cut tail is a failure: {r:?}");
+        assert!(tier(&r, "ledger").ok, "what is left still links: {r:?}");
+        let head = tier(&r, "head");
+        assert!(!head.ok, "{head:?}");
+        assert_eq!(head.failed, 1, "{head:?}");
+        assert!(
+            head.problems.iter().any(|p| p.contains("seq 1")),
+            "the head tier must name the head it could not find: {head:?}"
+        );
+
+        // Rewritten: valid JSON, a chain that no longer recomputes.
+        let mut first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        first["payload_hash"] = serde_json::Value::String("sha256:tampered".into());
+        std::fs::write(
+            &seg,
+            format!("{}\n{}\n", serde_json::to_string(&first).unwrap(), lines[1]),
+        )
+        .unwrap();
+        let r = open(d.path()).fsck();
+        assert!(!r.ok, "{r:?}");
+        let chain = tier(&r, "ledger");
+        assert!(!chain.ok, "{chain:?}");
+        assert!(
+            chain.problems.iter().any(|p| p.contains("seq 0")),
+            "the ledger tier must name the first event that does not recompute: {chain:?}"
+        );
+    }
+
+    /// A blob whose bytes are not what its address says. The store's own `get`
+    /// is what decides — AEAD under the address, then the address derived
+    /// again from the plaintext — so `fsck` is the same check, run over
+    /// everything rather than over the one blob somebody happened to read.
+    #[test]
+    fn fsck_finds_a_blob_that_is_not_what_its_address_says() {
+        let d = tempfile::tempdir().unwrap();
+        let s = furnished(d.path());
+        let env = s.blobs.envelope_of("subject-a", b"alpha").unwrap();
+        drop(s);
+        let bin = d
+            .path()
+            .join("blobs")
+            .join(env.hash.trim_start_matches("sha256:"))
+            .with_extension("bin");
+        let mut bytes = std::fs::read(&bin).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&bin, bytes).unwrap();
+
+        let r = open(d.path()).fsck();
+        assert!(!r.ok, "{r:?}");
+        let blobs = tier(&r, "blobs");
+        assert_eq!(blobs.checked, 2, "both were looked at: {blobs:?}");
+        assert_eq!(blobs.failed, 1, "{blobs:?}");
+        assert!(
+            blobs.problems.iter().any(|p| p.contains(&env.hash)),
+            "the failing blob is named: {blobs:?}"
+        );
+        assert!(tier(&r, "keys").ok, "the keys are untouched: {r:?}");
+    }
+
+    /// A DEK that no longer unwraps under the master key — a keyring entry
+    /// replaced, a file restored from the wrong backup. Its own tier, because
+    /// it is a different repair from a damaged blob.
+    #[test]
+    fn fsck_finds_a_dek_that_no_longer_unwraps() {
+        let d = tempfile::tempdir().unwrap();
+        drop(furnished(d.path()));
+        let dek = d
+            .path()
+            .join("blobs")
+            .join("keys")
+            .join(format!("{}.dek", hex::encode(b"subject-b")));
+        assert!(dek.exists(), "{}", dek.display());
+        std::fs::write(&dek, b"not a wrapped key").unwrap();
+
+        let r = open(d.path()).fsck();
+        assert!(!r.ok, "{r:?}");
+        let keys = tier(&r, "keys");
+        assert_eq!(keys.checked, 2, "{keys:?}");
+        assert_eq!(keys.failed, 1, "{keys:?}");
+        assert!(
+            keys.problems.iter().any(|p| p.contains("subject-b")),
+            "the subject whose key is gone is named: {keys:?}"
+        );
+    }
+
+    /// A shredded subject is not damage: its DEK was deleted on purpose and
+    /// its ciphertext is meant to be unreadable for ever. `fsck` counts it as
+    /// skipped and stays green, or erasure would read as corruption.
+    #[test]
+    fn fsck_counts_a_shredded_subject_as_skipped_not_failed() {
+        let d = tempfile::tempdir().unwrap();
+        let s = furnished(d.path());
+        s.blobs
+            .shred(vk_contracts::storage::ShredEvent {
+                key_id: "subject-b".into(),
+                issuer: vk_contracts::principal::Principal::Machine {
+                    node_id: "n1".into(),
+                    lease_id: "test".into(),
+                },
+                hlc_ms: 9,
+            })
+            .unwrap();
+        drop(s);
+        let r = open(d.path()).fsck();
+        assert!(r.ok, "a shredded subject is not a fault: {r:?}");
+        let blobs = tier(&r, "blobs");
+        assert_eq!(blobs.skipped, 1, "{blobs:?}");
+        assert_eq!(blobs.failed, 0, "{blobs:?}");
+    }
+
+    /// The recovery path after a legitimate restore, and its one refusal: the
+    /// head may be re-recorded from a chain that still links, never from one
+    /// that does not — re-recording a head onto a record known to be broken
+    /// would only make the next open call it intact.
+    #[test]
+    fn the_head_is_rebased_only_from_a_chain_that_still_verifies() {
+        let d = tempfile::tempdir().unwrap();
+        drop(furnished(d.path()));
+        let seg = d.path().join("ledger").join("seg-000000.jsonl");
+        let text = std::fs::read_to_string(&seg).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+
+        // A rewritten line: the rebase is refused, and the head is left alone.
+        let mut first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        first["payload_hash"] = serde_json::Value::String("sha256:tampered".into());
+        std::fs::write(
+            &seg,
+            format!("{}\n{}\n", serde_json::to_string(&first).unwrap(), lines[1]),
+        )
+        .unwrap();
+        {
+            let mut s = open(d.path());
+            let why = s.rebase_head().expect_err("a broken chain is not rebased");
+            assert!(why.to_string().contains("does not verify"), "{why:#}");
+        }
+
+        // A cut tail: the rebase records the head the chain now ends at, and
+        // the store opens `Intact` afterwards.
+        std::fs::write(&seg, format!("{}\n", lines[0])).unwrap();
+        let rebase = {
+            let mut s = open(d.path());
+            assert!(matches!(s.ledger_head, HeadVerdict::Diverged { .. }));
+            let rebase = s.rebase_head().expect("a chain that links is rebased");
+            // In this process too: the appends that follow record the head
+            // again rather than leaving it where a divergence froze it.
+            assert_eq!(s.ledger_head, HeadVerdict::Intact);
+            assert!(s.fsck().ok, "the store verifies once the head is right");
+            rebase
+        };
+        assert_eq!(rebase.from.as_ref().map(|h| h.seq), Some(1), "{rebase:?}");
+        assert_eq!(rebase.to.seq, 0, "{rebase:?}");
+        let s = open(d.path());
+        assert_eq!(s.ledger_head, HeadVerdict::Intact);
+        assert!(s.fsck().ok, "{:?}", s.fsck());
+    }
+
+    /// Nothing to rebase onto is a refusal, not a head recorded over an empty
+    /// record.
+    #[test]
+    fn an_empty_ledger_cannot_be_rebased_onto() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = open(d.path());
+        let why = s.rebase_head().expect_err("an empty ledger is not a head");
+        assert!(why.to_string().contains("no events"), "{why:#}");
     }
 
     fn append(s: &mut Store, kind: &str, n: u64) -> LedgerEvent {

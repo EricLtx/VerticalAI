@@ -18,13 +18,39 @@ use vk_harness::launch::{launch_claude_code, ExitReason, HarnessConfig, HarnessR
 use vk_kernel::tasks::{HarnessConnectionsRecord, HarnessLaunch, StepKind, StepStatus, TaskStatus};
 use vk_kernel::RealKernel;
 
+/// A kernel over `dir`, retrying the store's single-writer lock for a moment.
+///
+/// The retry is about *this test binary*, not about the lock. On Unix the
+/// lock is an `flock` on an open file description, and a description is
+/// inherited by every `fork` — including the one `Command::spawn` makes,
+/// which holds a copy of every open descriptor until the child `exec`s. One
+/// test here launches a stand-in process; the tests run on threads of one
+/// process; so a store this test closed can stay locked for as long as some
+/// other test's child sits between `fork` and `exec`. Under load on WSL that
+/// is milliseconds, and it was enough to fail this file about one run in
+/// three (present since before SP1b Task 8; reproduced at 8d0b358).
+///
+/// Nothing about the daemon's own rule is relaxed: `StoreLock::acquire` still
+/// refuses at once, and `a_second_vkd_over_a_served_state_dir_is_refused_and_
+/// writes_nothing` still proves it. This is the test waiting out a race the
+/// test suite creates for itself.
 fn open(dir: &Path) -> RealKernel {
-    RealKernel::open(
-        dir,
-        vk_store::keys::KeySource::File(dir.join("m.key")),
-        "n1",
-    )
-    .unwrap()
+    let source = || vk_store::keys::KeySource::File(dir.join("m.key"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match RealKernel::open(dir, source(), "n1") {
+            Ok(k) => return k,
+            Err(e) if std::time::Instant::now() < deadline => {
+                assert!(
+                    e.to_string().contains("already open"),
+                    "opening {}: {e:#}",
+                    dir.display()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("opening {}: {e:#}", dir.display()),
+        }
+    }
 }
 
 fn machine(now: u64) -> Ctx {

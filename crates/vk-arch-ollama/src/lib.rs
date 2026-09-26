@@ -656,6 +656,7 @@ impl ArchAdapter for OllamaAdapter {
             // The server counted the prompt; the estimate above was only ever
             // a stand-in for this.
             tokens_in_measured: Some(answer.prompt_eval_count),
+            tokens_out: Some(answer.eval_count),
             // A model on this machine has no list price. Zero would be a
             // number; `None` is the truth.
             cost_list_usd: None,

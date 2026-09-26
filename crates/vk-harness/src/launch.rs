@@ -333,6 +333,13 @@ pub struct ClaudeOutcome {
     /// List-price equivalent, as the CLI reports it — a comparison under a
     /// subscription, not a charge (SP1b ruling 3).
     pub total_cost_usd: f64,
+    /// Prompt tokens of the whole session, cached ones included, as the CLI
+    /// counted them. What a harness run's per-call usage row records, so the
+    /// money a harness spends is beside the money the arches spend rather
+    /// than missing from the node's total (SP1b Task 8).
+    pub tokens_in: u64,
+    /// Completion tokens of the whole session.
+    pub tokens_out: u64,
     /// Every tool call the fence refused, as `Tool(what)` — the evidence that
     /// the confinement held for this run.
     pub permission_denials: Vec<String>,
@@ -624,6 +631,23 @@ pub fn parse_outcome(stdout: &str) -> Option<ClaudeOutcome> {
             .get("total_cost_usd")
             .and_then(Value::as_f64)
             .unwrap_or(0.0),
+        // `usage` as the CLI prints it: uncached prompt tokens plus both
+        // cache halves, which is the whole prompt — the same sum the
+        // `claude-code` *arch* reports, so a harness call and an arch call
+        // are comparable numbers.
+        tokens_in: [
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ]
+        .iter()
+        .filter_map(|k| obj.get("usage")?.get(k)?.as_u64())
+        .fold(0u64, u64::saturating_add),
+        tokens_out: obj
+            .get("usage")
+            .and_then(|u| u.get("output_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         permission_denials: denials,
     })
 }

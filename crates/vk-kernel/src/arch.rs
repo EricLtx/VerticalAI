@@ -23,6 +23,11 @@ pub struct Completion {
     /// estimate, because there is no reason to keep a guess beside a
     /// measurement of the same thing (ruling 7).
     pub tokens_in_measured: Option<u32>,
+    /// Completion tokens as the provider counted them. The kernel has no
+    /// estimate to fall back on here — it never sees the answer before the
+    /// arch produces it — so this is `None` for an arch that reports nothing,
+    /// and the per-call usage row says `0` rather than guessing (Ruling 8).
+    pub tokens_out: Option<u32>,
     /// List-price equivalent in USD, as the provider reported it. Under a
     /// subscription nothing is billed per call, so this is what the same call
     /// would have cost on the meter, not a charge; the manifest's

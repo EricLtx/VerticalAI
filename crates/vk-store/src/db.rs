@@ -27,6 +27,12 @@ pub const TABLES: &[&str] = &[
     // (SP1b Task 5 fix round 1): what lets an `approval.recorded` event of
     // proof `webauthn` be re-verified from the store and the ledger alone.
     "assertions",
+    // One row per completed call on an arch (SP1b Task 8, ruling 8): which
+    // arch, which task's which step, what it spent and how long it took. The
+    // per-arch counters are the sum of these; only the rows can say which
+    // task the money went on. The key is `<ts>-<seq>`, so `list_json`'s
+    // key order is the order the calls came back in.
+    "usage",
     "kv_test",
 ];
 
