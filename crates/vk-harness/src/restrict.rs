@@ -25,7 +25,9 @@
 //! alone cannot run the binary: `%SystemRoot%\System32` grants read/execute to
 //! `Users`, not to `RESTRICTED`, so the restricting check on every system DLL
 //! would fail and the child would die `0xC0000142` (`STATUS_DLL_INIT_FAILED`) —
-//! measured on this machine. `Users`/`Everyone` in the set let the child reach
+//! the System32 ACL was read on this machine (`Users` has read/execute, the two
+//! AppContainer SIDs do too, no entry names `RESTRICTED`); the `RESTRICTED`-only
+//! row itself was not run. `Users`/`Everyone` in the set let the child reach
 //! what the OS grants the world (System32, `%ProgramFiles%`, …, none of it
 //! secret); the logon SID lets it reach the window station and desktop that
 //! `user32`'s initialiser needs. What is **not** widened is the fence that
@@ -65,18 +67,26 @@
 //! added — every set tried, up to `{RESTRICTED, Users, Everyone, Authenticated
 //! Users, logon}`, and with `RESTRICTED` also granted on the window station and
 //! desktop — a normal Win32 child (`cmd.exe`, and a bare Rust console `.exe`
-//! alike) dies at initialisation with `0xC0000142` (`STATUS_DLL_INIT_FAILED`).
-//! The cause is not the files above: process initialisation must also reach
-//! session/global namespace objects (`\Sessions\N\BaseNamedObjects`,
-//! `\KnownDlls`, the CSR port), whose DACLs grant the specific user and the
-//! logon session but not, for the *restricting* check, any SID that is not also
-//! on the sensitive objects. Granting a restricting SID on those namespaces is a
-//! **session/machine-global** change, and the alternative that runs a process
-//! while confining it — a LowBox/AppContainer token — is a **different
-//! mechanism** from the spike's `CreateRestrictedToken`. Which of the two to
-//! take is a founder decision (Task 10 reported it as `NEEDS_CONTEXT`); until
-//! then, restricted-token launch stays the open TCB item and the harness runs
-//! under the Job Object and Claude Code's own fence, as Task 4 shipped.
+//! alike) dies at initialisation with `0xC0000142` (`STATUS_DLL_INIT_FAILED`);
+//! with `logon`, `Users` or `Authenticated Users` as the only restricting SID it
+//! dies `0xC0000022` (`STATUS_ACCESS_DENIED`). **What was measured stops
+//! there: the denying object was not isolated** — no Process Monitor or ETW
+//! trace was taken, and the DACLs of the session and global namespace objects
+//! were not read. What is *inferred* from the exit codes, the ACLs that were
+//! read (System32 and the profile's ancestors) and the grants tried is that
+//! process initialisation must also reach session/global namespace objects
+//! (`\Sessions\N\BaseNamedObjects`, `\KnownDlls`, the CSR port) that grant
+//! none of those SIDs for the *restricting* check. The conclusion does not
+//! rest on that inference: no per-harness grant (workspace, config directory,
+//! window station, desktop) let the child initialise, so every remaining
+//! candidate is session- or machine-global — granting a restricting SID on
+//! those namespaces is a **session/machine-global** change, and the alternative
+//! that runs a process while confining it — a LowBox/AppContainer token — is a
+//! **different mechanism** from the spike's `CreateRestrictedToken`. Which of
+//! the two to take is a founder decision (Task 10 reported it as
+//! `NEEDS_CONTEXT`); until then, restricted-token launch stays the open TCB
+//! item and the harness runs under the Job Object and Claude Code's own fence,
+//! as Task 4 shipped.
 //!
 //! Every `unsafe` block here carries the reason it is sound.
 #![cfg(windows)]
@@ -90,10 +100,15 @@ use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, LUID, WAIT_OBJECT_0,
 };
-use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+use windows::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSidToSidW, GetSecurityInfo, SetSecurityInfo,
+    SE_WINDOW_OBJECT,
+};
 use windows::Win32::Security::{
-    CreateRestrictedToken, GetTokenInformation, LookupPrivilegeValueW, TokenGroups,
-    TokenPrivileges, CREATE_RESTRICTED_TOKEN_FLAGS, LUID_AND_ATTRIBUTES, PSID, SID_AND_ATTRIBUTES,
+    CreateRestrictedToken, DeleteAce, EqualSid, GetAce, GetLengthSid, GetTokenInformation,
+    LookupPrivilegeValueW, TokenGroups, TokenPrivileges, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
+    CONTAINER_INHERIT_ACE, CREATE_RESTRICTED_TOKEN_FLAGS, DACL_SECURITY_INFORMATION,
+    LUID_AND_ATTRIBUTES, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SID_AND_ATTRIBUTES,
     TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 
@@ -325,41 +340,381 @@ impl Drop for Sid {
     }
 }
 
-/// Grant `RESTRICTED` on this process's window station and its thread's
-/// desktop, so a restricted child's `user32` initialiser can reach them —
-/// without which even a console child dies `0xC0000142` (measured). Chromium's
-/// approach. Idempotent: `SetEntriesInAclW` merges the entry.
-///
-/// This touches the daemon's own window station (`WinSta0` interactively,
-/// `Service-0x0-…$` under the service). It grants only `RESTRICTED`, which
-/// nothing else on the machine holds, so the widening is to this harness alone.
-pub fn grant_restricted_on_winsta_desktop() -> Result<()> {
+/// `ACCESS_ALLOWED_ACE_TYPE`: the type byte of an allow entry (`windows` 0.62
+/// places it under `System::SystemServices` as a `u32`).
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+/// What the window-object grant asks for: `GENERIC_ALL`, container- and
+/// object-inheritable.
+const GRANT_MASK: u32 = 0x1000_0000;
+const GRANT_ACE_FLAGS: u8 = (CONTAINER_INHERIT_ACE.0 | OBJECT_INHERIT_ACE.0) as u8;
+
+/// How the object stores that request once set — read back on this machine
+/// (Task 10 pre-review fix), in two shapes. Applied once to a clean object:
+/// one entry, `OBJECT_INHERIT | CONTAINER_INHERIT` with the mask mapped to the
+/// object's all-access — `WINSTA_ALL_ACCESS | STANDARD_RIGHTS_REQUIRED` =
+/// `0x000F_037F` on a window station, `DESKTOP_ALL` = `0x000F_01FF` on a
+/// desktop. Applied again over that entry (a run that could not restore,
+/// then another): `SetEntriesInAclW` re-merges it into the canonical split the
+/// logon SID's and SYSTEM's own entries beside it have — on a window station an
+/// inherit-only part that keeps generic bits (`OBJECT_INHERIT |
+/// CONTAINER_INHERIT | INHERIT_ONLY`, mask `0xF000_0000`) plus an effective
+/// `NO_PROPAGATE_INHERIT` part with the mapped mask; on a desktop, which has no
+/// children, one effective entry with no flags. These `(flags, mask)` pairs,
+/// with the allow type and the `RESTRICTED` SID, are what the exact-match
+/// removal looks for; nothing else on either object is touched.
+const STORED_GRANT_WINSTA: [(u8, u32); 3] = [
+    (0x03, 0x000F_037F),
+    (0x0b, 0xF000_0000),
+    (0x04, 0x000F_037F),
+];
+const STORED_GRANT_DESKTOP: [(u8, u32); 2] = [(0x03, 0x000F_01FF), (0x00, 0x000F_01FF)];
+
+/// Which window object an entry was read from: the object manager stores
+/// the same request differently on each (see the constants above).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowObject {
+    WindowStation,
+    Desktop,
+}
+
+/// The window station and the desktop this process runs on.
+fn winsta_and_desktop() -> Result<(HANDLE, HANDLE)> {
     use windows::Win32::System::StationsAndDesktops::{GetProcessWindowStation, GetThreadDesktop};
     use windows::Win32::System::Threading::GetCurrentThreadId;
     // SAFETY: both return process/thread-scoped handles that need no close and
-    // are valid for the calls below.
+    // stay valid for the life of the process and thread.
     let (winsta, desktop) = unsafe {
         (
             GetProcessWindowStation().context("GetProcessWindowStation")?,
             GetThreadDesktop(GetCurrentThreadId()).context("GetThreadDesktop")?,
         )
     };
-    grant_restricted_on_object(HANDLE(winsta.0)).context("window station")?;
-    grant_restricted_on_object(HANDLE(desktop.0)).context("desktop")?;
-    Ok(())
+    Ok((HANDLE(winsta.0), HANDLE(desktop.0)))
+}
+
+/// One entry of a window object's DACL as read back — the tests' evidence and
+/// the exact-match removal below. The SID is carried as bytes and compared as
+/// bytes (Ruling 35); `sid` is its `S-1-…` rendering, for printing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AceView {
+    /// `ACE_HEADER.AceType` (`0` allow, `1` deny).
+    pub ace_type: u8,
+    /// `ACE_HEADER.AceFlags`: the inheritance bits.
+    pub flags: u8,
+    /// The access mask as the object stores it.
+    pub mask: u32,
+    /// The trustee, rendered; `?` for an ACE type this reader does not parse.
+    pub sid: String,
+    sid_bytes: Vec<u8>,
+}
+
+impl AceView {
+    /// Does this entry's trustee equal `sid`, byte for byte?
+    fn names(&self, sid: &Sid) -> bool {
+        if self.sid_bytes.is_empty() {
+            return false;
+        }
+        // SAFETY: both pointers address valid SIDs for the call's duration.
+        unsafe { EqualSid(PSID(self.sid_bytes.as_ptr() as *mut c_void), sid.psid()) }.is_ok()
+    }
+
+    /// Does this entry name `RESTRICTED`?
+    pub fn names_restricted(&self) -> bool {
+        Sid::parse(WORKSPACE_GRANT_SID)
+            .map(|r| self.names(&r))
+            .unwrap_or(false)
+    }
+
+    /// Is this entry exactly what [`grant_restricted_on_winsta_desktop`] leaves
+    /// on `on`: an allow for `RESTRICTED` with the flags and mask the object
+    /// manager stores for the grant there (the `STORED_GRANT_*` pairs)?
+    pub fn is_the_grant(&self, on: WindowObject) -> bool {
+        let stored: &[(u8, u32)] = match on {
+            WindowObject::WindowStation => &STORED_GRANT_WINSTA,
+            WindowObject::Desktop => &STORED_GRANT_DESKTOP,
+        };
+        self.ace_type == ACCESS_ALLOWED_ACE_TYPE
+            && stored.contains(&(self.flags, self.mask))
+            && self.names_restricted()
+    }
+
+    fn render(&self) -> String {
+        format!(
+            "type={} flags=0x{:02x} mask=0x{:08x} sid={}",
+            self.ace_type, self.flags, self.mask, self.sid
+        )
+    }
+}
+
+/// Render a list of entries, one per line, for the tests' evidence.
+pub fn render_aces(aces: &[AceView]) -> String {
+    if aces.is_empty() {
+        return String::from("  (no DACL entries)");
+    }
+    aces.iter()
+        .map(|a| format!("  {}", a.render()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn sid_string(bytes: &[u8]) -> String {
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    if bytes.is_empty() {
+        return String::from("?");
+    }
+    let mut s = PWSTR::null();
+    // SAFETY: `bytes` holds a valid SID for the call; the string it allocates
+    // is read once and freed with `LocalFree`.
+    unsafe {
+        if ConvertSidToStringSidW(PSID(bytes.as_ptr() as *mut c_void), &mut s).is_err() {
+            return String::from("?");
+        }
+        let rendered = s.to_string().unwrap_or_else(|_| String::from("?"));
+        let _ = LocalFree(Some(HLOCAL(s.0 as *mut c_void)));
+        rendered
+    }
+}
+
+/// A window object's DACL, copied out of the descriptor `GetSecurityInfo`
+/// allocates — DWORD-aligned, its `AclSize` capacity kept — so it can be
+/// walked, edited and set back after the descriptor is freed. `None` is a NULL
+/// DACL.
+struct DaclCopy(Option<Vec<u32>>);
+
+impl DaclCopy {
+    fn read(handle: HANDLE) -> Result<DaclCopy> {
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut psd = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: `handle` is a live window-object handle; the out-pointers are
+        // live; the descriptor is copied from, then freed exactly once.
+        unsafe {
+            let rc = GetSecurityInfo(
+                handle,
+                SE_WINDOW_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut dacl),
+                None,
+                Some(&mut psd),
+            );
+            if rc.is_err() {
+                anyhow::bail!("GetSecurityInfo on a window object: {rc:?}");
+            }
+            let copy = if dacl.is_null() {
+                None
+            } else {
+                let size = (*dacl).AclSize as usize;
+                let mut words = vec![0u32; size.div_ceil(4)];
+                std::ptr::copy_nonoverlapping(
+                    dacl as *const u8,
+                    words.as_mut_ptr() as *mut u8,
+                    size,
+                );
+                Some(words)
+            };
+            let _ = LocalFree(Some(HLOCAL(psd.0)));
+            Ok(DaclCopy(copy))
+        }
+    }
+
+    fn ptr(&self) -> *const ACL {
+        self.0
+            .as_ref()
+            .map_or(std::ptr::null(), |w| w.as_ptr() as *const ACL)
+    }
+
+    /// Set this DACL back on `handle`, byte for byte.
+    fn apply(&self, handle: HANDLE) -> Result<()> {
+        // SAFETY: the ACL (or null, a NULL DACL) stays valid for the call.
+        let rc = unsafe {
+            SetSecurityInfo(
+                handle,
+                SE_WINDOW_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(self.ptr()),
+                None,
+            )
+        };
+        if rc.is_err() {
+            anyhow::bail!("SetSecurityInfo on a window object: {rc:?}");
+        }
+        Ok(())
+    }
+
+    fn aces(&self) -> Result<Vec<AceView>> {
+        let Some(words) = &self.0 else {
+            return Ok(Vec::new());
+        };
+        let acl = words.as_ptr() as *const ACL;
+        // SAFETY: `acl` is a whole, valid ACL we copied; `GetAce` hands back
+        // pointers inside it, read within its bounds.
+        unsafe {
+            let count = u32::from((*acl).AceCount);
+            let mut out = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let mut ace: *mut c_void = std::ptr::null_mut();
+                GetAce(acl, i, &mut ace).with_context(|| format!("GetAce {i}"))?;
+                let header = *(ace as *const ACE_HEADER);
+                let (mask, sid_bytes) = if header.AceType <= 1 {
+                    let a = ace as *const ACCESS_ALLOWED_ACE;
+                    let psid = PSID(std::ptr::addr_of!((*a).SidStart) as *mut c_void);
+                    let len = GetLengthSid(psid) as usize;
+                    (
+                        (*a).Mask,
+                        std::slice::from_raw_parts(psid.0 as *const u8, len).to_vec(),
+                    )
+                } else {
+                    (0, Vec::new())
+                };
+                out.push(AceView {
+                    ace_type: header.AceType,
+                    flags: header.AceFlags,
+                    mask,
+                    sid: sid_string(&sid_bytes),
+                    sid_bytes,
+                });
+            }
+            Ok(out)
+        }
+    }
+
+    /// Delete every entry `ours` says is ours; how many were deleted.
+    fn strip(&mut self, ours: impl Fn(&AceView) -> bool) -> Result<usize> {
+        let views = self.aces()?;
+        let Some(words) = &mut self.0 else {
+            return Ok(0);
+        };
+        let acl = words.as_mut_ptr() as *mut ACL;
+        let mut removed = 0;
+        for (i, view) in views.iter().enumerate().rev() {
+            if ours(view) {
+                // SAFETY: `acl` is our own writable copy; walking from the end,
+                // a deletion never shifts an index still to be visited.
+                unsafe { DeleteAce(acl, i as u32) }.with_context(|| format!("DeleteAce {i}"))?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+}
+
+/// The DACL entries of this process's window station and of its thread's
+/// desktop, as stored — read for the tests' before/after evidence.
+pub fn winsta_desktop_aces() -> Result<(Vec<AceView>, Vec<AceView>)> {
+    let (winsta, desktop) = winsta_and_desktop()?;
+    Ok((
+        DaclCopy::read(winsta).context("window station")?.aces()?,
+        DaclCopy::read(desktop).context("desktop")?.aces()?,
+    ))
+}
+
+/// The window-station and desktop grant, held: both DACLs were copied before
+/// the entry was added and are set back, byte for byte, when this is dropped —
+/// so a test that fails while holding it still leaves the session's window
+/// station and desktop exactly as it found them.
+pub struct WinstaDesktopGrant {
+    winsta: HANDLE,
+    desktop: HANDLE,
+    saved_winsta: DaclCopy,
+    saved_desktop: DaclCopy,
+    restored: bool,
+}
+
+impl WinstaDesktopGrant {
+    /// Put both DACLs back now, reporting a failure instead of swallowing it.
+    pub fn restore(mut self) -> Result<()> {
+        self.restore_inner()
+    }
+
+    fn restore_inner(&mut self) -> Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        self.restored = true;
+        let a = self
+            .saved_winsta
+            .apply(self.winsta)
+            .context("restore the window station's DACL");
+        let b = self
+            .saved_desktop
+            .apply(self.desktop)
+            .context("restore the desktop's DACL");
+        a.and(b)
+    }
+}
+
+impl Drop for WinstaDesktopGrant {
+    fn drop(&mut self) {
+        if let Err(e) = self.restore_inner() {
+            eprintln!("restricted-token grant: {e:#}");
+        }
+    }
+}
+
+/// Grant `RESTRICTED` on this process's window station and its thread's
+/// desktop — the grant Chromium's sandbox makes so a restricted child's
+/// `user32` initialiser can reach them. On this machine it did not change the
+/// outcome: the child dies `0xC0000142` with the grant and without it
+/// (measured, Task 10 group G). `SetEntriesInAclW` merges the entry, so the
+/// grant is idempotent.
+///
+/// This touches the daemon's own window station (`WinSta0` interactively,
+/// `Service-0x0-…$` under the service). It grants only `RESTRICTED`, which
+/// nothing else on the machine holds, so the widening is to this harness alone
+/// — and it is undone when the returned guard drops.
+pub fn grant_restricted_on_winsta_desktop() -> Result<WinstaDesktopGrant> {
+    let (winsta, desktop) = winsta_and_desktop()?;
+    let guard = WinstaDesktopGrant {
+        winsta,
+        desktop,
+        saved_winsta: DaclCopy::read(winsta).context("window station")?,
+        saved_desktop: DaclCopy::read(desktop).context("desktop")?,
+        restored: false,
+    };
+    // From here a failure drops `guard`, which puts back what was saved.
+    grant_restricted_on_object(winsta).context("window station")?;
+    grant_restricted_on_object(desktop).context("desktop")?;
+    Ok(guard)
+}
+
+/// Remove, from this process's window station and desktop, every entry that
+/// is exactly what the grant adds ([`AceView::is_the_grant`]) — the cleanup
+/// for a run that ended before its guard could restore (a process killed
+/// mid-test). Returns how many entries each object lost. Nothing else is
+/// touched: an entry that differs in type, flags, mask or trustee stays.
+pub fn strip_restricted_from_winsta_desktop() -> Result<(usize, usize)> {
+    let (winsta, desktop) = winsta_and_desktop()?;
+    let mut counts = (0, 0);
+    for (handle, count, on, what) in [
+        (
+            winsta,
+            &mut counts.0,
+            WindowObject::WindowStation,
+            "window station",
+        ),
+        (desktop, &mut counts.1, WindowObject::Desktop, "desktop"),
+    ] {
+        let mut dacl = DaclCopy::read(handle).context(what)?;
+        *count = dacl.strip(|a| a.is_the_grant(on)).context(what)?;
+        if *count > 0 {
+            dacl.apply(handle).context(what)?;
+        }
+    }
+    Ok(counts)
 }
 
 /// Add an inheritable allow-all ACE for `RESTRICTED` to a kernel object's DACL.
 fn grant_restricted_on_object(handle: HANDLE) -> Result<()> {
     use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Authorization::{
-        GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE,
-        SET_ACCESS, SE_WINDOW_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
+        SetEntriesInAclW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SET_ACCESS, TRUSTEE_IS_SID,
+        TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
     };
-    use windows::Win32::Security::{
-        ACE_FLAGS, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
-        PSECURITY_DESCRIPTOR,
-    };
+    use windows::Win32::Security::ACE_FLAGS;
 
     let restricted = Sid::parse(WORKSPACE_GRANT_SID)?;
     // SAFETY: `handle` is a live window-object handle; the out-pointers are
@@ -381,9 +736,9 @@ fn grant_restricted_on_object(handle: HANDLE) -> Result<()> {
             anyhow::bail!("GetSecurityInfo on a window object: {rc:?}");
         }
         let ea = EXPLICIT_ACCESS_W {
-            grfAccessPermissions: 0x1000_0000, // GENERIC_ALL
+            grfAccessPermissions: GRANT_MASK,
             grfAccessMode: SET_ACCESS,
-            grfInheritance: ACE_FLAGS(CONTAINER_INHERIT_ACE.0 | OBJECT_INHERIT_ACE.0),
+            grfInheritance: ACE_FLAGS(u32::from(GRANT_ACE_FLAGS)),
             Trustee: TRUSTEE_W {
                 pMultipleTrustee: std::ptr::null_mut(),
                 MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
