@@ -26,7 +26,9 @@ impl LedgerFs {
     /// Does **not** verify the hash chain; the boot sequence does that — call
     /// `ledger.verify()` after `open`.
     pub fn open(dir: &Path) -> Result<LedgerFs> {
-        std::fs::create_dir_all(dir)?;
+        // The directory too, not only the segments in it (review N2): `0700`
+        // on Unix, re-applied on every open.
+        crate::paths::private_dir(dir).with_context(|| format!("create {}", dir.display()))?;
         let mut segs: Vec<PathBuf> = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;

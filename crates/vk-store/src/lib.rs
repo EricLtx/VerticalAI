@@ -973,6 +973,63 @@ mod tests {
         assert!(s.fsck().ok);
     }
 
+    /// Unix only: the payload tier is the owner's alone too (review N2) —
+    /// `blobs/`, `blobs/keys/` and `blobs/shredded/` `0700`; the wrapped DEKs,
+    /// the ciphertext, the envelopes and the tombstones `0600` — and so is the
+    /// ledger's own directory. Set explicitly, so the umask does not decide
+    /// it; and a directory an older version left open is tightened on open,
+    /// as the state directory is.
+    #[cfg(unix)]
+    #[test]
+    fn the_payload_tier_and_the_ledger_directory_are_private_to_the_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        {
+            let s = furnished(d.path());
+            s.blobs
+                .shred(vk_contracts::storage::ShredEvent {
+                    key_id: "subject-b".into(),
+                    issuer: vk_contracts::principal::Principal::Machine {
+                        node_id: "n1".into(),
+                        lease_id: "test".into(),
+                    },
+                    hlc_ms: 9,
+                })
+                .unwrap();
+        }
+        let dirs = ["blobs", "blobs/keys", "blobs/shredded", "ledger"];
+        let files: Vec<std::path::PathBuf> = ["blobs", "blobs/keys", "blobs/shredded"]
+            .iter()
+            .flat_map(|dir| std::fs::read_dir(d.path().join(dir)).unwrap())
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_file())
+            .collect();
+        // Two blobs (a `.bin` and a `.json` each), one wrapped key left and
+        // one tombstone: the whole tier, and nothing in it was missed.
+        assert_eq!(files.len(), 6, "{files:?}");
+
+        // Born private, whatever the umask.
+        for dir in dirs {
+            assert_eq!(mode(&d.path().join(dir)), 0o700, "{dir}");
+        }
+        for f in &files {
+            assert_eq!(mode(f), 0o600, "{}", f.display());
+        }
+
+        // And tightened on open when an older version left them open — as a
+        // careless `mkdir` under a permissive umask would have.
+        for dir in dirs {
+            std::fs::set_permissions(d.path().join(dir), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let s = open(d.path());
+        for dir in dirs {
+            assert_eq!(mode(&d.path().join(dir)), 0o700, "{dir} after reopen");
+        }
+        drop(s);
+    }
+
     /// Unix only: the state directory and every file the store writes are
     /// the owner's alone — including ones a previous version left open to
     /// others, which are tightened on open rather than trusted.

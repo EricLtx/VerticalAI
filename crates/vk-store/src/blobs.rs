@@ -23,9 +23,17 @@ pub struct BlobStore {
 }
 
 impl BlobStore {
+    /// Open the tier under `dir`, making its three directories — the
+    /// ciphertext and envelopes, the wrapped keys, the tombstones — the
+    /// owner's alone (`0700` on Unix, new or not; review N2). The files are
+    /// born `0600` by `write_private`; the directories above them are what is
+    /// re-applied on every open, because that is what an older version's
+    /// umask would have left open and what a walk of the whole tier at boot
+    /// need not be spent on.
     pub fn open(dir: &Path, master: MasterKey) -> Result<BlobStore> {
-        std::fs::create_dir_all(dir.join("keys"))?;
-        std::fs::create_dir_all(dir.join("shredded"))?;
+        for sub in [dir.to_path_buf(), dir.join("keys"), dir.join("shredded")] {
+            crate::paths::private_dir(&sub).with_context(|| format!("create {}", sub.display()))?;
+        }
         let mut shredded = BTreeSet::new();
         for entry in std::fs::read_dir(dir.join("shredded"))? {
             // No `.flatten()`: a per-entry read error must fail `open`, not
