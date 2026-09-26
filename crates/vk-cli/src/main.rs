@@ -1517,34 +1517,54 @@ mod detach_tests {
     /// `SIGHUP` — sent to the session when the shell that ran `vk boot`
     /// closes — never reaches it.
     ///
-    /// The child reports its session and this process reports its own, both
-    /// through the same `ps -o sess=` — a numeric session id on Linux, an
-    /// opaque session pointer on macOS. The test never parses it; it only
-    /// asserts the two **differ**, which is exactly what distinguishes `setsid`
-    /// (a new session) from a mere `process_group(0)` (a new group in the same
-    /// session): a regression to the latter would leave the two equal.
+    /// On Linux the child reports its session id (`ps -o sess=` is numeric
+    /// there) and it must **differ** from this process's — exactly what tells
+    /// `setsid` (a new session) from a mere `process_group(0)` (a new group in
+    /// the same session). macOS's `ps` reports no session id at all (`sess`
+    /// prints `0` for every process), so there the test checks the portable,
+    /// necessary consequence of `setsid`: the child leads a process group of
+    /// its own (`pgid == pid`) that is not this process's.
     #[test]
     fn a_detached_daemon_leads_its_own_session() {
         let d = tempfile::tempdir().unwrap();
         let mut cmd = Command::new("sh");
+        #[cfg(target_os = "linux")]
         cmd.args(["-c", "ps -o sess= -p $$"]);
+        #[cfg(not(target_os = "linux"))]
+        cmd.args(["-c", "ps -o pgid= -p $$"]);
         detach(&mut cmd, d.path()).unwrap();
-        let status = cmd.status().unwrap();
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id();
+        let status = child.wait().unwrap();
         assert!(status.success(), "{status}");
-        let child_sess = std::fs::read_to_string(d.path().join("vkd.log")).unwrap();
-        let child_sess = child_sess.trim();
-        assert!(!child_sess.is_empty(), "the child printed no session");
+        let reported = std::fs::read_to_string(d.path().join("vkd.log")).unwrap();
+        let reported = reported.trim().to_string();
+        assert!(!reported.is_empty(), "the child printed nothing");
 
-        // This process's own session, read the same way.
-        let ours = Command::new("ps")
-            .args(["-o", "sess=", "-p", &std::process::id().to_string()])
-            .output()
-            .unwrap();
-        let ours = String::from_utf8_lossy(&ours.stdout);
-        let ours = ours.trim();
-        assert_ne!(
-            child_sess, ours,
-            "the child must be in a different session (setsid), not this one"
-        );
+        #[cfg(target_os = "linux")]
+        {
+            // This process's own session, read the same way: the two differ.
+            let ours = Command::new("ps")
+                .args(["-o", "sess=", "-p", &std::process::id().to_string()])
+                .output()
+                .unwrap();
+            let ours = String::from_utf8_lossy(&ours.stdout);
+            assert_ne!(
+                reported,
+                ours.trim(),
+                "the child must be in a different session (setsid), not this one"
+            );
+            let _ = pid;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let pgid: i32 = reported
+                .parse()
+                .unwrap_or_else(|e| panic!("{e}: {reported:?}"));
+            assert_eq!(pgid, pid as i32, "the child leads its own process group");
+            // SAFETY: `getpgrp` reads this process's own process group id.
+            let ours = unsafe { libc::getpgrp() };
+            assert_ne!(pgid, ours, "and it is not this process's group");
+        }
     }
 }
