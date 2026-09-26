@@ -23,31 +23,38 @@ pub enum AcceptError {
     Listener(std::io::Error),
 }
 
+/// The endpoint that belongs to one account, by name. **The** derivation:
+/// `default_endpoint` asks it about whoever is running, and the Windows
+/// service asks it about the interactive user it was installed for (founder
+/// decision, Task 6 follow-up), so the two can never disagree about where a
+/// person's node listens. Change the shape here or nowhere.
+///
+/// `name` is the bare account name — `%USERNAME%`, which is what
+/// `LookupAccountSid` returns beside the domain, not `DOMAIN\name`.
+pub fn user_endpoint(name: &str) -> Endpoint {
+    #[cfg(windows)]
+    {
+        Endpoint(format!(r"\\.\pipe\vk-{name}"))
+    }
+    #[cfg(not(windows))]
+    {
+        Endpoint(format!("/tmp/vk-{name}/vk.sock"))
+    }
+}
+
 /// Where `vkd` listens for this user. One daemon per account, by name. The
 /// Unix fallback is a directory of our own, which `bind` creates `0700`.
 pub fn default_endpoint() -> Endpoint {
     #[cfg(windows)]
     {
-        Endpoint(format!(r"\\.\pipe\vk-{}", whoami()))
+        user_endpoint(&whoami())
     }
     #[cfg(not(windows))]
     {
-        Endpoint(
-            std::env::var("XDG_RUNTIME_DIR")
-                .map(|d| format!("{d}/vk.sock"))
-                .unwrap_or_else(|_| format!("/tmp/vk-{}/vk.sock", whoami())),
-        )
+        std::env::var("XDG_RUNTIME_DIR")
+            .map(|d| Endpoint(format!("{d}/vk.sock")))
+            .unwrap_or_else(|_| user_endpoint(&whoami()))
     }
-}
-
-/// Where a `vkd` running as the Windows service listens (SP1b Task 6). Not
-/// `vk-<user>`: the service account's name is not the name of the human it
-/// serves, and a pipe whose name depended on whatever `%USERNAME%` a virtual
-/// account reports could not be written down in advance — which is exactly
-/// what the DACL and the documentation have to do. One machine-wide daemon,
-/// one well-known name; `vk` reaches it with `$VK_ENDPOINT`.
-pub fn service_endpoint() -> Endpoint {
-    Endpoint(r"\\.\pipe\vk".into())
 }
 
 /// The SID of `NT SERVICE\vkd`, the virtual account the service runs as.
@@ -55,7 +62,8 @@ pub fn service_endpoint() -> Endpoint {
 /// A service's virtual account SID is a pure function of the service's name
 /// (SHA-1 of the uppercased name in UTF-16LE), so this is a constant, not a
 /// lookup — which is what lets a *client* know, before it trusts anything on
-/// the wire, which account is allowed to be serving the machine-wide pipe.
+/// the wire, that the daemon answering on its own endpoint may legitimately be
+/// the service rather than a process of its own account.
 /// `vk-service` derives the same value from the name and asserts they agree,
 /// so the two can never drift; `sc.exe showsid vkd` prints it too.
 pub const VKD_SERVICE_SID: &str = "S-1-5-80-2321736676-1855261038-2536180385-746309522-2788627728";
@@ -116,6 +124,28 @@ mod dacl_tests {
 
     const SERVICE: &str = "S-1-5-80-2321736676-1855261038-2536180385-746309522-2788627728";
     const USER: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+
+    /// One derivation, asked two ways. The service resolves `--user-sid` to an
+    /// account name and calls `user_endpoint` with it; a person's own daemon
+    /// calls `default_endpoint`, which calls `user_endpoint` with
+    /// `%USERNAME%`. If these ever diverge, `vk` stops finding the node the
+    /// service is running for.
+    #[test]
+    fn the_endpoint_of_an_account_is_derived_from_its_name_alone() {
+        #[cfg(windows)]
+        {
+            assert_eq!(user_endpoint("eric").0, r"\\.\pipe\vk-eric");
+            // A name with a space is a name: pipe names take one.
+            assert_eq!(user_endpoint("Ada L").0, r"\\.\pipe\vk-Ada L");
+            // And `default_endpoint` is this function about whoever is running.
+            assert_eq!(default_endpoint(), user_endpoint(&whoami()));
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(user_endpoint("eric").0, "/tmp/vk-eric/vk.sock");
+            assert_eq!(user_endpoint("Ada L").0, "/tmp/vk-Ada L/vk.sock");
+        }
+    }
 
     #[test]
     fn two_sids_become_the_task_6_dacl() {
@@ -463,6 +493,18 @@ pub mod os {
     /// serves one human, a `--user-sid` naming no account is a typo, and a
     /// pipe with an unresolvable ACE admits nobody.
     pub fn ensure_user_sid(sid: &str) -> Result<()> {
+        user_account_name(sid).map(|_| ())
+    }
+
+    /// The bare account name of a string SID — `%USERNAME%`, not
+    /// `DOMAIN\name` — refusing anything that is not a real user account.
+    ///
+    /// This is both halves of the check the installer needs: that `--user-sid`
+    /// names a *user* (see `ensure_user_sid` above for why the shape alone is
+    /// no answer), and *which* user, so the service can bind that person's own
+    /// endpoint rather than a machine-wide one they would have to be told
+    /// about (founder decision, Task 6 follow-up).
+    pub fn user_account_name(sid: &str) -> Result<String> {
         use windows::core::{PCWSTR, PWSTR};
         use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
         use windows::Win32::Security::{
@@ -508,19 +550,24 @@ pub mod os {
                      one you are logged in as"
                 )
             })?;
+            let account = String::from_utf16_lossy(&name[..name_len as usize]);
             anyhow::ensure!(
                 kind == SidTypeUser,
-                "{sid} names {}, which is {} — the endpoint admits one *user*, and a group or an \
-                 alias here would hand it to everybody in that group. `whoami /user` prints the \
-                 SID of the account you are logged in as.",
-                String::from_utf16_lossy(&name[..name_len as usize]),
+                "{sid} names {account}, which is {} — the endpoint admits one *user*, and a group \
+                 or an alias here would hand it to everybody in that group. `whoami /user` prints \
+                 the SID of the account you are logged in as.",
                 match kind {
                     k if k == SidTypeUnknown => "an account of unknown type".to_string(),
                     k if k == SidTypeDeletedAccount => "a deleted account".to_string(),
                     k => format!("not a user account (SID_NAME_USE {})", k.0),
                 }
             );
-            Ok(())
+            anyhow::ensure!(
+                !account.is_empty(),
+                "{sid} resolves to a user account with no name, which no endpoint can be derived \
+                 from"
+            );
+            Ok(account)
         }
     }
 
@@ -805,6 +852,24 @@ pub mod os {
                 assert!(err.contains(sid), "{what} ({sid}) must be refused: {err}");
             }
             assert!(ensure_user_sid("BA").is_err());
+        }
+
+        /// The installer's resolution, on the one SID this test can be sure
+        /// of: its own. The name it comes back with must be the name
+        /// `%USERNAME%` carries, because that is what the endpoint the
+        /// interactive `vk` dials is derived from — if these two ever
+        /// disagree, the service binds a pipe nobody looks for.
+        #[test]
+        fn a_user_sid_resolves_to_the_account_name_the_endpoint_is_built_from() {
+            let me = current_process_sid().unwrap();
+            let name = user_account_name(&me).unwrap();
+            assert!(!name.is_empty());
+            assert!(
+                !name.contains('\\'),
+                "the bare name, not DOMAIN\\name: {name}"
+            );
+            assert_eq!(name, whoami(), "LookupAccountSid and %USERNAME% must agree");
+            assert_eq!(user_endpoint(&name), default_endpoint());
         }
 
         /// The squatter case, in one process: a name somebody else is already

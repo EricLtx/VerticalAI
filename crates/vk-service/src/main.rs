@@ -64,6 +64,12 @@ struct InstallArgs {
     /// The `vkd-service.exe` to register. Defaults to this executable.
     #[arg(long)]
     binary: Option<PathBuf>,
+    /// The endpoint the service binds. Defaults to the interactive user's own
+    /// — `\\.\pipe\vk-<their account name>`, resolved from `--user-sid` — so
+    /// their `vk` finds the node with nothing configured. An explicit one is
+    /// an override, and whoever passes it has to tell `vk` about it.
+    #[arg(long)]
+    endpoint: Option<String>,
     /// Run `docker info` as the service account at every start and record the
     /// verdict in the log (spike 6a: is Docker Desktop's engine reachable from
     /// a virtual account at all?).
@@ -80,6 +86,11 @@ struct RunArgs {
     /// The interactive user the endpoint admits beside this account.
     #[arg(long)]
     user_sid: String,
+    /// The endpoint to bind, as `install` resolved it and wrote it into the
+    /// `ImagePath`. Absent, the daemon derives the same name from
+    /// `--user-sid` itself.
+    #[arg(long)]
+    endpoint: Option<String>,
     /// Probe Docker before the daemon starts; see `install --probe-docker`.
     #[arg(long)]
     probe_docker: bool,
@@ -99,6 +110,10 @@ impl RunArgs {
             "--user-sid".to_string(),
             self.user_sid.clone(),
         ];
+        if let Some(ep) = &self.endpoint {
+            argv.push("--endpoint".to_string());
+            argv.push(ep.clone());
+        }
         argv.extend(self.daemon_args.iter().cloned());
         argv
     }
@@ -110,13 +125,16 @@ impl RunArgs {
 fn describe(cmd: &Cmd) -> String {
     match cmd {
         Cmd::Install(a) => format!(
-            "install {} for user {} from {}{}{}, pipe DACL {}",
+            "install {} for user {} from {}, on {}{}{}, pipe DACL {}",
             pipe_acl::SERVICE_ACCOUNT,
             a.user_sid.as_deref().unwrap_or("<this account>"),
             a.binary
                 .as_deref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "<this executable>".into()),
+            a.endpoint
+                .as_deref()
+                .unwrap_or("<that user's own endpoint>"),
             if a.probe_docker {
                 ", probing docker"
             } else {
@@ -209,8 +227,9 @@ mod scm {
     /// What `services.msc` shows.
     const DISPLAY_NAME: &str = "VerticalAI kernel daemon (vkd)";
     const DESCRIPTION: &str = "Opens the VerticalAI store, verifies the ledger chain and serves \
-                               kernel syscalls on \\\\.\\pipe\\vk. The endpoint admits this \
-                               service account and the interactive user named at install only.";
+                               kernel syscalls on the interactive user's own named pipe. The \
+                               endpoint admits this service account and the user named at \
+                               install only; `sc qc vkd` shows which pipe and which user.";
 
     /// `ERROR_SERVICE_DOES_NOT_EXIST`.
     const NO_SUCH_SERVICE: i32 = 1060;
@@ -240,13 +259,27 @@ mod scm {
         // refused here rather than by a service that admits a whole group.
         vk_ipc::transport::os::ensure_user_sid(&user_sid).context("--user-sid")?;
         let dacl = pipe_acl::pipe_sddl(pipe_acl::SERVICE_NAME, &user_sid)?;
+        // The endpoint is resolved here and written into the `ImagePath`, so
+        // `sc qc vkd` says where the node listens and a later change to the
+        // derivation cannot move a service that is already installed. The
+        // daemon derives the same name from the same `--user-sid` through the
+        // same function, so the two cannot disagree.
+        let endpoint = match &a.endpoint {
+            Some(explicit) => vk_ipc::transport::Endpoint(explicit.clone()),
+            None => vkd::service_endpoint_for(&user_sid)?,
+        };
         let binary = match a.binary {
             Some(p) => p,
             None => std::env::current_exe().context("find this executable")?,
         };
         let binary = registrable_binary(&binary)?;
-        let mut launch: Vec<OsString> =
-            vec!["run".into(), "--user-sid".into(), OsString::from(&user_sid)];
+        let mut launch: Vec<OsString> = vec![
+            "run".into(),
+            "--user-sid".into(),
+            OsString::from(&user_sid),
+            "--endpoint".into(),
+            OsString::from(&endpoint.0),
+        ];
         if a.probe_docker {
             launch.push("--probe-docker".into());
         }
@@ -306,7 +339,11 @@ mod scm {
             pipe_acl::service_account_sid(pipe_acl::SERVICE_NAME)
         );
         println!("user_sid={user_sid}");
-        println!("endpoint={}", vk_ipc::transport::service_endpoint().0);
+        println!("endpoint={}", endpoint.0);
+        println!(
+            "user_account={}",
+            vk_ipc::transport::os::user_account_name(&user_sid).unwrap_or_default()
+        );
         println!("pipe_dacl={dacl}");
         println!("state_dir={}", state_dir.display());
         println!("log={}", state_dir.join("vkd.log").display());
@@ -582,6 +619,7 @@ mod scm {
             tracing::info!(
                 command = %describe(&super::Cmd::Run(RunArgs {
                     user_sid: a.user_sid.clone(),
+                    endpoint: a.endpoint.clone(),
                     probe_docker: a.probe_docker,
                     daemon_args: a.daemon_args.clone(),
                 })),
@@ -803,6 +841,7 @@ mod tests {
             Cmd::Install(InstallArgs {
                 user_sid: Some(USER.into()),
                 binary: None,
+                endpoint: None,
                 probe_docker: false,
                 daemon_args: vec![],
             })
@@ -814,6 +853,7 @@ mod tests {
             parse(&["vkd-service", "run", "--user-sid", USER]),
             Cmd::Run(RunArgs {
                 user_sid: USER.into(),
+                endpoint: None,
                 probe_docker: false,
                 daemon_args: vec![],
             })
@@ -890,6 +930,30 @@ mod tests {
                 "node-1"
             ]
         );
+        // What `install` actually writes into the `ImagePath`: the endpoint it
+        // resolved, passed straight through, so the service binds the name the
+        // installer decided rather than deriving one again at every start.
+        let Cmd::Run(with_ep) = parse(&[
+            "vkd-service",
+            "run",
+            "--user-sid",
+            USER,
+            "--endpoint",
+            r"\.\pipek-eric",
+        ]) else {
+            panic!("that is a run");
+        };
+        assert_eq!(
+            with_ep.daemon_argv(),
+            [
+                "vkd",
+                "--as-service",
+                "--user-sid",
+                USER,
+                "--endpoint",
+                r"\.\pipek-eric"
+            ]
+        );
     }
 
     /// The DACL is in the sentence, so that `vkd-service install` on a machine
@@ -912,6 +976,23 @@ mod tests {
         // ACE nobody meant.
         let bad = describe(&parse(&["vkd-service", "install", "--user-sid", "WD"]));
         assert!(bad.contains("<refused:"), "{bad}");
+    }
+
+    /// And which endpoint. Unnamed it is the user's own, which only a machine
+    /// that can resolve the SID knows — so the sentence says whose, not what.
+    #[test]
+    fn install_says_which_endpoint_it_would_bind() {
+        let derived = describe(&parse(&["vkd-service", "install", "--user-sid", USER]));
+        assert!(derived.contains("<that user's own endpoint>"), "{derived}");
+        let explicit = describe(&parse(&[
+            "vkd-service",
+            "install",
+            "--user-sid",
+            USER,
+            "--endpoint",
+            r"\.\pipek-elsewhere",
+        ]));
+        assert!(explicit.contains(r"\.\pipek-elsewhere"), "{explicit}");
     }
 
     #[test]

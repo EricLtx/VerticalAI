@@ -347,8 +347,7 @@ copy "$env:CARGO_TARGET_DIR\release\vk*.exe" "$env:ProgramFiles\VerticalAI\"
 & "$env:ProgramFiles\VerticalAI\vkd-service.exe" install   # --user-sid defaults to you
 & "$env:ProgramFiles\VerticalAI\vkd-service.exe" start
 
-# from an ordinary shell, from then on
-$env:VK_ENDPOINT = '\\.\pipe\vk'
+# from an ordinary shell, from then on -- nothing to configure
 vk status
 ```
 
@@ -361,13 +360,18 @@ because an elevated `mkdir` there is owned by the administrators. (Signing is
 the SP1 gate's job; until then nothing verifies *what* is at that path, only
 who may change it.)
 
-The endpoint is the machine-wide `\\.\pipe\vk`, not the per-user
-`\\.\pipe\vk-<user>` a `vk boot` daemon takes, and the state directory is
-`%ProgramData%\VerticalAI\vk` rather than any one person's app data. `vk` needs
-`$VK_ENDPOINT` (or `--endpoint`) to reach it; everything else about the shell is
-unchanged. Stopping the service is `vkd-service stop`, and `vkd-service
-uninstall` removes it — leaving the state directory and the service account's
-keyring entries behind, which is where the node's whole record still is.
+**The service listens where that person's `vk` already looks.** `install`
+resolves `--user-sid` to its account name and registers the endpoint that
+name gives — `\\.\pipe\vk-<user>`, the very name a `vk boot` daemon of
+theirs would take — so the shell needs no `$VK_ENDPOINT` and no `--endpoint`.
+One derivation serves both (`transport::user_endpoint`), so they cannot drift.
+The corollary: **a `vkd` of your own and the service cannot both run**, because
+they want the same pipe; whichever starts second is refused, naming the holder.
+`vkd-service install --endpoint <name>` overrides it, and then `vk` has to be
+told too. The state directory is `%ProgramData%\VerticalAI\vk` rather than any
+one person's app data. Stopping the service is `vkd-service stop`, and
+`vkd-service uninstall` removes it — leaving the state directory and the service
+account's keyring entries behind, which is where the node's whole record is.
 
 **The endpoint's ACL is the first authentication factor, and it is written
 out — for every daemon, not only the service.** The default DACL of a named
@@ -425,13 +429,14 @@ elevated PowerShell and builds nothing:
 
 | `vkd-service` verb | what it does |
 |---|---|
-| `install [--user-sid S] [--binary PATH] [--probe-docker] [-- <vkd args>]` | create the service under `NT SERVICE\vkd`; print the SIDs, the endpoint, the DACL and the `ImagePath` |
+| `install [--user-sid S] [--binary PATH] [--endpoint EP] [--probe-docker] [-- <vkd args>]` | create the service under `NT SERVICE\vkd`, on that user's own endpoint unless one is named; print the SIDs, the account, the endpoint, the DACL and the `ImagePath` |
 | `uninstall` | stop it if it is running, delete it |
 | `start` / `stop` | control it and wait for the new state |
-| `run --user-sid S` | the service control manager's own entry point; it runs `vkd --as-service --user-sid S` in this process. Not for a terminal |
+| `run --user-sid S [--endpoint EP]` | the service control manager's own entry point; it runs `vkd --as-service --user-sid S --endpoint EP` in this process, with the endpoint `install` resolved. Not for a terminal |
 
 `vkd --as-service --user-sid <SID>` is that daemon on its own, without the SCM:
-same state directory, same endpoint, same DACL. It refuses without
+same state directory, same DACL, and the same endpoint — it resolves the SID
+to an account name and derives the pipe exactly as `install` does. It refuses without
 `--user-sid`, because a service that did not know which user to admit would
 serve nobody.
 
@@ -442,7 +447,7 @@ serve nobody.
 | state directory | this user's local app data, never a synced folder; `%ProgramData%\VerticalAI\vk` under `--as-service` | `--state-dir DIR` |
 | master key | OS keyring, service `vk`, user `master` | `--master-key-file FILE` (tests and CI) |
 | node device key | OS keyring | `--node-key-file FILE`, or `$VK_NODE_KEY_FILE` |
-| endpoint | `\\.\pipe\vk-<user>` (Windows), `\\.\pipe\vk` under `--as-service`; `$XDG_RUNTIME_DIR/vk.sock`, else `/tmp/vk-<user>/vk.sock` (Unix) | `--endpoint EP`, or `$VK_ENDPOINT` |
+| endpoint | `\\.\pipe\vk-<user>` (Windows — under `--as-service` too, for the `--user-sid` account); `$XDG_RUNTIME_DIR/vk.sock`, else `/tmp/vk-<user>/vk.sock` (Unix) | `--endpoint EP`, or `$VK_ENDPOINT` |
 | endpoint ACL | the creating account's — Unix: `0600` in a `0700` directory; Windows: `D:(A;;GA;;;<that account>)` | `--as-service`: `D:(A;;GA;;;<service SID>)(A;;GA;;;<--user-sid>)` |
 | state directory ACL | Unix `0700`; Windows, the parent's (per user under `%LOCALAPPDATA%`) | `--as-service`: the service account, SYSTEM and the administrators, protected and inherited |
 | passkey pages | `http://localhost:7734`, on loopback only | `--web-port PORT` (`0`: one the OS picks) |

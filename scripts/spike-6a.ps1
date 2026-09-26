@@ -24,7 +24,9 @@
       2.  copies vk.exe, vkd.exe and vkd-service.exe to
           %ProgramFiles%\VerticalAI (admin-owned, because this shell is
           elevated) and installs the service from there, with --probe-docker;
-      3.  starts it and waits for `vk status` to answer;
+      3.  starts it and waits for `vk status` to answer -- with nothing set
+          in the environment, because the service binds the interactive
+          user's own endpoint;
       4.  `vk status`, `vk ls /arches`, `vk ledger verify` as the interactive
           user, over the service's pipe;
       5.  stops and starts it again, and re-runs `vk ledger verify` -- the
@@ -103,7 +105,11 @@ param(
 $ErrorActionPreference = 'Continue'
 
 $ServiceName = 'vkd'
-$Endpoint    = '\\.\pipe\vk'
+# The endpoint is the interactive user's own, derived in preflight from
+# -UserSid: the service binds the name that user's `vk` already dials, so
+# nothing here sets $env:VK_ENDPOINT.
+$PipeLeaf    = $null
+$Endpoint    = $null
 $StateDir    = Join-Path $env:ProgramData 'VerticalAI\vk'
 $DaemonLog   = Join-Path $StateDir 'vkd.log'
 $DockerLog   = Join-Path $StateDir 'docker-probe.log'
@@ -214,6 +220,23 @@ if (-not $UserSid) { $UserSid = $identity.User.Value }
 Record 'interactive_user' $identity.Name
 Record 'user_sid' $UserSid
 
+# The account name behind that SID, and so the pipe. `vkd-service install`
+# resolves the same SID the same way (LookupAccountSid) and the daemon derives
+# the same name from it, so this is the endpoint the founder's own `vk` will
+# dial with nothing configured.
+try {
+    $sidObj = New-Object System.Security.Principal.SecurityIdentifier($UserSid)
+    $UserAccount = $sidObj.Translate([System.Security.Principal.NTAccount]).Value
+    $UserAccount = $UserAccount.Substring($UserAccount.LastIndexOf('\') + 1)
+} catch {
+    Write-Host "cannot resolve $UserSid to an account name: $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
+}
+$PipeLeaf = "vk-$UserAccount"
+$Endpoint = "\\.\pipe\$PipeLeaf"
+Record 'user_account' $UserAccount
+Record 'endpoint_expected' $Endpoint
+
 if (-not $ServiceBinary) { $ServiceBinary = Join-Path $BuildDir 'vkd-service.exe' }
 if (-not (Test-Path -LiteralPath $ServiceBinary)) {
     Write-Host "no such file: $ServiceBinary" -ForegroundColor Red
@@ -248,8 +271,14 @@ if ($existing) {
     Write-Host ("    & '{0}' uninstall" -f $ServiceBinary)
     exit 1
 }
-if (Pipe-Exists 'vk') {
-    Warn "$Endpoint already exists -- another daemon is serving the machine-wide pipe. Stop it first."
+if (Pipe-Exists $PipeLeaf) {
+    # Now that the service binds this user's own endpoint, the likeliest thing
+    # holding it is the founder's own `vk boot` daemon -- and the service will
+    # refuse to start rather than join somebody else's pipe.
+    Warn "$Endpoint is already served, and that is where the service will bind too."
+    Warn 'Its start will be refused, naming the holder. Stop your own vkd first:'
+    Warn '    tasklist /FI "IMAGENAME eq vkd.exe"   then   taskkill /F /PID <pid>'
+    Record 'preflight_pipe_held' $Endpoint
 }
 $portHeld = Get-NetTCPConnection -LocalPort $WebPort -State Listen -ErrorAction SilentlyContinue
 if ($portHeld) {
@@ -333,6 +362,11 @@ try {
         if ($line -match '^([a-z_]+)=(.*)$') { $installed[$Matches[1]] = $Matches[2] }
     }
     Record 'service_sid_derived' $installed['service_sid']
+    Record 'endpoint_installed' $installed['endpoint']
+    if ($installed['endpoint']) {
+        if ($installed['endpoint'] -eq $Endpoint) { Record 'endpoint_agrees' 'yes' }
+        else { Record 'endpoint_agrees' 'NO -- install resolved a different pipe than this script did' }
+    }
     Record 'pipe_dacl_predicted' $installed['pipe_dacl']
     Record 'image_path' $installed['image_path']
 
@@ -366,8 +400,10 @@ try {
     if ($svc) { Record 'service_state' $svc.Status }
 
     # The service reports running as soon as the daemon has not fallen over;
-    # the pipe appears a moment later, and arches come up behind it.
-    $env:VK_ENDPOINT = $Endpoint
+    # the pipe appears a moment later, and arches come up behind it. Nothing
+    # is set in the environment, on purpose: the whole point of the per-user
+    # endpoint is that `vk` finds the node with no configuration at all.
+    Remove-Item Env:VK_ENDPOINT -ErrorAction SilentlyContinue
     $answered = $false
     for ($i = 0; $i -lt 30; $i++) {
         $probe = Try-Run $VkExe @('status') 20
@@ -449,7 +485,7 @@ try {
     $pipeOwner = ''
     try {
         $client = New-Object System.IO.Pipes.NamedPipeClientStream(
-            '.', 'vk', [System.IO.Pipes.PipeDirection]::InOut)
+            '.', $PipeLeaf, [System.IO.Pipes.PipeDirection]::InOut)
         $client.Connect(5000)
         $pipeOwner = $client.GetAccessControl().GetOwner(
             [System.Security.Principal.SecurityIdentifier]).Value
@@ -515,7 +551,9 @@ try {
         $cmd = Join-Path $SharedDir 'probe.cmd'
         @(
             '@echo off',
-            'set VK_ENDPOINT=\\.\pipe\vk',
+            # Not that account's own endpoint -- the founder's, named
+            # explicitly, because that is the connection that must be refused.
+            ('set VK_ENDPOINT=' + $Endpoint),
             ('"' + $VkExe + '" status > "' + $out + '" 2>&1'),
             ('echo exit=%ERRORLEVEL% >> "' + $out + '"')
         ) | Set-Content -LiteralPath $cmd -Encoding ascii

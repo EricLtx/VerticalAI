@@ -99,10 +99,10 @@ pub struct Args {
 pub struct ServiceProfile {
     /// `%ProgramData%\VerticalAI\vk`, unless `--state-dir` named one.
     pub state_dir: PathBuf,
-    /// The interactive user's SID, beside this process's own, in the DACL.
+    /// The interactive user's SID, beside this process's own, in the DACL —
+    /// and, resolved to that account's name, the endpoint this daemon binds
+    /// when `--endpoint` did not name one (`service_endpoint_for`).
     pub user_sid: String,
-    /// The endpoint, when the caller did not name one: the machine-wide pipe.
-    pub endpoint: vk_ipc::transport::Endpoint,
 }
 
 /// `%ProgramData%\VerticalAI\vk` — the state directory of a daemon that is not
@@ -170,6 +170,25 @@ pub fn protect_service_state_dir(dir: &std::path::Path) -> anyhow::Result<()> {
     vk_store::win_acl::create_protected_dir(dir, &allowed)
 }
 
+/// Where a service installed for `user_sid` listens: that person's own
+/// endpoint, derived from their account name through the one function
+/// `default_endpoint` uses (founder decision, Task 6 follow-up).
+///
+/// The service used to bind a fixed machine-wide `\\.\pipe\vk`, which was
+/// deterministic but meant every `vk` needed `$VK_ENDPOINT` set before it could
+/// find the node — a wart in front of the demo and of every later shell. A
+/// service account's own `%USERNAME%` is no use for this (it is not the human's
+/// name and is not knowable in advance), so the name comes from the SID the
+/// installer validated: `LookupAccountSid` gives the account, and
+/// `transport::user_endpoint` turns it into exactly the name that person's
+/// `vk` already dials.
+#[cfg(windows)]
+pub fn service_endpoint_for(user_sid: &str) -> anyhow::Result<vk_ipc::transport::Endpoint> {
+    let account = vk_ipc::transport::os::user_account_name(user_sid)
+        .with_context(|| format!("resolve the account of --user-sid {user_sid}"))?;
+    Ok(vk_ipc::transport::user_endpoint(&account))
+}
+
 /// `%ProgramData%\VerticalAI\vk`, made private, for the service host.
 #[cfg(windows)]
 pub fn service_state_dir() -> anyhow::Result<PathBuf> {
@@ -223,7 +242,6 @@ pub fn service_profile(
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(program_data_state_dir),
         user_sid: user_sid.to_string(),
-        endpoint: vk_ipc::transport::service_endpoint(),
     }))
 }
 
@@ -357,7 +375,11 @@ pub async fn run(a: Args) -> anyhow::Result<()> {
         Some(named) => named,
         #[cfg(windows)]
         None => match &service {
-            Some(s) => s.endpoint.clone(),
+            // The interactive user's own endpoint, so their `vk` finds this
+            // node with nothing set. `vkd-service install` writes the same
+            // name into the `ImagePath`, from the same function, so the two
+            // cannot drift — this is the fallback for a hand-run daemon.
+            Some(s) => service_endpoint_for(&s.user_sid)?,
             None => vk_ipc::transport::default_endpoint(),
         },
         #[cfg(not(windows))]
@@ -506,7 +528,7 @@ mod service_tests {
     }
 
     #[test]
-    fn as_service_puts_the_state_under_program_data_and_serves_the_machine_pipe() {
+    fn as_service_puts_the_state_under_program_data() {
         let a = parse(&["vkd", "--as-service", "--user-sid", USER]);
         let p = service_profile(a.as_service, a.user_sid.as_deref(), a.state_dir.as_deref())
             .unwrap()
@@ -518,7 +540,23 @@ mod service_tests {
             p.state_dir.display()
         );
         assert_eq!(p.user_sid, USER);
-        assert_eq!(p.endpoint.0, r"\\.\pipe\vk");
+    }
+
+    /// The founder's decision: a service installed for a person binds *that
+    /// person's* endpoint, so their `vk` needs nothing set. Checked against
+    /// this process's own SID, the only one a test can resolve.
+    #[test]
+    fn a_service_binds_the_endpoint_of_the_user_it_was_installed_for() {
+        let me = vk_ipc::transport::os::current_process_sid().unwrap();
+        assert_eq!(
+            service_endpoint_for(&me).unwrap(),
+            vk_ipc::transport::default_endpoint(),
+            "installed for this account, the service must bind the pipe this account's vk dials"
+        );
+        // A SID that names nobody yields no endpoint, and says so naming the
+        // flag's value rather than failing later at `bind`.
+        let err = format!("{:#}", service_endpoint_for(USER).unwrap_err());
+        assert!(err.contains(USER), "{err}");
     }
 
     #[test]
@@ -613,7 +651,6 @@ mod service_tests {
         let profile = ServiceProfile {
             state_dir: program_data_state_dir(),
             user_sid: USER.to_string(),
-            endpoint: vk_ipc::transport::service_endpoint(),
         };
         let dacl = pipe_descriptor(Some(&profile)).unwrap();
         assert_eq!(dacl, format!("D:(A;;GA;;;{me})(A;;GA;;;{USER})"));
