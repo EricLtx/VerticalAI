@@ -18,7 +18,25 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - name: cargo test --workspace
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace --no-fail-fast 2>&1 | tee test.log
+      # Raw job logs need a GitHub login; annotations and the step summary
+      # do not. On failure, surface every failing test by name so a public
+      # reader (and the API) can see what broke without the log.
+      - name: Name the failing tests
+        if: failure()
+        shell: bash
+        run: |
+          grep -E "^test .* FAILED$|^test .* \.\.\. FAILED|panicked at|^---- .* stdout ----|^error(\[E[0-9]+\])?:" test.log | head -60 | while IFS= read -r line; do
+            printf '::error title=cargo test::%s\n' "$line"
+            printf -- '- `%s`\n' "$line" >> "$GITHUB_STEP_SUMMARY"
+          done
+          grep -E "^test result:" test.log | grep -v " 0 failed" | while IFS= read -r line; do
+            printf '::error title=suite::%s\n' "$line"
+          done
       # The other half of the `bedrock` feature gate. The default build has no
       # AWS SDK in it (Ruling 30), so `cargo test --workspace` above exercises
       # the refusal; this one *runs* the tests the feature turns on — the EU
