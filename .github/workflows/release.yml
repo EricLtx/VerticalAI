@@ -1,7 +1,11 @@
 name: release
-# Builds the vk shell and the vkd daemon in release mode on the three node
+# Builds vk, vkd, vk-mcp and vkd-service in release mode on the three node
 # platforms and publishes them as workflow artifacts. Runs on demand
-# (workflow_dispatch) and on sp*/v* tags. Unsigned until the SP1 signing gate.
+# (workflow_dispatch) and on sp*/v* tags. The Windows leg signs them the same
+# three ways the `sign` job in ci.yml does — Azure Trusted Signing, then an
+# OV certificate, then unsigned — so a release built before either secret
+# exists still succeeds and says so on the artifact's name
+# (`unsigned-vk-windows-latest`) rather than looking like a signed one.
 on:
   workflow_dispatch:
   push:
@@ -20,16 +24,90 @@ jobs:
           - os: macos-latest
             ext: ''
     runs-on: ${{ matrix.os }}
+    env:
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
+      AZURE_CODE_SIGNING_NAME: ${{ secrets.AZURE_CODE_SIGNING_NAME }}
+      AZURE_CERT_PROFILE_NAME: ${{ secrets.AZURE_CERT_PROFILE_NAME }}
+      SIGNING_CERT_B64: ${{ secrets.SIGNING_CERT_B64 }}
+      SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release -p vk-cli -p vkd
+      - run: cargo build --release -p vk-cli -p vkd -p vk-mcp -p vk-service
       - run: cargo run --release -p vk-cli -- --help
-      - uses: actions/upload-artifact@v4
+      # Everything from here to the two upload steps is Windows-only: signing
+      # is an Authenticode concept and the other two legs have nothing to do.
+      # `steps.decide` is skipped (and its output empty) on those legs, which
+      # is why the upload `if:`s below read as "signed, or not Windows".
+      - name: Decide which signing path applies
+        if: matrix.os == 'windows-latest'
+        id: decide
+        shell: bash
+        run: |
+          if [ -n "$AZURE_TENANT_ID" ] && [ -n "$AZURE_CLIENT_ID" ] && [ -n "$AZURE_CLIENT_SECRET" ] && [ -n "$AZURE_ENDPOINT" ] && [ -n "$AZURE_CODE_SIGNING_NAME" ] && [ -n "$AZURE_CERT_PROFILE_NAME" ]; then
+            echo "path=azure" >> "$GITHUB_OUTPUT"
+          elif [ -n "$SIGNING_CERT_B64" ]; then
+            echo "path=ov-cert" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=unsigned" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Sign with Azure Trusted Signing
+        if: matrix.os == 'windows-latest' && steps.decide.outputs.path == 'azure'
+        uses: azure/trusted-signing-action@v1
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_CODE_SIGNING_NAME }}
+          certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE_NAME }}
+          files-folder: ${{ github.workspace }}\target\release
+          files-folder-filter: exe
+          file-digest: SHA256
+      - name: Sign with an OV certificate
+        if: matrix.os == 'windows-latest' && steps.decide.outputs.path == 'ov-cert'
+        shell: pwsh
+        run: |
+          [IO.File]::WriteAllBytes("$pwd\cert.pfx", [Convert]::FromBase64String($env:SIGNING_CERT_B64))
+          $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+                      Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { $signtool = 'signtool.exe' }
+          $exes = @('vk.exe', 'vkd.exe', 'vk-mcp.exe', 'vkd-service.exe') | ForEach-Object { Join-Path 'target\release' $_ }
+          $signArgs = @('sign', '/fd', 'SHA256', '/tr', 'http://timestamp.digicert.com', '/td', 'SHA256', '/f', "$pwd\cert.pfx")
+          if ($env:SIGNING_CERT_PASSWORD) { $signArgs += @('/p', $env:SIGNING_CERT_PASSWORD) }
+          $signArgs += $exes
+          & $signtool @signArgs
+          if ($LASTEXITCODE -ne 0) { throw "signtool exited $LASTEXITCODE" }
+          Remove-Item "$pwd\cert.pfx" -Force
+      - name: No signing secrets configured
+        if: matrix.os == 'windows-latest' && steps.decide.outputs.path == 'unsigned'
+        shell: bash
+        run: |
+          echo "unsigned: no signing secrets configured"
+      - name: Upload build
+        if: matrix.os != 'windows-latest' || steps.decide.outputs.path != 'unsigned'
+        uses: actions/upload-artifact@v4
         with:
           name: vk-${{ matrix.os }}
           path: |
             target/release/vk${{ matrix.ext }}
             target/release/vkd${{ matrix.ext }}
+            target/release/vk-mcp${{ matrix.ext }}
+            target/release/vkd-service${{ matrix.ext }}
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload build (unsigned — no signing secret is configured yet)
+        if: matrix.os == 'windows-latest' && steps.decide.outputs.path == 'unsigned'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-vk-${{ matrix.os }}
+          path: |
+            target/release/vk${{ matrix.ext }}
+            target/release/vkd${{ matrix.ext }}
+            target/release/vk-mcp${{ matrix.ext }}
+            target/release/vkd-service${{ matrix.ext }}
           if-no-files-found: error
           retention-days: 30

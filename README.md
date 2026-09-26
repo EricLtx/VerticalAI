@@ -401,6 +401,74 @@ ledgers and the H1 verdict — are in `docs/demo/runs/2026-09-25/`, and
 `docs/demo/README.md` says what to expect, what it needs, and how to run the
 Windows Hello variant by hand.
 
+### Installing on Windows
+
+`scripts\install-windows.ps1` is the everyday path once a build (or a signed
+release download) already exists: it does not build anything, it packages
+what is already built.
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-windows.ps1
+```
+
+That copies `vk.exe`, `vkd.exe`, `vk-mcp.exe` and `vkd-service.exe` — found
+beside the script by default, `-Source DIR` elsewhere — into
+`%LOCALAPPDATA%\Programs\VerticalAI` and adds that directory to this user's
+own PATH (`-Root DIR` installs somewhere else instead; running it again does
+not grow a duplicate PATH entry). It also checks two things the rest of this
+README assumes are already true — Docker Desktop's engine answers `docker
+info`, and `claude` is on PATH — and warns rather than failing if either is
+missing, because installing the node and being ready to mount every arch are
+two different moments. If the binaries it is copying are not signed, it says
+so loudly: Smart App Control and SmartScreen will not be quiet about it
+either (`docs/sp1-gate-checklist.md`, item 1).
+
+`-Service` additionally registers and starts `vkd` as the `NT SERVICE\vkd`
+Windows service the next section describes — `vkd-service install`, then
+`start` — and needs an elevated shell; run without one, it refuses and
+prints the exact command to re-run elevated, rather than doing half the job
+from the wrong account. `-Uninstall` reverses everything a plain run did,
+and, if it finds one, whatever `-Service` did too: the PATH entry, the copied
+binaries, the service. It never touches `%ProgramData%\VerticalAI\vk` (the
+node's store) or the OS keyring — uninstalling the program is not discarding
+a node. `-DryRun` (or the built-in `-WhatIf`) prints every action a run would
+take without taking any of them.
+
+### Signing release binaries
+
+Every Windows binary this repository ships — `vk`, `vkd`, `vk-mcp`,
+`vkd-service` — is signed by the `sign` job in `.github/workflows/ci.yml` (on
+every push) and by the Windows leg of `.github/workflows/release.yml` (on an
+`sp*`/`v*` release tag), so that gate item 1 — installing without a
+SmartScreen or Smart App Control prompt — has something to check. Neither
+job fails for a secret that does not exist yet, because the founder has not
+chosen between the two paths below; both are wired up so whichever secret
+set is added first is the one that runs, in this order:
+
+1. **Azure Trusted Signing**, when `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`,
+   `AZURE_CLIENT_SECRET`, `AZURE_ENDPOINT`, `AZURE_CODE_SIGNING_NAME` and
+   `AZURE_CERT_PROFILE_NAME` are all set as repository secrets — a per-call,
+   short-lived certificate from an Azure Trusted Signing account, nothing to
+   renew by hand and nothing to protect as a file.
+2. **An OV (organization-validated) code-signing certificate**, when
+   `SIGNING_CERT_B64` (the `.pfx`, base64-encoded) is set, plus
+   `SIGNING_CERT_PASSWORD` if the `.pfx` has one. Signed with `signtool sign
+   /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f cert.pfx` — the
+   founder's own certificate, bought from a CA and renewed by hand every one
+   to three years.
+3. **Neither** (today's state): the job prints `unsigned: no signing
+   secrets configured`, still succeeds, and uploads the same four binaries
+   under a clearly named `unsigned-` prefix (`unsigned-vk-windows` from CI,
+   `unsigned-vk-windows-latest` from a release tag) — so a run before either
+   secret exists is still a green run with something installable at the end
+   of it, not a red one with nothing.
+
+`scripts/check-workflows.py` loads both workflow files with `yaml.safe_load`
+and asserts their job names, so a YAML mistake — in particular a flow mapping
+(`{ key: value }`) holding a `${{ }}` expression, which GitHub's own
+preprocessor accepts but a standard YAML parser does not — is caught before
+it reaches a runner rather than by a contributor reading the diff carefully.
+
 ### Running as a Windows service
 
 A node that belongs to the machine rather than to a logged-in shell:
@@ -614,3 +682,13 @@ first, or namespace paths like `/arches` are rewritten into filesystem paths
 before `vk` ever sees them — and pass a named-pipe endpoint from PowerShell or
 `cmd` rather than Git Bash, which eats the leading `\` of `\\.\pipe\...` even
 with that set.
+
+## The SP1 gate
+
+`docs/sp1-gate-checklist.md` is this stage's acceptance gate: eight items, run
+on a stock Windows 11 VirtualBox image with Smart App Control on, covering
+signed installation, the service identity, the store surviving a restart, the
+harness's fence and its network egress, the passkey ceremony under replay and
+forgery, the property tests and CI, the demo script in both role orders, and
+the TCB statement. SP1 is done when every row in its results table reads
+PASS.

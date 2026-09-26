@@ -56,16 +56,106 @@ jobs:
         if: always()
         run: docker rm -f vk-ollama
   sign:
-    # Scaffold only: signs release binaries when a certificate secret exists (SP1 gate).
+    # Signs the four release binaries for the SP1 gate (item 1: signed
+    # binaries install without SmartScreen/Smart App Control prompts). Tries,
+    # in order, and never fails the workflow over a secret that is not there
+    # yet:
+    #   1. Azure Trusted Signing, when all six AZURE_* secrets are set.
+    #   2. An OV certificate through signtool, when SIGNING_CERT_B64 is set.
+    #   3. Neither: prints "unsigned: no signing secrets configured" and
+    #      uploads the same binaries under an `unsigned-` prefix, so a run
+    #      before either secret exists still succeeds and still leaves
+    #      something installable behind.
+    # The founder has not chosen between the two paths (README.md, "Signing
+    # release binaries"); both are wired up so whichever secret set is added
+    # first is the one that runs.
     if: ${{ github.event_name == 'push' }}
     needs: test
     runs-on: windows-latest
     env:
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
+      AZURE_CODE_SIGNING_NAME: ${{ secrets.AZURE_CODE_SIGNING_NAME }}
+      AZURE_CERT_PROFILE_NAME: ${{ secrets.AZURE_CERT_PROFILE_NAME }}
       SIGNING_CERT_B64: ${{ secrets.SIGNING_CERT_B64 }}
+      SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
-      - name: Check signing secret
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the four binaries release-mode
+        run: cargo build --release -p vk-cli -p vkd -p vk-mcp -p vk-service
+      - name: Stage them under one directory
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/vk.exe target/release/vkd.exe target/release/vk-mcp.exe target/release/vkd-service.exe dist/
+      - name: Decide which signing path applies
+        id: decide
+        shell: bash
+        run: |
+          if [ -n "$AZURE_TENANT_ID" ] && [ -n "$AZURE_CLIENT_ID" ] && [ -n "$AZURE_CLIENT_SECRET" ] && [ -n "$AZURE_ENDPOINT" ] && [ -n "$AZURE_CODE_SIGNING_NAME" ] && [ -n "$AZURE_CERT_PROFILE_NAME" ]; then
+            echo "path=azure" >> "$GITHUB_OUTPUT"
+          elif [ -n "$SIGNING_CERT_B64" ]; then
+            echo "path=ov-cert" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=unsigned" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Sign with Azure Trusted Signing
+        if: steps.decide.outputs.path == 'azure'
+        uses: azure/trusted-signing-action@v1
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_CODE_SIGNING_NAME }}
+          certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE_NAME }}
+          files-folder: ${{ github.workspace }}\dist
+          files-folder-filter: exe
+          file-digest: SHA256
+      - name: Sign with an OV certificate
+        if: steps.decide.outputs.path == 'ov-cert'
         shell: pwsh
         run: |
-          if (-not $env:SIGNING_CERT_B64) { Write-Host "no SIGNING_CERT_B64 secret; skipping (expected in SP0)"; exit 0 }
-          Write-Host "signing pipeline would run here"
+          [IO.File]::WriteAllBytes("$pwd\cert.pfx", [Convert]::FromBase64String($env:SIGNING_CERT_B64))
+          $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+                      Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { $signtool = 'signtool.exe' }
+          $exes = Get-ChildItem -Path dist -Filter *.exe | ForEach-Object { $_.FullName }
+          $signArgs = @('sign', '/fd', 'SHA256', '/tr', 'http://timestamp.digicert.com', '/td', 'SHA256', '/f', "$pwd\cert.pfx")
+          if ($env:SIGNING_CERT_PASSWORD) { $signArgs += @('/p', $env:SIGNING_CERT_PASSWORD) }
+          $signArgs += $exes
+          & $signtool @signArgs
+          if ($LASTEXITCODE -ne 0) { throw "signtool exited $LASTEXITCODE" }
+          Remove-Item "$pwd\cert.pfx" -Force
+      - name: No signing secrets configured
+        if: steps.decide.outputs.path == 'unsigned'
+        shell: bash
+        run: |
+          echo "unsigned: no signing secrets configured"
+      - name: Upload signed artifacts
+        if: steps.decide.outputs.path != 'unsigned'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vk-windows-signed
+          path: |
+            dist/vk.exe
+            dist/vkd.exe
+            dist/vk-mcp.exe
+            dist/vkd-service.exe
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload unsigned artifacts
+        if: steps.decide.outputs.path == 'unsigned'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-vk-windows
+          path: |
+            dist/vk.exe
+            dist/vkd.exe
+            dist/vk-mcp.exe
+            dist/vkd-service.exe
+          if-no-files-found: error
+          retention-days: 30
