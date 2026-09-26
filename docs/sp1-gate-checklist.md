@@ -67,6 +67,9 @@ nothing.
 
 ```
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install-windows.ps1
+# a User-PATH change is not visible in the shell that made it; refresh here,
+# or just open a new PowerShell window before the four lines below
+$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
 vk --help
 vkd --help
 vkd-service --help
@@ -89,15 +92,20 @@ certificate's, whichever the `sign` job used).
 
 ### 2. `vkd` runs as a service under `NT SERVICE\vkd`; `vk status` from the user account works; another local user is refused
 
+The gate VM is stock — no Rust toolchain — so point `spike-6a.ps1` at the
+signed binaries item 1 already installed rather than at its own
+`cargo build` default:
 ```
-net user vk-gate-second P@ssw0rd-change-me! /add        # elevated, once
-.\scripts\spike-6a.ps1 -SecondUser vk-gate-second
+net user vk-gate-second VkGate2026Temp /add              # elevated, once
+.\scripts\spike-6a.ps1 -ServiceBinary "$env:LOCALAPPDATA\Programs\VerticalAI\vkd-service.exe" -SecondUser vk-gate-second
 net user vk-gate-second /delete                          # elevated, cleanup
 ```
-`spike-6a.ps1` is the whole thing end to end — install, start, `vk status`
-and `vk ls /arches` as the interactive user over the service's own pipe, and
-the second account's attempt — and it un-installs itself and cleans up after
-printing its summary, so the gate VM is left as it found it.
+`spike-6a.ps1` is the whole thing end to end — stage a copy under
+`%ProgramFiles%\VerticalAI`, install, start, `vk status` and `vk ls /arches`
+as the interactive user over the service's own pipe, and the second
+account's attempt — and it un-installs and un-stages itself after printing
+its summary, so the gate VM (and item 1's own install) is left as it found
+it.
 
 **Expected:** the summary block's `install=ok`, `service_state=Running`,
 `pipe_answered=True`, `vk_status` names the node (not a connection refusal),
@@ -107,9 +115,9 @@ containing `Access is denied. (os error 5)`.
 
 ### 3. `vk ledger verify` and `vk fsck` ok after a service restart; a second `vkd` start is refused by the lock
 
-Re-run `spike-6a.ps1 -KeepInstalled` (or install for real via
-`install-windows.ps1 -Service`, elevated) so the service is left running for
-this item, then:
+Re-run `spike-6a.ps1 -ServiceBinary "$env:LOCALAPPDATA\Programs\VerticalAI\vkd-service.exe" -KeepInstalled`
+(or install for real via `install-windows.ps1 -Service`, elevated) so the
+service is left running for this item, then:
 ```
 vk ledger verify
 vk fsck
