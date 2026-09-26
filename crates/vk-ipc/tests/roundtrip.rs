@@ -23,6 +23,139 @@ where
     serde_json::from_str(&line).unwrap()
 }
 
+/// A register that cannot be read — a row that does not parse, a database
+/// fault — fails the task read surfaces loudly (Ruling 8; SP1a review N3)
+/// instead of quietly hiding the task from `ps`, `top` and `task.show` as
+/// if it were above the caller's clearance.
+#[tokio::test]
+async fn a_register_that_cannot_be_read_fails_the_task_surfaces_loudly() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+    let task = c
+        .call(
+            "task.create",
+            json!({"goal": "g", "artefact_type": "note", "steps": []}),
+            None,
+        )
+        .await
+        .unwrap();
+    let id = task["id"].as_str().unwrap().to_string();
+    let register = task["register"].as_str().unwrap().to_string();
+    assert_eq!(
+        c.call("task.ls", json!({}), None)
+            .await
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // The register row is no longer a register.
+    k.lock()
+        .unwrap()
+        .store()
+        .db
+        .put_json("registers", &register, &json!("not a register"))
+        .unwrap();
+    for (method, params) in [
+        ("task.ls", json!({})),
+        ("task.show", json!({"task_id": id})),
+        ("top", json!({})),
+        ("ns.ls", json!({"path": "/tasks"})),
+    ] {
+        let err = c.call(method, params, None).await.unwrap_err();
+        assert_eq!(
+            code_of(&err),
+            vk_ipc::E_STORE,
+            "{method} must fail as a store fault, not hide the task: {err}"
+        );
+    }
+    drop(c);
+    shutdown(server, k, d).await;
+}
+
+/// `liveness.renew` (SP1a review M10): the admin syscall behind `vk top`'s
+/// liveness column. A human act — it says a human vouched for the business
+/// — so it takes a presence proof and records the device that made it.
+#[tokio::test]
+async fn liveness_renew_is_a_human_act_that_feeds_top() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let device = with_device(&k);
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+
+    let err = c
+        .call(
+            "liveness.renew",
+            json!({"business": "acme", "ttl_ms": 60_000}),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_INVARIANT, "{err}");
+
+    let proof = prove(&c, &device).await;
+    let err = c
+        .call(
+            "liveness.renew",
+            json!({"business": "", "ttl_ms": 60_000}),
+            Some(proof),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code_of(&err), vk_ipc::E_BAD_PARAMS, "{err}");
+
+    let proof = prove(&c, &device).await;
+    let renewed = c
+        .call(
+            "liveness.renew",
+            json!({"business": "acme", "ttl_ms": 60_000}),
+            Some(proof),
+        )
+        .await
+        .unwrap();
+    assert_eq!(renewed["business"], "acme");
+    assert_eq!(renewed["renewed_by_device"], "laptop");
+    let expires = renewed["expires_at_ms"].as_u64().unwrap();
+    assert!(expires > vk_kernel::now_ms());
+
+    let top = c.call("top", json!({}), None).await.unwrap();
+    assert_eq!(top["liveness"]["acme"].as_u64(), Some(expires));
+
+    drop(c);
+    shutdown(server, k, d).await;
+}
+
+/// No pipe method writes a register wholesale (SP1a review M1): the only
+/// writes over the transport go through the harness's lease-scoped verbs,
+/// which read the register first and change one field of it.
+#[tokio::test]
+async fn no_pipe_method_writes_a_register_wholesale() {
+    let d = tempfile::tempdir().unwrap();
+    let k = kernel(d.path());
+    let endpoint = vk_ipc::transport::test_endpoint();
+    let server = tokio::spawn(vk_ipc::server::serve(k.clone(), endpoint.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let c = Client::connect(&endpoint).await.unwrap();
+    for method in ["register.write", "write_register", "register.put"] {
+        let err = c
+            .call(method, json!({"register": {}}), None)
+            .await
+            .unwrap_err();
+        assert_eq!(code_of(&err), vk_ipc::E_METHOD, "{method}: {err}");
+    }
+    drop(c);
+    shutdown(server, k, d).await;
+}
+
 /// The daemon's scheduled retention sweep (Task 10 group C) runs the
 /// kernel's `sweep_retention` on its interval: a stale usage row is gone
 /// after a tick, with nothing on the pipe having asked for it.
@@ -72,6 +205,34 @@ async fn the_scheduled_sweep_removes_a_stale_usage_row_on_its_own() {
     let _ = sweeper.await;
     drop(k);
     d.close().unwrap();
+}
+
+/// Stop a test's server and let go of its kernel before the state directory
+/// goes: the aborted server task is awaited, then the per-connection tasks
+/// it spawned — each holding a clone of the kernel — are given a moment to
+/// end, and only then is the directory removed, which on Windows fails
+/// while the store's files are open. `close()` rather than a drop, so a
+/// directory that could not be removed fails the test instead of leaking
+/// into `%TEMP%` (Task 10 group F).
+async fn shutdown(
+    server: tokio::task::JoinHandle<anyhow::Result<()>>,
+    k: Arc<Mutex<vk_kernel::RealKernel>>,
+    d: tempfile::TempDir,
+) {
+    server.abort();
+    let _ = server.await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while Arc::strong_count(&k) > 1 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        Arc::strong_count(&k),
+        1,
+        "a connection task still holds the kernel"
+    );
+    drop(k);
+    d.close()
+        .expect("the state directory is removed once the store is closed");
 }
 
 fn kernel(dir: &std::path::Path) -> Arc<Mutex<vk_kernel::RealKernel>> {
@@ -532,7 +693,7 @@ async fn approve_over_ipc_requires_presence_and_a_matching_human_approval() {
             partition: "local".into(),
             now_ms: vk_kernel::now_ms(),
         };
-        let register = kk.task(&ctx, &id).unwrap().register;
+        let register = kk.task(&ctx, &id).unwrap().unwrap().register;
         let reg = kk.read_register(&ctx, &register).unwrap();
         reg.artefacts
             .last()

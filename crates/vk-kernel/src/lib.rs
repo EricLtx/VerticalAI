@@ -620,6 +620,28 @@ struct HarnessTokenState {
     oversize: Option<String>,
 }
 
+/// Build an adapter with `factory`, turning a panic inside it into the error
+/// it should have been (Task 1b deferred minor). A factory that panicked used
+/// to take the daemon's startup task down with it and leave the arch
+/// `Starting` for ever — the one state a step waits on rather than fails on.
+pub fn build_adapter(
+    factory: &AdapterFactory,
+    spec: &arch::MountSpec,
+) -> Result<Box<dyn arch::ArchAdapter>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| factory(spec))).unwrap_or_else(
+        |panic| {
+            let what = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "no message".into());
+            Err(anyhow::anyhow!(
+                "the adapter factory panicked while building this arch: {what}"
+            ))
+        },
+    )
+}
+
 /// The factory [`RealKernel::open`] uses: the mock and nothing else.
 ///
 /// A kernel opened without a daemon around it can still bring its mock arches
@@ -923,7 +945,7 @@ impl RealKernel {
         for (id, spec) in self.pending_mounts() {
             // The adapter this did not install, dropped here rather than left
             // to fall inside `install_arch`: same rule, no lock is held.
-            drop(self.install_arch(&id, factory(&spec)));
+            drop(self.install_arch(&id, build_adapter(&factory, &spec)));
         }
     }
 
@@ -1271,10 +1293,10 @@ impl RealKernel {
         // kernel uses, so a task above this caller's clearance is "not found"
         // rather than "no rows" — which would say it exists and was idle.
         if let UsageFilter::Task(id) = filter {
-            self.task(ctx, id)
+            self.task(ctx, id)?
                 .ok_or_else(|| KernelError::NotFound(id.clone()))?;
         }
-        let visible: BTreeSet<String> = self.tasks(ctx).into_iter().map(|t| t.id).collect();
+        let visible: BTreeSet<String> = self.tasks(ctx)?.into_iter().map(|t| t.id).collect();
         Ok(self
             .store
             .db
@@ -1319,7 +1341,7 @@ impl RealKernel {
             .map_err(store_failed)?;
         // Exactly `limit` back means the table may well hold more.
         let more = newest.len() == limit;
-        let visible: BTreeSet<String> = self.tasks(ctx).into_iter().map(|t| t.id).collect();
+        let visible: BTreeSet<String> = self.tasks(ctx)?.into_iter().map(|t| t.id).collect();
         Ok((
             newest
                 .into_iter()
@@ -2447,7 +2469,34 @@ impl Kernel for RealKernel {
         Ok(reg)
     }
 
-    fn write_register(&mut self, ctx: &Ctx, reg: Register) -> Result<(), KernelError> {
+    fn write_register(&mut self, ctx: &Ctx, mut reg: Register) -> Result<(), KernelError> {
+        // An in-process caller is held to the rule a syscall would be (SP1a
+        // review M1): the stored label joins the written one, so a write
+        // never lowers a label; the register stays its task's; and a
+        // register the caller could not read is not one it may overwrite.
+        // Over the pipe no method writes a register wholesale — the harness
+        // verbs read it first and change one field — so this is the whole of
+        // the rule, in the one place a register is written.
+        if let Some(existing) = self
+            .store
+            .db
+            .get_json::<Register>("registers", &reg.id.0)
+            .map_err(store_failed)?
+        {
+            if !existing.label.flows_to(&ctx.clearance) {
+                return Err(KernelError::I2(format!(
+                    "register {} exceeds caller clearance",
+                    reg.id.0
+                )));
+            }
+            if existing.task_id != reg.task_id {
+                return Err(KernelError::I3(format!(
+                    "register {} belongs to task {}; a write cannot move it to task {}",
+                    reg.id.0, existing.task_id, reg.task_id
+                )));
+            }
+            reg.label = existing.label.join(&reg.label);
+        }
         self.store
             .db
             .put_json("registers", &reg.id.0, &reg)
@@ -2933,6 +2982,187 @@ mod tests {
             },
             ..machine(now)
         }
+    }
+
+    /// An in-process `write_register` cannot relabel a register downward,
+    /// re-parent it to another task, or overwrite one the caller could not
+    /// read (SP1a review M1): the stored label joins the written one, a
+    /// changed `task_id` is an I3 refusal, and a register above the caller's
+    /// clearance is an I2 refusal — the same rule the stub kernel applies.
+    #[test]
+    fn a_register_write_cannot_relabel_reparent_or_overwrite_what_it_could_not_read() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let business = Label {
+            scope: Scope::Business,
+            data_class: DataClass::Own,
+            origins: [Origin::OwnerAuthored].into(),
+        };
+        let id = k
+            .submit_task(&machine(1), "a business register", business.clone())
+            .unwrap();
+        let stored = k.read_register(&machine(1), &id).unwrap();
+
+        // Written back with a lower label: the stored one is kept (joined).
+        let mut lowered = stored.clone();
+        lowered.label = Label::bottom();
+        lowered.decisions.push("a decision".into());
+        k.write_register(&machine(2), lowered).unwrap();
+        let after = k.read_register(&machine(2), &id).unwrap();
+        assert_eq!(after.label, business, "a write never lowers a label");
+        assert_eq!(after.decisions, vec!["a decision".to_string()]);
+
+        // Written back with a higher label: the join takes it.
+        let mut raised = after.clone();
+        raised.label = Label {
+            scope: Scope::Personal,
+            data_class: DataClass::Unknown,
+            origins: [Origin::Web].into(),
+        };
+        k.write_register(&machine(3), raised.clone()).unwrap();
+        assert_eq!(
+            k.read_register(&machine(3), &id).unwrap().label,
+            business.join(&raised.label)
+        );
+
+        // Re-parented: refused, and the row untouched.
+        let mut moved = k.read_register(&machine(4), &id).unwrap();
+        moved.task_id = "task-somebody-elses".into();
+        let err = k.write_register(&machine(4), moved).unwrap_err();
+        assert!(matches!(err, KernelError::I3(_)), "{err}");
+        assert_eq!(
+            k.read_register(&machine(4), &id).unwrap().task_id,
+            stored.task_id
+        );
+
+        // A caller who could not read it cannot overwrite it either.
+        let low = Ctx {
+            clearance: Clearance {
+                max_scope: Scope::Public,
+                third_party_allowed: false,
+            },
+            ..machine(5)
+        };
+        let mut overwrite = stored.clone();
+        overwrite.goal = "replaced".into();
+        let err = k.write_register(&low, overwrite).unwrap_err();
+        assert!(matches!(err, KernelError::I2(_)), "{err}");
+        assert_eq!(
+            k.read_register(&machine(5), &id).unwrap().goal,
+            "a business register"
+        );
+    }
+
+    /// A factory that panics while building an arch leaves it `Unavailable`
+    /// with the panic as its reason — never `Starting` for ever, and never a
+    /// kernel that panicked with it (Task 1b deferred minor).
+    #[test]
+    fn a_factory_that_panics_leaves_the_arch_unavailable_not_starting() {
+        let d = tempfile::tempdir().unwrap();
+        let spec = {
+            let mut k = open(d.path());
+            let m = local(personal());
+            let spec = arch::MountSpec::mock(&m, 100);
+            k.mount(
+                Arc::new(arch::MockAdapter {
+                    manifest: m,
+                    budget: 100,
+                }),
+                spec.clone(),
+            )
+            .unwrap();
+            spec
+        };
+        let panicking: AdapterFactory = Arc::new(
+            |_: &arch::MountSpec| -> Result<Box<dyn arch::ArchAdapter>> {
+                panic!("the engine behind this arch blew up")
+            },
+        );
+        let mut k = RealKernel::open_with_factory(
+            d.path(),
+            KeySource::File(d.path().join("master.key")),
+            "n1",
+            panicking,
+        )
+        .unwrap();
+        k.start_arches_now();
+        let states = k.arch_states();
+        assert_eq!(states.len(), 1, "{states:?}");
+        let (_, _, state) = &states[0];
+        assert_eq!(state.name(), "unavailable", "{state:?}");
+        let why = state.reason().unwrap_or_default();
+        assert!(why.contains("panicked"), "{why}");
+        assert!(why.contains("blew up"), "the panic's own words: {why}");
+        assert_eq!(k.arches_starting(), 0);
+        let _ = spec;
+    }
+
+    /// `authorization`, `oauth`, `x_auth_token`: credential-shaped names the
+    /// guard's needles did not cover (Task 1b deferred minor).
+    #[test]
+    fn a_credential_under_an_auth_shaped_name_is_refused() {
+        for named in [
+            "authorization",
+            "Authorization",
+            "oauth",
+            "auth",
+            "basic_auth",
+        ] {
+            assert!(
+                arch::MountSpec::new("x", serde_json::json!({ named: "Bearer sk-live-1" }))
+                    .is_err(),
+                "{named} must be refused"
+            );
+        }
+        // A number under such a name is still not a credential.
+        arch::MountSpec::new("x", serde_json::json!({ "auth_retries": 3 })).unwrap();
+    }
+
+    /// A register row that cannot be read fails `task`, `tasks` and `top` as
+    /// a store fault (Ruling 8, review N3) rather than hiding the task; a
+    /// register that is simply not there still hides it.
+    #[test]
+    fn a_register_that_cannot_be_read_is_a_store_fault_not_a_hidden_task() {
+        let d = tempfile::tempdir().unwrap();
+        let mut k = open(d.path());
+        let t = k
+            .create_task(&machine(1), "g", "note", Label::bottom(), vec![])
+            .unwrap();
+        assert!(k.task(&machine(2), &t.id).unwrap().is_some());
+
+        k.store()
+            .db
+            .put_json(
+                "registers",
+                &t.register.0,
+                &serde_json::json!("not a register"),
+            )
+            .unwrap();
+        assert!(matches!(
+            k.task(&machine(2), &t.id),
+            Err(KernelError::Store(_))
+        ));
+        assert!(matches!(k.tasks(&machine(2)), Err(KernelError::Store(_))));
+        assert!(matches!(k.top(&machine(2)), Err(KernelError::Store(_))));
+
+        // Gone rather than unreadable: hidden, as before.
+        k.store().db.delete("registers", &t.register.0).unwrap();
+        assert_eq!(k.task(&machine(2), &t.id).unwrap(), None);
+        assert!(k.tasks(&machine(2)).unwrap().is_empty());
+        assert!(k.top(&machine(2)).unwrap().tasks.is_empty());
+    }
+
+    /// A stats row written before `tokens_in_measured` and `cost_list_usd`
+    /// existed reads back with them at zero (Task 2 deferred minor).
+    #[test]
+    fn an_old_stats_row_reads_back_with_the_new_counters_at_zero() {
+        let old: ArchStats =
+            serde_json::from_str(r#"{"calls":3,"tokens_in":120,"projected":1}"#).unwrap();
+        assert_eq!(old.calls, 3);
+        assert_eq!(old.tokens_in, 120);
+        assert_eq!(old.projected, 1);
+        assert_eq!(old.tokens_in_measured, 0);
+        assert_eq!(old.cost_list_usd, 0.0);
     }
 
     /// The HLC is seeded from the ledger tail on open (review M3): an event
@@ -3457,7 +3687,7 @@ mod tests {
             guessed.tokens_in
         );
 
-        let stats = k.top(&machine(4)).arches;
+        let stats = k.top(&machine(4)).unwrap().arches;
         let m = &stats[&measured];
         assert_eq!(m.calls, 1);
         assert_eq!(m.tokens_in, 14_435);
@@ -3471,7 +3701,7 @@ mod tests {
         // And it is on disk, not in this process: `vk top` after a restart.
         drop(k);
         let k = open(d.path());
-        let after = k.top(&machine(5)).arches;
+        let after = k.top(&machine(5)).unwrap().arches;
         assert_eq!(after[&measured].tokens_in_measured, 14_435);
         assert!((after[&measured].cost_list_usd - 0.0148193).abs() < 1e-9);
     }
@@ -3518,7 +3748,7 @@ mod tests {
         // A refused call is not a call. Both arches are on the screen — they
         // are mounted, and `top` says so (Ruling 9d) — with nothing counted
         // against either of them.
-        let top = k.top(&machine(4));
+        let top = k.top(&machine(4)).unwrap();
         assert_eq!(top.arches.len(), 2, "both mounted arches are listed");
         assert!(
             top.arches
@@ -4709,7 +4939,7 @@ mod tests {
             err.to_string().starts_with("arch unavailable: "),
             "the scheduler names the state, not a mock's answer: {err}"
         );
-        let row = k.task(&machine(3), &t.id).unwrap();
+        let row = k.task(&machine(3), &t.id).unwrap().unwrap();
         assert!(matches!(row.status, TaskStatus::Failed));
         match &row.steps[0].status {
             StepStatus::Failed(why) => assert!(why.starts_with("arch unavailable: "), "{why}"),
@@ -4876,7 +5106,7 @@ mod tests {
             "{err}"
         );
         assert_eq!(err.to_string(), format!("arch {id} is starting; retry"));
-        let row = k.task(&machine(3), &t.id).unwrap();
+        let row = k.task(&machine(3), &t.id).unwrap().unwrap();
         assert!(
             matches!(row.status, TaskStatus::Queued),
             "a task waiting on an arch that is coming up is queued, not failed: {:?}",

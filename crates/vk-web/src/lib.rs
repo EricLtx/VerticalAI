@@ -756,7 +756,7 @@ async fn approve_page(
     let (goal, artefact_type, subject) = with_kernel(&app, move |k| {
         let ctx = machine_ctx(&node_id, now);
         let t = k
-            .task(&ctx, &id)
+            .task(&ctx, &id)?
             .ok_or_else(|| KernelError::NotFound(id.clone()))?;
         let subject = k.approval_subject(&ctx, &id)?;
         Ok((t.goal, t.artefact_type, subject))
@@ -942,7 +942,7 @@ async fn approve_finish(
         // stepped, say) is not pushed into its next step by this page.
         let ctx = machine_ctx(&node_id, now);
         let waiting_for_this = k
-            .task(&ctx, &id)
+            .task(&ctx, &id)?
             .is_some_and(|t| t.status == TaskStatus::WaitingHuman)
             && k.approval_subject(&ctx, &id).ok().as_deref() == Some(expected.as_str());
         let stepped = waiting_for_this
@@ -953,7 +953,7 @@ async fn approve_finish(
                     false
                 }
             };
-        Ok((k.task(&ctx, &id).map(|t| t.status), stepped))
+        Ok((k.task(&ctx, &id)?.map(|t| t.status), stepped))
     })
     .await?;
     app.links.spend(&body.t);

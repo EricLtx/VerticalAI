@@ -114,7 +114,25 @@ impl Kernel for StubKernel {
         Ok(reg)
     }
 
-    fn write_register(&mut self, ctx: &Ctx, reg: Register) -> Result<(), KernelError> {
+    fn write_register(&mut self, ctx: &Ctx, mut reg: Register) -> Result<(), KernelError> {
+        // The real kernel's rule (SP1a review M1), so the two agree: no
+        // relabelling downward, no re-parenting, no overwriting a register
+        // the caller could not read.
+        if let Some(existing) = self.registers.get(&reg.id) {
+            if !existing.label.flows_to(&ctx.clearance) {
+                return Err(KernelError::I2(format!(
+                    "register {} exceeds caller clearance",
+                    reg.id.0
+                )));
+            }
+            if existing.task_id != reg.task_id {
+                return Err(KernelError::I3(format!(
+                    "register {} belongs to task {}; a write cannot move it to task {}",
+                    reg.id.0, existing.task_id, reg.task_id
+                )));
+            }
+            reg.label = existing.label.join(&reg.label);
+        }
         self.log("register.written", ctx.now_ms, &reg.id);
         self.registers.insert(reg.id.clone(), reg);
         Ok(())
@@ -327,6 +345,66 @@ mod tests {
     use vk_contracts::arch::*;
     use vk_contracts::labels::*;
     use vk_contracts::principal::*;
+
+    /// The stub applies the real kernel's write rule (SP1a review M1), so the
+    /// two kernels agree: no relabelling downward, no re-parenting, no
+    /// overwriting a register the caller could not read.
+    #[test]
+    fn a_register_write_cannot_relabel_reparent_or_overwrite_what_it_could_not_read() {
+        let mut k = StubKernel::new("n1");
+        let ctx = Ctx {
+            principal: Principal::Machine {
+                node_id: "n1".into(),
+                lease_id: "l".into(),
+            },
+            clearance: Clearance {
+                max_scope: Scope::Personal,
+                third_party_allowed: true,
+            },
+            partition: "p".into(),
+            now_ms: 1,
+        };
+        let business = Label {
+            scope: Scope::Business,
+            data_class: DataClass::Own,
+            origins: [Origin::OwnerAuthored].into(),
+        };
+        let id = k
+            .submit_task(&ctx, "a business register", business.clone())
+            .unwrap();
+        let stored = k.read_register(&ctx, &id).unwrap();
+
+        let mut lowered = stored.clone();
+        lowered.label = Label::bottom();
+        k.write_register(&ctx, lowered).unwrap();
+        assert_eq!(k.read_register(&ctx, &id).unwrap().label, business);
+
+        let mut moved = stored.clone();
+        moved.task_id = "task-somebody-elses".into();
+        assert!(matches!(
+            k.write_register(&ctx, moved).unwrap_err(),
+            KernelError::I3(_)
+        ));
+        assert_eq!(k.read_register(&ctx, &id).unwrap().task_id, stored.task_id);
+
+        let low = Ctx {
+            clearance: Clearance {
+                max_scope: Scope::Public,
+                third_party_allowed: false,
+            },
+            ..ctx.clone()
+        };
+        let mut overwrite = stored.clone();
+        overwrite.goal = "replaced".into();
+        assert!(matches!(
+            k.write_register(&low, overwrite).unwrap_err(),
+            KernelError::I2(_)
+        ));
+        assert_eq!(
+            k.read_register(&ctx, &id).unwrap().goal,
+            "a business register"
+        );
+    }
 
     fn gemma(clearance: Clearance) -> ArchManifest {
         ArchManifest {

@@ -93,10 +93,10 @@ pub fn resolve(k: &RealKernel, ctx: &Ctx, path: &str) -> Result<Entry, KernelErr
             })
             .ok_or_else(|| KernelError::NotFound(path.into())),
         ["tasks"] => Ok(Entry::Dir {
-            entries: k.tasks(ctx).into_iter().map(|t| t.id).collect(),
+            entries: k.tasks(ctx)?.into_iter().map(|t| t.id).collect(),
         }),
         ["tasks", id] => k
-            .task(ctx, id)
+            .task(ctx, id)?
             .map(Entry::Task)
             .ok_or_else(|| KernelError::NotFound(path.into())),
         // The envelope, never the plaintext: reading the bytes is `read_artefact`,

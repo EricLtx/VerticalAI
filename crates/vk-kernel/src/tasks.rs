@@ -391,29 +391,37 @@ impl RealKernel {
 
     /// The row as stored, with no question asked about who is looking. Every
     /// read that leaves the kernel goes through `task`, which asks it.
-    fn task_row(&self, id: &str) -> Option<Task> {
-        self.store.db.get_json("tasks", id).ok().flatten()
+    fn task_row(&self, id: &str) -> Result<Option<Task>, KernelError> {
+        self.store.db.get_json("tasks", id).map_err(store_failed)
     }
 
     /// May `ctx` see this task? A `Task` carries its register's goal and the
     /// trail of what was done with it, so it is subject to the register's
     /// label exactly as `read_register` is (I2): the label must flow to the
-    /// caller's clearance. A task whose register cannot be read — or cannot
-    /// be found — is hidden rather than refused: "not found" says nothing,
-    /// where "exceeds your clearance" would say that something is there.
-    fn visible_to(&self, ctx: &Ctx, t: &Task) -> bool {
-        self.store
+    /// caller's clearance. A task whose register is not there, or whose label
+    /// does not flow, is hidden rather than refused: "not found" says nothing,
+    /// where "exceeds your clearance" would say that something is there. A
+    /// register that cannot be *read* — a database fault, a row that does not
+    /// parse — is not hidden but reported (Ruling 8, SP1a review N3): a fault
+    /// that quietly made tasks vanish from `ps` and `top` is the one nobody
+    /// would notice.
+    fn visible_to(&self, ctx: &Ctx, t: &Task) -> Result<bool, KernelError> {
+        Ok(self
+            .store
             .db
             .get_json::<Register>("registers", &t.register.0)
-            .ok()
-            .flatten()
-            .is_some_and(|r| r.label.flows_to(&ctx.clearance))
+            .map_err(store_failed)?
+            .is_some_and(|r| r.label.flows_to(&ctx.clearance)))
     }
 
     /// One task, as `ctx` may see it: `None` for a task that is not there and
-    /// for one whose label the caller is not cleared for, indistinguishably.
-    pub fn task(&self, ctx: &Ctx, id: &str) -> Option<Task> {
-        self.task_row(id).filter(|t| self.visible_to(ctx, t))
+    /// for one whose label the caller is not cleared for, indistinguishably;
+    /// an error for a store that could not answer.
+    pub fn task(&self, ctx: &Ctx, id: &str) -> Result<Option<Task>, KernelError> {
+        match self.task_row(id)? {
+            Some(t) if self.visible_to(ctx, &t)? => Ok(Some(t)),
+            _ => Ok(None),
+        }
     }
 
     /// What each of a task's steps left in its register's `decisions` — and
@@ -484,7 +492,7 @@ impl RealKernel {
     /// step asks from inside its own run, so it always satisfies this.
     pub fn approval_subject(&mut self, ctx: &Ctx, task_id: &str) -> Result<String, KernelError> {
         let t = self
-            .task(ctx, task_id)
+            .task(ctx, task_id)?
             .ok_or_else(|| KernelError::NotFound(task_id.into()))?;
         let current = t
             .steps
@@ -564,15 +572,19 @@ impl RealKernel {
 
     /// Every task `ctx` may see (I2, as for `task`): the listing is a read
     /// surface too, and an id in it is a fact about a register.
-    pub fn tasks(&self, ctx: &Ctx) -> Vec<Task> {
-        self.store
+    pub fn tasks(&self, ctx: &Ctx) -> Result<Vec<Task>, KernelError> {
+        let mut out = Vec::new();
+        for (_, t) in self
+            .store
             .db
             .list_json::<Task>("tasks")
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(_, t)| t)
-            .filter(|t| self.visible_to(ctx, t))
-            .collect()
+            .map_err(store_failed)?
+        {
+            if self.visible_to(ctx, &t)? {
+                out.push(t);
+            }
+        }
+        Ok(out)
     }
 
     /// End every step a dead process left `Running`, and say so in the record
@@ -657,7 +669,7 @@ impl RealKernel {
         // not found, and its row is not touched — no step of it could have
         // run anyway, since every step reads the register.
         let mut t = self
-            .task(ctx, task_id)
+            .task(ctx, task_id)?
             .ok_or_else(|| KernelError::NotFound(task_id.into()))?;
         if matches!(t.status, TaskStatus::Done | TaskStatus::Failed) {
             return Ok(t);
@@ -918,7 +930,7 @@ impl RealKernel {
             )));
         }
         let mut t = self
-            .task(ctx, task_id)
+            .task(ctx, task_id)?
             .ok_or_else(|| KernelError::NotFound(task_id.into()))?;
         if matches!(t.status, TaskStatus::Done | TaskStatus::Failed) {
             return Err(KernelError::Gate(format!(
@@ -1084,7 +1096,9 @@ impl RealKernel {
 
         // 5. The row: the step ended, one way or the other.
         let saved = match self.task_row(task_id) {
-            Some(mut t) => {
+            Err(e) => Err(e),
+            Ok(None) => Err(KernelError::NotFound(task_id.into())),
+            Ok(Some(mut t)) => {
                 t.steps[i].status = match &verdict {
                     Ok(()) => StepStatus::Done,
                     Err(why) => StepStatus::Failed(why.clone()),
@@ -1099,7 +1113,6 @@ impl RealKernel {
                 };
                 self.save_task(&t).map(|()| t)
             }
-            None => Err(KernelError::NotFound(task_id.into())),
         };
 
         // 6. The directories: the configuration (it held the token) always; the
@@ -1139,6 +1152,7 @@ impl RealKernel {
         }
         let t = self
             .task_row(task_id)
+            .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("task {task_id} is gone"))?;
         let reg = self
             .read_register(ctx, &t.register)
@@ -1328,7 +1342,7 @@ impl RealKernel {
             if self.harness_running(&task_id) {
                 continue;
             }
-            let expired = match self.task_row(&task_id) {
+            let expired = match self.task_row(&task_id)? {
                 // Nothing accounts for it.
                 None => true,
                 Some(t) => {
@@ -1363,10 +1377,16 @@ impl RealKernel {
     /// The operator's one screen. Everything here is read back from disk, so it
     /// says the same thing after a restart as it did before one. The tasks on
     /// it are the ones `ctx` may see (I2); arches, STOPs and liveness carry no
-    /// label.
-    pub fn top(&self, ctx: &Ctx) -> TopView {
+    /// label. A store that cannot answer fails the screen rather than
+    /// printing a shorter one (Ruling 8, review N3).
+    pub fn top(&self, ctx: &Ctx) -> Result<TopView, KernelError> {
         let mut v = TopView::default();
-        for (key, value) in self.store.db.kv_list_prefix("stats:").unwrap_or_default() {
+        for (key, value) in self
+            .store
+            .db
+            .kv_list_prefix("stats:")
+            .map_err(store_failed)?
+        {
             if let (Some(arch), Ok(stats)) = (
                 key.strip_prefix("stats:"),
                 serde_json::from_str::<ArchStats>(&value),
@@ -1391,7 +1411,7 @@ impl RealKernel {
                 v.unavailable.insert(id, why.into());
             }
         }
-        for t in self.tasks(ctx) {
+        for t in self.tasks(ctx)? {
             v.tasks.insert(t.id, t.status);
         }
         // Every scope a live STOP holds, from the STOP set itself rather than
@@ -1403,11 +1423,11 @@ impl RealKernel {
             .store
             .db
             .list_json::<vk_contracts::stop::LivenessLease>("liveness")
-            .unwrap_or_default()
+            .map_err(store_failed)?
         {
             v.liveness.insert(business, l.expires_at_ms);
         }
-        v
+        Ok(v)
     }
 }
 
@@ -1498,7 +1518,7 @@ mod tests {
         let reg = k.read_register(&machine(5), &t.register).unwrap();
         assert!(reg.decisions.iter().any(|d| d.starts_with("plan:")));
         assert!(reg.decisions.iter().any(|d| d.starts_with("draft:")));
-        assert_eq!(k.top(&machine(0)).arches[&arch].calls, 2);
+        assert_eq!(k.top(&machine(0)).unwrap().arches[&arch].calls, 2);
         // One task, one id: the payload tier keys artefacts under the
         // register's task id, and the `Task` must name the same subject.
         assert_eq!(t.id, reg.task_id);
@@ -1778,7 +1798,7 @@ mod tests {
         let after = k.run_task_step(&machine(7), &done.id).unwrap();
         assert!(matches!(after.status, TaskStatus::Done));
         assert!(matches!(
-            k.task(&machine(0), &done.id).unwrap().status,
+            k.task(&machine(0), &done.id).unwrap().unwrap().status,
             TaskStatus::Done
         ));
     }
@@ -1843,7 +1863,7 @@ mod tests {
                 ),
                 "{bad} must be refused"
             );
-            let row = k.task(&machine(0), &t.id).unwrap();
+            let row = k.task(&machine(0), &t.id).unwrap().unwrap();
             assert!(matches!(row.status, TaskStatus::Failed));
             assert!(matches!(row.steps[0].status, StepStatus::Failed(_)));
         }
@@ -1881,7 +1901,7 @@ mod tests {
             k.run_task_step(&machine(4), &t.id),
             Err(KernelError::Gate(_))
         ));
-        let row = k.task(&machine(0), &t.id).unwrap();
+        let row = k.task(&machine(0), &t.id).unwrap().unwrap();
         assert!(matches!(row.status, TaskStatus::Failed));
         assert!(matches!(row.steps[0].status, StepStatus::Failed(_)));
         assert!(
@@ -1916,7 +1936,7 @@ mod tests {
                 k.run_task_step(&machine(2), &failed.id),
                 Err(KernelError::NotFound(_))
             ));
-            let row = k.task(&machine(0), &failed.id).unwrap();
+            let row = k.task(&machine(0), &failed.id).unwrap().unwrap();
             assert!(matches!(row.status, TaskStatus::Failed));
             match &row.steps[0].status {
                 StepStatus::Failed(reason) => assert!(reason.contains("arch-nope"), "{reason}"),
@@ -1939,7 +1959,7 @@ mod tests {
                 Err(KernelError::Stopped(_))
             ));
             assert!(matches!(
-                k.task(&machine(0), &stopped.id).unwrap().status,
+                k.task(&machine(0), &stopped.id).unwrap().unwrap().status,
                 TaskStatus::Stopped
             ));
             (failed.id, stopped.id)
@@ -1947,14 +1967,17 @@ mod tests {
         // A caller that never comes back must not be the only record of either.
         let k = open(d.path());
         assert!(matches!(
-            k.task(&machine(0), &failed_id).unwrap().status,
+            k.task(&machine(0), &failed_id).unwrap().unwrap().status,
             TaskStatus::Failed
         ));
         assert!(matches!(
-            k.task(&machine(0), &stopped_id).unwrap().status,
+            k.task(&machine(0), &stopped_id).unwrap().unwrap().status,
             TaskStatus::Stopped
         ));
-        assert_eq!(k.top(&machine(0)).stopped_scopes, vec!["node".to_string()]);
+        assert_eq!(
+            k.top(&machine(0)).unwrap().stopped_scopes,
+            vec!["node".to_string()]
+        );
     }
 
     /// `top` and `boot`/`vk status` read one set. A scope this screen had to
@@ -1967,11 +1990,11 @@ mod tests {
         let mut k = open(d.path());
         let s = k.stop(&human(1), "business:acme").unwrap();
         assert_eq!(
-            k.top(&machine(0)).stopped_scopes,
+            k.top(&machine(0)).unwrap().stopped_scopes,
             vec!["business:acme".to_string()]
         );
         k.resume(&human(2), &s).unwrap();
-        assert!(k.top(&machine(0)).stopped_scopes.is_empty());
+        assert!(k.top(&machine(0)).unwrap().stopped_scopes.is_empty());
     }
 
     #[test]
@@ -1993,11 +2016,11 @@ mod tests {
                 .unwrap();
             let t = k.run_task_step(&machine(2), &t.id).unwrap();
             assert!(matches!(t.status, TaskStatus::Done));
-            assert_eq!(k.top(&machine(0)).arches[&arch].calls, 1);
+            assert_eq!(k.top(&machine(0)).unwrap().arches[&arch].calls, 1);
             (arch, t.id)
         };
         let k = open(d.path());
-        let v = k.top(&machine(0));
+        let v = k.top(&machine(0)).unwrap();
         assert_eq!(
             v.arches[&arch].calls, 1,
             "per-arch counters come from disk, not from this process's memory"
@@ -2022,7 +2045,7 @@ mod tests {
         let cloud_id = k.register_arch(cloud);
         let local_id = k.register_arch(crate::tests::local_named("here", personal()));
 
-        let v = k.top(&machine(0));
+        let v = k.top(&machine(0)).unwrap();
         assert_eq!(v.locality[&cloud_id], "cloud");
         assert_eq!(v.jurisdiction[&cloud_id], "US");
         assert!(!v.governed[&cloud_id], "a cloud arch is not governed");
@@ -2111,16 +2134,22 @@ mod tests {
         }
 
         // Not there, for the caller who is not cleared for it.
-        assert!(k.task(&low, &secret.id).is_none());
+        assert!(k.task(&low, &secret.id).unwrap().is_none());
         assert_eq!(
             k.tasks(&low)
+                .unwrap()
                 .iter()
                 .map(|t| t.id.clone())
                 .collect::<Vec<_>>(),
             vec![plain.id.clone()]
         );
         assert_eq!(
-            k.top(&low).tasks.keys().cloned().collect::<Vec<_>>(),
+            k.top(&low)
+                .unwrap()
+                .tasks
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
             vec![plain.id.clone()]
         );
         assert_eq!(listed(&k, &low), vec![plain.id.clone()]);
@@ -2140,13 +2169,14 @@ mod tests {
         // There, unchanged, for the caller who is.
         let seen = k
             .task(&cleared, &secret.id)
+            .unwrap()
             .expect("visible to a cleared caller");
         assert_eq!(
             seen, secret,
             "the refused step must not have touched the row"
         );
-        assert_eq!(k.tasks(&cleared).len(), 2);
-        assert!(k.top(&cleared).tasks.contains_key(&secret.id));
+        assert_eq!(k.tasks(&cleared).unwrap().len(), 2);
+        assert!(k.top(&cleared).unwrap().tasks.contains_key(&secret.id));
         assert_eq!(listed(&k, &cleared).len(), 2);
         assert!(matches!(
             resolve(&k, &cleared, &format!("/tasks/{}", secret.id)),
@@ -2235,7 +2265,10 @@ mod tests {
         let mut k = open(d.path());
         let before = k.ledger().events().len();
         k.boot().unwrap();
-        let t = k.task(&machine(2), &id).expect("the task is still there");
+        let t = k
+            .task(&machine(2), &id)
+            .unwrap()
+            .expect("the task is still there");
         assert_eq!(
             t.steps[0].status,
             StepStatus::Failed(INTERRUPTED.into()),
@@ -2256,7 +2289,13 @@ mod tests {
         );
 
         // Never re-run: the arch is not called again, and the row does not move.
-        let calls = |k: &RealKernel| k.top(&machine(9)).arches.get(&arch).map_or(0, |s| s.calls);
+        let calls = |k: &RealKernel| {
+            k.top(&machine(9))
+                .unwrap()
+                .arches
+                .get(&arch)
+                .map_or(0, |s| s.calls)
+        };
         let spent = calls(&k);
         let again = k.run_task_step(&machine(3), &id).unwrap();
         assert_eq!(again.steps[0].status, t.steps[0].status);

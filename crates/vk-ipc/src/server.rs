@@ -140,6 +140,10 @@ const MAX_LINE: usize = 1 << 20;
 /// `usage.ls` is unbounded, because a caller that names a task or an arch has
 /// already said how much it wants.
 const MAX_TOP_CALLS: usize = 200;
+/// The longest a liveness lease may be renewed for in one call: thirty days.
+/// A lease is a recent human vouching for the business (I4); a year-long one
+/// would be a liveness check nobody makes.
+const MAX_LIVENESS_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// Pause after a connection that could not be accepted, so a condition that
 /// is not ours to fix (a burst past the descriptor limit, say) is not spun on.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
@@ -264,7 +268,10 @@ pub async fn start_arches(kernel: Shared) {
         // The blocking pool: building an adapter runs child processes and
         // blocking HTTP, which must not sit on a runtime worker.
         let built = tokio::task::spawn_blocking(move || {
-            let made = factory(&spec);
+            // A factory that panics is an unavailable arch with the panic as
+            // its reason, never a startup task that died with the arch left
+            // `Starting` (Task 1b deferred minor).
+            let made = vk_kernel::build_adapter(&factory, &spec);
             let stale = match kernel.lock() {
                 Ok(mut k) => k.install_arch(&arch_id, made),
                 Err(_) => None,
@@ -476,6 +483,9 @@ fn takes_presence(method: &str) -> bool {
             | "resume"
             | "approve"
             | "web.link"
+            // Renewing a liveness lease says a human vouched for the
+            // business (SP1a review M10).
+            | "liveness.renew"
             // Mounting a cloud arch is a human act: see the refusal in
             // `dispatch` (fix round 1, Critical 1). Local kinds take a proof
             // and ignore it, as `task.step` does.
@@ -1059,7 +1069,10 @@ fn dispatch(
         "task.show" => {
             let ctx = ctx_for(&k, presence, now)?;
             let id = p["task_id"].as_str().ok_or_else(|| bad("task_id"))?;
-            let task = k.task(&ctx, id).ok_or_else(|| not_found(id))?;
+            let task = k
+                .task(&ctx, id)
+                .map_err(kerr)?
+                .ok_or_else(|| not_found(id))?;
             let decisions = k.task_decisions(&ctx, &task).map_err(kerr)?;
             // And what each step spent (SP1b Task 8): the same rows
             // `usage.ls` and `vk top --calls` serve, narrowed to this task,
@@ -1077,14 +1090,14 @@ fn dispatch(
         }
         "task.ls" => {
             let ctx = ctx_for(&k, presence, now)?;
-            to_value(k.tasks(&ctx))
+            k.tasks(&ctx).map_err(kerr).and_then(to_value)
         }
         // The operator's screen. `calls: true` (`vk top --calls`) folds the
         // per-call rows in beside the totals they add up to — one syscall,
         // one answer, and the same I2 filter on both halves.
         "top" => {
             let ctx = ctx_for(&k, presence, now)?;
-            let mut view = k.top(&ctx);
+            let mut view = k.top(&ctx).map_err(kerr)?;
             if p["calls"] == Value::Bool(true) {
                 // The newest `MAX_TOP_CALLS`, bounded **in the query**: a
                 // node that has run for a week has more calls than a screen
@@ -1096,6 +1109,35 @@ fn dispatch(
                 view.calls_truncated = more;
             }
             to_value(view)
+        }
+        // Renew a business's liveness lease (I4): the admin syscall the plan
+        // promised and the one thing that populates `vk top`'s liveness
+        // column (SP1a review M10). A human act — the lease says a human
+        // vouched for the business recently — so it takes the presence proof
+        // `stop` takes, and the lease names the device that proved it.
+        "liveness.renew" => {
+            let ctx = ctx_for(&k, presence, now)?;
+            let Principal::Human { device_id } = &ctx.principal else {
+                return Err(invariant(
+                    "I1: renewing a liveness lease is a human act; re-run it with a presence proof",
+                ));
+            };
+            let business = p["business"]
+                .as_str()
+                .filter(|b| !b.trim().is_empty())
+                .ok_or_else(|| bad("business"))?;
+            let ttl_ms = p["ttl_ms"]
+                .as_u64()
+                .filter(|t| (1..=MAX_LIVENESS_TTL_MS).contains(t))
+                .ok_or_else(|| bad("ttl_ms: between 1 and thirty days, in milliseconds"))?;
+            let expires_at_ms = now.saturating_add(ttl_ms);
+            k.renew_liveness_persisted(business, device_id, expires_at_ms)
+                .map_err(kerr)?;
+            Ok(json!({
+                "business": business,
+                "renewed_by_device": device_id,
+                "expires_at_ms": expires_at_ms,
+            }))
         }
         "stop" => {
             let ctx = ctx_for(&k, presence, now)?;

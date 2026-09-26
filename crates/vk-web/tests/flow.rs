@@ -253,7 +253,13 @@ fn events_of_kind(kernel: &Shared, kind: &str) -> usize {
 }
 
 fn task_status(kernel: &Shared, id: &str) -> TaskStatus {
-    kernel.lock().unwrap().task(&ctx(), id).unwrap().status
+    kernel
+        .lock()
+        .unwrap()
+        .task(&ctx(), id)
+        .unwrap()
+        .unwrap()
+        .status
 }
 
 /// The whole ceremony: a passkey is enrolled through the pages and then
@@ -350,7 +356,10 @@ async fn a_passkey_enrols_through_the_pages_and_approves_a_waiting_task() {
         assert_eq!(a.challenge.as_ref(), Some(&minted));
         assert_eq!(a.signature_hex.as_deref(), Some(signature_hex.as_str()));
         assert!(k.pending_approvals(now_ms()).is_empty(), "spent");
-        assert_eq!(k.task(&ctx(), &task).unwrap().status, TaskStatus::Done);
+        assert_eq!(
+            k.task(&ctx(), &task).unwrap().unwrap().status,
+            TaskStatus::Done
+        );
 
         // The recorded nonce is the challenge inside the signed client data.
         let client_data: Value =

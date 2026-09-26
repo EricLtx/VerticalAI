@@ -143,11 +143,22 @@ impl MountSpec {
 
 /// Does this name read like a credential? Substring rather than whole word: a
 /// later kind is as likely to call it `apiKey` or `x_auth_token` as `key`.
+/// `auth` covers `authorization`, `oauth` and `basic_auth` (Task 1b deferred
+/// minor) — and, being a substring, `author` too, which is the price of not
+/// having to guess the next spelling.
 fn secret_shaped(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    ["secret", "token", "key", "password", "passwd", "credential"]
-        .iter()
-        .any(|needle| lower.contains(needle))
+    [
+        "secret",
+        "token",
+        "key",
+        "password",
+        "passwd",
+        "credential",
+        "auth",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 /// Walk a config and refuse the first string sitting under such a name,

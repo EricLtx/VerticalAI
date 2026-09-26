@@ -173,7 +173,7 @@ fn a_harness_step_leases_materialises_launches_collects_and_settles() {
         "a harness step points the operator at `vk harness run`: {refused}"
     );
     assert!(matches!(
-        k.task(&machine(0), &t.id).unwrap().status,
+        k.task(&machine(0), &t.id).unwrap().unwrap().status,
         TaskStatus::Queued
     ));
 
@@ -567,7 +567,10 @@ fn a_task_with_a_bad_artefact_type_is_refused_at_creation() {
         )
         .unwrap_err();
     assert!(matches!(err, KernelError::Gate(_)), "{err}");
-    assert!(k.tasks(&machine(2)).is_empty(), "nothing was created");
+    assert!(
+        k.tasks(&machine(2)).unwrap().is_empty(),
+        "nothing was created"
+    );
 }
 
 /// The harness the caller names must be the one the step names.
